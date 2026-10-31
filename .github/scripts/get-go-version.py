@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+
+import json
+import os
+import pathlib
+
+from packaging.version import parse
+
+SCRIPT_PATH = pathlib.Path(__file__).parents[0]
+REPO_ROOT = SCRIPT_PATH.parents[1]
+GO_SRC = REPO_ROOT / 'src' / 'go'
+
+GITHUB_OUTPUT = pathlib.Path(os.environ['GITHUB_OUTPUT'])
+
+version = parse('1.0.0')
+modules = []
+
+for modfile in GO_SRC.glob('**/go.mod'):
+    moddata = modfile.read_text()
+
+    for line in moddata.splitlines():
+        if line.startswith('go '):
+            version = max(version, parse(line.split()[1]))
+            break
+
+    for main in modfile.parent.glob('**/main.go'):
+        mainpath = main.relative_to(modfile.parent).parent
+
+        if 'examples' in mainpath.parts:
+            continue
+
+        # Skip ibmdplugin as it requires CGO
+        if 'ibmdplugin' in mainpath.parts:
+            continue
+
+        modules.append({
+            'module': str(modfile.parent),
+            'version': str(version),
+            'build_target': f'github.com/netdata/netdata/go/plugins/{str(mainpath)}/',
+        })
+
+# Preserve the existing multi-OS build matrix. The standalone cgroup helper is
+# Linux-only, but it still belongs in the native Linux test matrix below.
+build_modules = list(modules)
+
+# Standalone Go modules outside src/go included in native Linux tests.
+# Each build_target is the module's own import path read from go.mod.
+EXTRA_TEST_MODULES = [
+    REPO_ROOT / 'src' / 'collectors' / 'cgroups.plugin' / 'cgroup-name',
+    REPO_ROOT / 'src' / 'collectors' / 'ebpf.plugin' / 'ebpfgo.plugin',
+    REPO_ROOT / 'src' / 'health' / 'notifications' / 'alarm-notify',
+]
+
+for moddir in EXTRA_TEST_MODULES:
+    modfile = moddir / 'go.mod'
+    if not modfile.exists():
+        continue
+
+    mod_version = parse('1.0.0')
+    module_path = None
+    for line in modfile.read_text().splitlines():
+        if line.startswith('go '):
+            mod_version = max(mod_version, parse(line.split()[1]))
+        elif line.startswith('module '):
+            module_path = line.split()[1]
+
+    if module_path is None:
+        continue
+
+    modules.append({
+        'module': str(moddir),
+        'version': str(mod_version),
+        'build_target': module_path,
+    })
+
+with GITHUB_OUTPUT.open('a') as f:
+    f.write(f'matrix={json.dumps(modules)}\n')
+    f.write(f'build_matrix={json.dumps(build_modules)}\n')

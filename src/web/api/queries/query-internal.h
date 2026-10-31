@@ -1,0 +1,155 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#ifndef NETDATA_QUERY_INTERNAL_H
+#define NETDATA_QUERY_INTERNAL_H
+
+#include "query.h"
+#include "web/api/formatters/rrd2json.h"
+#include "rrdr.h"
+
+#define QUERY_PLAN_MIN_POINTS 10
+#define POINTS_TO_EXPAND_QUERY 5
+
+typedef struct query_point {
+    STORAGE_POINT sp;
+    NETDATA_DOUBLE value;
+    time_t storage_cadence; // retained before projection clips the point
+    uint8_t tier;
+    bool added;
+    bool synthetic;
+#ifdef NETDATA_INTERNAL_CHECKS
+    size_t id;
+#endif
+} QUERY_POINT;
+
+#ifdef NETDATA_INTERNAL_CHECKS
+#define QUERY_POINT_EMPTY (QUERY_POINT){ \
+    .sp = STORAGE_POINT_UNSET, \
+    .value = NAN, \
+    .added = false, \
+    .synthetic = true, \
+    .id = 0, \
+}
+#else
+#define QUERY_POINT_EMPTY (QUERY_POINT){ \
+    .sp = STORAGE_POINT_UNSET, \
+    .value = NAN, \
+    .added = false, \
+    .synthetic = true, \
+}
+#endif
+
+#ifdef NETDATA_INTERNAL_CHECKS
+#define query_point_set_id(point, point_id) (point).id = point_id
+#else
+#define query_point_set_id(point, point_id) debug_dummy()
+#endif
+
+typedef struct query_engine_ops {
+    // configuration
+    RRDR *r;
+    QUERY_METRIC *qm;
+    time_t view_update_every;
+    time_t query_granularity;
+    TIER_QUERY_FETCH tier_query_fetch;
+    QUERY_POINT_MODE point_mode;
+
+    // query planer
+    size_t current_plan;
+    time_t current_plan_expire_time;
+    time_t result_plan_expire_time;
+    time_t plan_switch_time_offset;
+    time_t plan_expanded_after;
+    time_t plan_expanded_before;
+
+    // storage queries
+    size_t tier;
+    struct query_metric_tier *tier_ptr;
+    struct storage_engine_query_handle *seqh;
+
+    // aggregating points over time
+    size_t group_points_non_zero;
+    size_t group_points_added;
+    time_t group_covered_s;             // seconds of this bucket already accounted for
+    STORAGE_POINT group_point;          // aggregates min, max, sum, count, anomaly count for each group point
+    STORAGE_POINT query_point;          // aggregates min, max, sum, count, anomaly count across the whole query
+    RRDR_VALUE_FLAGS group_value_flags;
+
+    // statistics
+    size_t db_total_points_read;
+    size_t db_points_read_per_tier[RRD_STORAGE_TIERS];
+
+    bool result_plan_expire_time_overflow;
+
+    // the LATEST grouping with a single output point reached by the metric's
+    // latest collection interval is answered from the collector's cached value,
+    // without querying the storage engine (no query plan is built)
+    bool latest_fast_path;
+    NETDATA_DOUBLE latest_fast_path_value;
+    time_t latest_fast_path_time;
+
+    struct {
+        time_t expanded_after;
+        time_t expanded_before;
+        struct storage_engine_query_handle handle;
+        bool initialized;
+        bool finalized;
+    } plans[QUERY_PLANS_MAX];
+
+    struct query_engine_ops *next;
+} QUERY_ENGINE_OPS;
+
+typedef struct query_engine_ops_cache {
+    QUERY_ENGINE_OPS *released_ops;
+} QUERY_ENGINE_OPS_CACHE;
+
+// query planner
+#define query_plan_should_switch_plan(ops, now) ((now) >= (ops)->current_plan_expire_time)
+#define query_result_plan_should_switch_plan(ops, now) \
+    ((now) >= (ops)->result_plan_expire_time && !(ops)->result_plan_expire_time_overflow)
+bool query_planer_next_plan(QUERY_ENGINE_OPS *ops, time_t now, time_t last_point_end_time);
+void query_planer_finalize_remaining_plans(QUERY_ENGINE_OPS *ops);
+QUERY_ENGINE_OPS *rrd2rrdr_query_ops_prep(RRDR *r, QUERY_ENGINE_OPS_CACHE *cache, size_t query_metric_id);
+void rrd2rrdr_query_ops_release(QUERY_ENGINE_OPS_CACHE *cache, QUERY_ENGINE_OPS *ops);
+time_t query_target_min_update_every_for_tier(QUERY_TARGET *qt, size_t tier);
+int query_plan_unittest(void);
+void rrd2rrdr_query_ops_freeall(RRDR *r, QUERY_ENGINE_OPS_CACHE *cache);
+
+// query execution
+void rrd2rrdr_query_execute(RRDR *r, size_t dim_id_in_rrdr, QUERY_ENGINE_OPS *ops);
+
+// time aggregation: time_grouping_is_expression() lives with the grammar
+// it describes, in tg-expression.h
+
+// The hot path takes a bare value: every grouping except the four
+// condition ones needs nothing else, and building a point for them would
+// cost every query engine-wide. Only the condition groupings, which reason
+// about a stored window, take the richer point.
+void time_grouping_add(RRDR *r, NETDATA_DOUBLE value, const RRDR_TIME_GROUPING add_flush);
+
+// defined in tg-expression.h, which the grouping modules include
+struct tg_point;
+void time_grouping_add_point(RRDR *r, const struct tg_point *p, const RRDR_TIME_GROUPING add_flush);
+NETDATA_DOUBLE time_grouping_flush(RRDR *r, RRDR_VALUE_FLAGS *rrdr_value_options_ptr, const RRDR_TIME_GROUPING add_flush);
+void rrdr_set_grouping_function(RRDR *r, RRDR_TIME_GROUPING group_method);
+
+// group by
+struct group_by_label_key {
+    DICTIONARY *values;
+};
+
+void group_by_label_key_insert_cb(const DICTIONARY_ITEM *item __maybe_unused, void *value, void *data);
+void group_by_label_key_delete_cb(const DICTIONARY_ITEM *item __maybe_unused, void *value, void *data __maybe_unused);
+int rrdlabels_traversal_cb_to_group_by_label_key(const char *name, const char *value, RRDLABEL_SRC ls __maybe_unused, void *data);
+void rrd2rrdr_set_timestamps(RRDR *r);
+RRDR *rrd2rrdr_group_by_initialize(ONEWAYALLOC *owa, QUERY_TARGET *qt);
+void rrdr2rrdr_group_by_calculate_percentage_of_group(RRDR *r);
+void rrdr2rrdr_group_by_partial_trimming(RRDR *r);
+void rrd2rrdr_group_by_add_metric(RRDR *r_dst, size_t d_dst, RRDR *r_tmp, size_t d_tmp,
+                                  RRDR_GROUP_BY_FUNCTION group_by_aggregate_function,
+                                  STORAGE_POINT *query_points, size_t pass);
+void rrd2rrdr_convert_values_to_percentage_of_total(RRDR *r);
+RRDR *rrd2rrdr_group_by_finalize(RRDR *r_tmp);
+RRDR *rrd2rrdr_cardinality_limit(RRDR *r);
+
+#endif //NETDATA_QUERY_INTERNAL_H

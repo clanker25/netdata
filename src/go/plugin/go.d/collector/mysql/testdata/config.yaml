@@ -1,0 +1,17 @@
+vnode: "ok"
+update_every: 123
+autodetection_retry: 122
+dsn: "ok"
+my.cnf: "ok"
+timeout: 122.123
+functions:
+  top_queries:
+    disabled: yes
+    timeout: 123.123
+    limit: 124
+  deadlock_info:
+    disabled: yes
+    timeout: 122.123
+  error_info:
+    disabled: yes
+    timeout: 123.123

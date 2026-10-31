@@ -1,0 +1,754 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#ifndef NETDATA_RRDHOST_H
+#define NETDATA_RRDHOST_H
+
+#include "libnetdata/libnetdata.h"
+#include "nrpc/nrpc.h"   // NRPC_OWNER: the host doubles as the owner token of its function registry
+
+#define HOST_LABEL_IS_EPHEMERAL "_is_ephemeral"
+#define NETDATA_VIRTUAL_HOST "Netdata Virtual Host 1.0"
+
+#define IS_VIRTUAL_HOST_OS(host) (strcmp(string2str(host->os), NETDATA_VIRTUAL_HOST) == 0)
+
+struct stream_thread;
+struct rrdset;
+
+typedef struct rrdhost RRDHOST;
+typedef struct ml_host rrd_ml_host_t;
+typedef struct rrdhost_acquired RRDHOST_ACQUIRED;
+
+//#include "streaming/stream-traffic-types.h"
+#include "streaming/stream-sender-commit.h"
+#include "rrd-database-mode.h"
+//#include "streaming/stream-replication-tracking.h"
+#include "streaming/stream-parents.h"
+#include "streaming/stream-path.h"
+#include "storage-engine.h"
+//#include "streaming/stream-traffic-types.h"
+#include "rrdlabels.h"
+#include "health/health-alert-log.h"
+
+struct rrdcontext;
+DEFINE_JUDYL_TYPED_ADVANCED(RRDCONTEXT_QUEUE, struct rrdcontext *, JUDYL_TYPED_NO_CONVERSION, JUDYL_TYPED_NO_CONVERSION, \
+                            SPINLOCK spinlock; \
+                            Word_t id; \
+                            uint32_t version; \
+                            int32_t entries; \
+                            );
+
+// ----------------------------------------------------------------------------
+// RRDHOST flags
+// use this for runtime state that changes while the agent runs.
+// accesses go through atomic_flags_* (see rrdhost_flag_* below), so concurrent
+// set/clear of different bits is safe - unlike rrdhost_options, which is a plain
+// bitfield. State written by one thread and read by another belongs here.
+
+typedef enum __attribute__ ((__packed__)) rrdhost_flags {
+
+    // Careful not to overlap with rrdhost_options to avoid bugs if
+    // rrdhost_flags_xxx is used instead of rrdhost_option_xxx or vice-versa.
+    // rrdhost_options occupies bits 0-3, so flags start above them.
+    //
+    // bits 5 and 6 are free and may be used by new flags.
+
+    // this host is a virtual node, defined by a local collector via HOST_DEFINE/HOST.
+    // it lives here and not in rrdhost_options because it is runtime state, toggled as a vnode
+    // goes stale and comes back, and because it gates writer admission: rrdhost_set_receiver()
+    // reads it to refuse a streaming receiver for a host the local collector owns. A plain
+    // read-modify-write on rrdhost_options could lose this bit against a concurrent
+    // RRDHOST_OPTION_EPHEMERAL_HOST write from another thread, which would silently reopen
+    // both vnode gates.
+    RRDHOST_FLAG_VIRTUAL_HOST                   = (1 << 4),
+
+    /*
+     * 3 BASE FLAGS FOR HOSTS:
+     *
+     * - COLLECTOR_ONLINE = the collector is currently collecting data for this node
+     *                      this is true FOR ALL KINDS OF NODES (including localhost, virtual hosts, children)
+     *
+     * - ORPHAN           = the node had a collector online recently, but does not have it now
+     *
+     * - ARCHIVED         = the node does not have data collection structures attached to it
+     *
+     */
+
+    RRDHOST_FLAG_COLLECTOR_ONLINE               = (1 << 7), // the collector of this host is online
+    RRDHOST_FLAG_ORPHAN                         = (1 << 8), // this host is orphan (not receiving data)
+    RRDHOST_FLAG_ARCHIVED                       = (1 << 9), // The host is archived, no collected charts yet
+
+    RRDHOST_FLAG_PENDING_OBSOLETE_CHARTS        = (1 << 10), // the host has pending chart obsoletions
+    RRDHOST_FLAG_PENDING_OBSOLETE_DIMENSIONS    = (1 << 11), // the host has pending dimension obsoletions
+
+    // Streaming sender
+    RRDHOST_FLAG_STREAM_SENDER_INITIALIZED      = (1 << 12), // the host has initialized streaming sender structures
+    RRDHOST_FLAG_STREAM_SENDER_ADDED            = (1 << 13), // When set, the sender thread is running
+    RRDHOST_FLAG_STREAM_SENDER_CONNECTED        = (1 << 14), // When set, the host is connected to a parent
+    RRDHOST_FLAG_STREAM_SENDER_READY_4_METRICS  = (1 << 15), // when set, rrdset_done() should push metrics to parent
+    RRDHOST_FLAG_STREAM_SENDER_LOGGED_STATUS    = (1 << 16), // when set, we have logged the status of metrics streaming
+
+    // Health
+    RRDHOST_FLAG_PENDING_HEALTH_INITIALIZATION  = (1 << 17), // contains charts and dims with uninitialized variables
+    RRDHOST_FLAG_INITIALIZED_HEALTH             = (1 << 18), // the host has initialized health structures
+
+    // Exporting
+    RRDHOST_FLAG_EXPORTING_SEND                 = (1 << 19), // send it to external databases
+    RRDHOST_FLAG_EXPORTING_DONT_SEND            = (1 << 20), // don't send it to external databases
+
+    // ACLK
+    RRDHOST_FLAG_ACLK_STREAM_CONTEXTS           = (1 << 21), // when set, we should send ACLK stream context updates
+    RRDHOST_FLAG_ACLK_STREAM_ALERTS             = (1 << 22), // Host should stream alerts
+
+    // Metadata
+    RRDHOST_FLAG_METADATA_UPDATE                = (1 << 23), // metadata needs to be stored in the database
+    RRDHOST_FLAG_METADATA_LABELS                = (1 << 24), // metadata needs to be stored in the database
+    RRDHOST_FLAG_METADATA_INFO                  = (1 << 25), // metadata needs to be stored in the database
+    RRDHOST_FLAG_PENDING_CONTEXT_LOAD           = (1 << 26), // Context needs to be loaded
+
+    RRDHOST_FLAG_METADATA_CLAIMID               = (1 << 27), // metadata needs to be stored in the database
+
+    RRDHOST_FLAG_GLOBAL_FUNCTIONS_UPDATED       = (1 << 28), // set when the host has updated global functions
+    RRDHOST_FLAG_RRDCONTEXT_GET_RETENTION       = (1 << 29), // set when rrdcontext needs to update the retention of the host
+
+    RRDHOST_FLAG_OBSOLETE_ALL_IN_PROGRESS       = (1 << 30), // svc_rrdhost_obsolete_all_charts() is running on this host;
+                                                             // gates rrdhost_set_receiver() so a reconnect cannot attach
+                                                             // mid-pass. Set under receiver_lock; the heavy work runs
+                                                             // without holding receiver_lock so readers stay unblocked.
+
+    RRDHOST_FLAG_PENDING_LABEL_RECHECK          = (1U << 31), // host labels changed since the last health prototype
+                                                              // evaluation; on its next pass the health thread treats
+                                                              // every chart of this host as needing a recheck, in
+                                                              // addition to charts that have RRDSET_FLAG_PENDING_LABEL_RECHECK
+                                                              // set individually (no per-chart flag fan-out).
+} RRDHOST_FLAGS;
+
+#define rrdhost_flag_get(host)                         atomic_flags_get(&((host)->flags))
+#define rrdhost_flag_check(host, flag)                 atomic_flags_check(&((host)->flags), flag)
+#define rrdhost_flag_set(host, flag)                   atomic_flags_set(&((host)->flags), flag)
+#define rrdhost_flag_clear(host, flag)                 atomic_flags_clear(&((host)->flags), flag)
+#define rrdhost_flag_set_and_clear(host, set, clear)   atomic_flags_set_and_clear(&((host)->flags), set, clear)
+
+typedef enum __attribute__ ((__packed__)) {
+    // Streaming configuration
+    RRDHOST_OPTION_SENDER_ENABLED           = (1 << 0), // set when the host is configured to send metrics to a parent
+    RRDHOST_OPTION_REPLICATION              = (1 << 1), // when set, we support replication for this host
+
+    // Other options
+    // bit 2 is free - it held RRDHOST_OPTION_VIRTUAL_HOST, now RRDHOST_FLAG_VIRTUAL_HOST.
+    // Keep bits 0-3 reserved to rrdhost_options even when unused, so the non-overlap guard
+    // with rrdhost_flags above still holds.
+    RRDHOST_OPTION_EPHEMERAL_HOST           = (1 << 3), // when set, this host is an ephemeral one
+} RRDHOST_OPTIONS;
+
+#define rrdhost_option_check(host, flag) ((host)->options & (flag))
+#define rrdhost_option_set(host, flag)   (host)->options |= flag
+#define rrdhost_option_clear(host, flag) (host)->options &= ~(flag)
+
+#define rrdhost_has_stream_sender_enabled(host) (rrdhost_option_check(host, RRDHOST_OPTION_SENDER_ENABLED) && (host)->sender)
+
+#define rrdhost_can_stream_metadata_to_parent(host)                                 \
+    (rrdhost_has_stream_sender_enabled(host) &&                                     \
+     rrdhost_flag_check(host, RRDHOST_FLAG_STREAM_SENDER_READY_4_METRICS) &&        \
+     rrdhost_flag_check(host, RRDHOST_FLAG_COLLECTOR_ONLINE)                  \
+    )
+
+
+struct rrdhost {
+    char machine_guid[GUID_LEN + 1];                // the unique ID of this host
+
+    // ------------------------------------------------------------------------
+    // host information
+
+    STRING *hostname;                               // the hostname of this host
+    STRING *registry_hostname;                      // the registry hostname for this host
+    STRING *os;                                     // the O/S type of the host
+    STRING *timezone;                               // the timezone of the host
+    STRING *abbrev_timezone;                        // the abbriviated timezone of the host
+    STRING *program_name;                           // the program name that collects metrics for this host
+    STRING *program_version;                        // the program version that collects metrics for this host
+
+    uint32_t node_stale_after_seconds;              // vnode stale timeout
+
+    OBJECT_STATE state_id;                          // every time data collection (stream receiver) (dis)connects,
+                           // this gets incremented - it is used to detect stale functions,
+                           // stale backfilling requests, etc.
+
+    int32_t utc_offset;                             // the offset in seconds from utc
+
+    RRDHOST_OPTIONS options;                        // configuration option for this RRDHOST (no atomics on this)
+    RRDHOST_FLAGS flags;                            // runtime flags about this RRDHOST (atomics on this)
+    RRDHOST_FLAGS *exporting_flags;                 // array of flags for exporting connector instances
+
+    int32_t rrd_update_every;                       // the update frequency of the host
+    int32_t rrd_history_entries;                    // the number of history entries for the host's charts
+
+    RRD_DB_MODE rrd_memory_mode;                    // the configured memory more for the charts of this host
+                                                    // the actual per tier is at .db[tier].mode
+
+    char *cache_dir;                                // the directory to save RRD cache files
+
+    struct {
+        RRD_DB_MODE mode;                           // the db mode for this tier
+        STORAGE_ENGINE *eng;                        // the storage engine API for this tier
+        STORAGE_INSTANCE *si;                       // the db instance for this tier
+        uint32_t tier_grouping;                     // tier 0 iterations aggregated on this tier
+    } db[RRD_STORAGE_TIERS];
+
+    struct rrdhost_system_info *system_info;        // information collected from the host environment
+
+    // ------------------------------------------------------------------------
+    // streaming and replication, configuration and status
+
+    struct {
+        struct stream_thread *thread;
+        uint8_t refcount;
+
+        // --- sender ---
+
+        struct {
+            struct {
+                struct {
+                    SPINLOCK spinlock;
+
+                    bool ignore;                    // when set, freeing slots will not put them in the available
+                    uint32_t used;
+                    uint32_t size;
+                    uint32_t *array;
+                } available;                        // keep track of the available chart slots per host
+
+                uint32_t last_used;                 // the last slot we used for a chart (increments only)
+            } pluginsd_chart_slots;
+
+            struct {
+                pid_t tid;
+
+                time_t last_connected;              // last time child connected (stored in db)
+                uint32_t connections;               // the number of times this sender has connected
+                STREAM_HANDSHAKE reason;            // the last receiver exit reason
+
+                struct {
+                    uint32_t counter_in;            // counts the number of replication statements we have received
+                    uint32_t counter_out;           // counts the number of replication statements we have sent
+                    uint32_t charts;                // the number of charts currently being replicated to a parent
+                } replication;
+            } status;
+
+            // reserved for the receiver/sender thread - do not use for other purposes
+            struct sender_buffer commit;
+
+            // serializes the host labels snapshot and its commit (stream_send_host_labels())
+            SPINLOCK labels_spinlock;
+
+            STRING *destination;                    // where to send metrics to
+            STRING *api_key;                        // the api key at the receiving netdata
+            SIMPLE_PATTERN *charts_matching;        // pattern to match the charts to be sent
+            RRDHOST_STREAM_PARENTS parents;         // the list of parents (extracted from destination)
+        } snd;
+
+        // --- receiver ---
+
+        struct {
+            uint32_t min_update_every;
+            uint32_t min_update_every_applied;
+
+            struct {
+                SPINLOCK spinlock;                  // lock for the management of the allocation
+                uint32_t size;
+                struct rrdset **array;
+            } pluginsd_chart_slots;
+
+            struct {
+                pid_t tid;
+
+                time_t last_connected;              // the time the last sender was connected
+                time_t last_disconnected;           // the time the last sender was disconnected
+
+                uint32_t connections;               // the number of times this receiver has connected
+                STREAM_HANDSHAKE reason;            // the last receiver exit reason
+
+                struct {
+                    uint32_t counter_in;            // counts the number of replication statements we have received
+                    uint32_t counter_out;           // counts the number of replication statements we have sent
+                    uint32_t backfill_pending;      // the number of replication requests pending on us
+                    // High 32 bits: charts whose claim won the receiver-replication transition in this
+                    // connection generation. Low 32 bits: charts still outstanding. A duplicate
+                    // CHART_DEFINITION_END moves neither half. The ratio is therefore "completed charts
+                    // among the charts admitted in this connection generation", not a monotonic progress
+                    // clock: admitting new charts mid-generation legitimately moves it backwards.
+                    // Keep this naturally 8-byte aligned: misaligned 64-bit atomics on armv6l/armv7l
+                    // degrade to libatomic calls.
+                    uint64_t charts_started_and_remaining __attribute__((aligned(8)));
+                } replication;
+
+                // single-writer (the receiver thread), relaxed-atomic; read lock-free by the
+                // pulse traversal. Cumulative over the host's lifetime, never reset.
+                // Keep these 8-byte aligned: 32-bit GCC may inline relaxed 64-bit access.
+                uint64_t bytes_in __attribute__((aligned(8)));  // raw socket bytes received from this child
+                uint64_t bytes_out __attribute__((aligned(8))); // raw socket bytes sent to this child
+
+                // realtime second the current inbound (receiver) state was entered; reset by
+                // pulse_host_status() on every inbound state change, read by the pulse traversal
+                // to chart the age in the current state.
+                time_t state_changed_s;
+
+                // "running latched": set true once the node first reaches RCV_RUNNING after a
+                // (re)connect. While set and the node is currently running, per-chart replication
+                // ripples (a new container/service/process group briefly replicating) do NOT flip
+                // the host status back to replicating. Reset on disconnect (RCV_OFFLINE) and when a
+                // replicating transition arrives while the node is NOT currently running (i.e. the
+                // initial catch-up of a fresh connection). Note: this masks ANY replication once
+                // running until the next disconnect, not only small ripples. Maintained by
+                // pulse_host_status() (relaxed atomic).
+                bool running_latched;
+
+                // last host-label version applied to this host's per-child streaming.in.* charts.
+                // Written and read only by the pulse thread (pulse_child_charts_update()), which
+                // re-applies the labels when the version differs. labels_applied distinguishes
+                // "version 0 and never applied" from "version 0 and applied": a host with no labels
+                // at all keeps version 0 forever, so the version compare alone would never label its
+                // charts. See pulse-parents.c for what this version does and does not detect.
+                bool labels_applied;
+                uint32_t labels_applied_version;
+            } status;
+        } rcv;
+
+        // resolved combined PULSE_HOST_STATUS (basic|receiver|sender|ephemerality), maintained by
+        // pulse_host_status() lock-free (CAS) and read by the pulse traversal, which computes the
+        // streaming_inbound (basic|receiver bits) and streaming_outbound (sender bits) aggregates.
+        // Replaces the former global PHOST Judy + spinlock.
+        uint32_t pulse_state;
+
+        // --- configuration ---
+
+        struct {
+            time_t period;                          // max time we want to replicate from the child
+            time_t step;                            // seconds per replication step
+        } replication;
+
+        RRDHOST_STREAM_PATH path;
+    } stream;
+
+    // the following are state information for the threading
+    // streaming metrics from this netdata to an upstream netdata
+    struct sender_state *sender;
+
+    struct receiver_state *receiver;
+    SPINLOCK receiver_lock;
+
+    // ------------------------------------------------------------------------
+
+    struct aclk_sync_cfg_t *aclk_host_config;
+
+    // ------------------------------------------------------------------------
+    // health monitoring options
+
+    // health variables
+    HEALTH health;
+
+    // all RRDCALCs are primarily allocated and linked here
+    DICTIONARY *rrdcalc_root_index;
+
+    // Secondary index of the above, keyed by the interned STRING* of
+    // rc->config.name, so health expression variable lookups can resolve an
+    // alert name without scanning every alert of the host. Alert names are not
+    // unique per host (the primary key is "{alert},on[{chart}]"), so each entry
+    // is the head of a list threaded through RRDCALC.name_next / name_prev.
+    struct {
+        RW_SPINLOCK spinlock;
+        Pvoid_t JudyL;
+    } rrdcalc_by_name;
+
+    ALARM_LOG health_log;                           // alarms historical events (event log)
+    uint32_t health_last_processed_id;              // the last processed health id from the log
+    uint32_t health_max_unique_id;                  // the max alarm log unique id given for the host
+    uint32_t health_max_alarm_id;                   // the max alarm id given for the host
+    size_t health_transitions;                      // the number of times an alert changed state
+
+    // ------------------------------------------------------------------------
+    // locks
+
+    SPINLOCK rrdhost_update_lock;
+
+    // The host's lifetime lock: the admission protocol between the paths that make a host live and
+    // the paths that remove it.
+    // - Removers (remove-stale-node, the orphan/ephemeral reaper, the memory-mode replace in
+    //   rrdhost_find_or_create()) take the write side with trywrite, re-check that the host is still
+    //   eligible AFTER acquiring it, and hold it until the host is unlinked from the index.
+    // - Attachers (the stream receiver, a plugin defining or re-enabling a vnode, an un-archive in
+    //   rrdhost_update()) hold the read side - a "pin" - from the index lookup until the host is
+    //   marked live. The pin is acquired under rrd_rdlock() (or rrd_wrlock()), which is what keeps
+    //   the pointer valid between the lookup and the pin. rrdhost_find_or_create() returns hosts
+    //   pinned.
+    // - A plugin holds a pin on the non-local host it has selected (HOST, HOST_DEFINE_END) for as long
+    //   as it is selected, because it keeps using that pointer: see pluginsd_select_host(). Selecting
+    //   localhost takes no pin: localhost is never removed.
+    // - A weights query pins the hosts it queries for the whole call (query_scope_hosts_pin()), because
+    //   its worker threads and its results use them after the host walk. A host it cannot pin is left
+    //   out of the query.
+    // Nobody ever waits for the write side, so holding a pin cannot block anyone; failing to take a
+    // pin means a removal is in progress, and the attacher refuses and retries later. Every pin MUST
+    // be released with rrdhost_pin_release() on the thread that took it: a leaked pin makes the host
+    // unremovable. The metadata sync scan and the CLI's mark-ephemeral path also take the read side.
+    RW_SPINLOCK metadata_lifetime_lock;
+
+    // ------------------------------------------------------------------------
+    // ML handle
+    RW_SPINLOCK ml_host_rwlock;
+    rrd_ml_host_t *ml_host;
+    bool ml_running;                                      // atomic
+
+    // ------------------------------------------------------------------------
+    // Support for host-level labels
+    RRDLABELS *rrdlabels;
+
+    // ------------------------------------------------------------------------
+    // indexes
+
+    DICTIONARY *rrdset_root_index;                  // the host's charts index (by id)
+    DICTIONARY *rrdset_root_index_name;             // the host's charts index (by name)
+
+    DICTIONARY *rrdvars;                            // the host's chart variables index
+                         // this includes custom host variables
+
+    struct {
+        uint32_t metrics_count;                     // atomic
+        uint32_t instances_count;                   // atomic
+        uint32_t contexts_count;                    // atomic
+    } collected;
+
+    struct {
+        DICTIONARY *contexts;
+        RRDCONTEXT_QUEUE_JudyLSet pp_queue;
+        RRDCONTEXT_QUEUE_JudyLSet hub_queue;
+        uint32_t metrics_count;                     // atomic
+        uint32_t instances_count;                   // atomic
+        uint32_t contexts_count;                    // atomic
+    } rrdctx;
+
+    struct {
+        SPINLOCK spinlock;
+        time_t first_time_s;
+        time_t last_time_s;
+    } retention;
+
+    ND_UUID host_id;                                // Global GUID for this host
+    ND_UUID node_id;                                // Cloud node_id
+
+    struct {
+        SPINLOCK spinlock;
+        ND_UUID claim_id_of_origin;
+        ND_UUID claim_id_of_parent;
+    } aclk;
+
+    struct rrdhost *next;
+    struct rrdhost *prev;
+};
+
+extern RRDHOST *localhost;
+
+// receiver_lock protects host->receiver and the host->stream.rcv.status fields.
+//
+// Hold time must stay short-bounded: no caller may hold receiver_lock across
+// O(charts), I/O, sends, ML stop/start, or any wait on other subsystems. The
+// obsolete-all cleanup pass (service.c) used to violate this; it now sets
+// RRDHOST_FLAG_OBSOLETE_ALL_IN_PROGRESS under the lock and runs the heavy
+// work without holding it. rrdhost_set_receiver() checks that flag under
+// the lock and returns RRDHOST_SET_RECEIVER_CLEANUP_BUSY when the cleanup
+// pass is in progress; the caller answers the child with BUSY_TRY_LATER and
+// the child reconnects via normal backoff. With cleanup off the lock, all
+// other readers (status, ACLK, capabilities, paths, event-driven sends)
+// keep blocking-lock semantics and stay truthful.
+//
+// Error logs are tolerated under it, as on the attach and replication-reset paths. rrdset_free()
+// releases a chart's receiver-replication claim under it, and a refused release logs an error; a
+// refusal means the accounting is already corrupt, which the ownership invariant makes unreachable.
+#define rrdhost_receiver_lock(host) spinlock_lock(&(host)->receiver_lock)
+#define rrdhost_receiver_unlock(host) spinlock_unlock(&(host)->receiver_lock)
+
+#define rrdhost_hostname(host) string2str((host)->hostname)
+#define rrdhost_registry_hostname(host) string2str((host)->registry_hostname)
+#define rrdhost_os(host) string2str((host)->os)
+// Timezone fields are mutable at runtime (DST refresh); use rrdhost_tz_get() for thread-safe access.
+// Do NOT access host->timezone or host->abbrev_timezone directly outside of rrdhost_update_lock.
+// Host identity fields are mutable at runtime; use rrdhost_identity_acquire()
+// when their STRING references must survive concurrent host metadata updates.
+#define rrdhost_program_name(host) string2str((host)->program_name)
+#define rrdhost_program_version(host) string2str((host)->program_version)
+
+static inline uint64_t rrdhost_receiver_replication_accounting(RRDHOST *host) {
+    return __atomic_load_n(&host->stream.rcv.status.replication.charts_started_and_remaining, __ATOMIC_RELAXED);
+}
+
+// One claim attempt: one unit of cohort in the high half, one outstanding chart in the low half. The
+// claim adds it and the duplicate-CHART_DEFINITION_END rollback subtracts it, both in one atomic op,
+// so the two halves can never be observed out of step and a duplicate moves neither.
+//
+// The add is deliberately unguarded, unlike the two subtracts. A carry out of the low half needs 2^32
+// charts outstanding on one host at once, which the address space rules out. A wrap of the high half
+// needs 2^32 won claims inside a single connection generation, and its consequence is a cohort of 0
+// with work outstanding, i.e. the NAN diagnostic - the same wrap and the same reading the separate
+// uint32_t cohort had before it was packed. Neither warrants a CAS retry loop on the claim path.
+#define RRDHOST_RCV_REPLICATION_UNIT (((uint64_t)1 << 32) | 1)
+
+static inline uint64_t rrdhost_receiver_replication_accounting_pack(uint32_t started, uint32_t remaining) {
+    return ((uint64_t)started << 32) | remaining;
+}
+
+static inline uint32_t rrdhost_receiver_replication_remaining_of(uint64_t accounting) {
+    return (uint32_t)accounting;
+}
+
+static inline uint32_t rrdhost_receiver_replication_started_of(uint64_t accounting) {
+    return (uint32_t)(accounting >> 32);
+}
+
+// Reinstall a word saved by rrdhost_receiver_replication_accounting(); the tests save and restore the
+// host's real accounting around the synthetic states they install.
+static inline void rrdhost_receiver_replication_accounting_restore(RRDHOST *host, uint64_t saved) {
+    __atomic_store_n(&host->stream.rcv.status.replication.charts_started_and_remaining, saved, __ATOMIC_RELAXED);
+}
+
+// Test-facing setter: install both halves together so tests cannot create a torn synthetic state.
+static inline void rrdhost_receiver_replication_accounting_set(RRDHOST *host, uint32_t started, uint32_t remaining) {
+    rrdhost_receiver_replication_accounting_restore(host, rrdhost_receiver_replication_accounting_pack(started, remaining));
+}
+
+static inline uint32_t rrdhost_receiver_replicating_charts(RRDHOST *host) {
+    return rrdhost_receiver_replication_remaining_of(rrdhost_receiver_replication_accounting(host));
+}
+
+static inline uint32_t rrdhost_receiver_replicating_charts_started(RRDHOST *host) {
+    return rrdhost_receiver_replication_started_of(rrdhost_receiver_replication_accounting(host));
+}
+
+static inline void rrdhost_receiver_replicating_charts_zero(RRDHOST *host) {
+    rrdhost_receiver_replication_accounting_restore(host, 0);
+}
+
+// Decrement the outstanding half by one, CHECKED - unlike the sender counterpart. `function` names the
+// release site for the refusal log. Callers MUST only decrement a contribution they own, i.e. one whose
+// RRDSET_FLAG_RECEIVER_REPLICATION_IN_PROGRESS they observed in their own CAS old-value; the guard is
+// what stops an unowned one corrupting the word, and the refusal is how a test sees it happen. Reach it
+// through rrdhost_receiver_replication_release() (rrdset.h) unless you are a test driving the guard
+// itself: that function is what pairs the decrement with the flag transition that authorises it.
+//
+// Both decrements return the outstanding count: after the subtraction, or, when the guard refuses,
+// as observed in the word the refusal was decided on. Zero is a count, not a success indicator.
+uint32_t rrdhost_receiver_replicating_charts_decrement(RRDHOST *host, const char *function);
+
+// The duplicate-CHART_DEFINITION_END rollback: withdraw the speculative unit this same thread just
+// added, both halves together. Called by rrdhost_receiver_replication_claim() on a lost CAS, and by
+// the test that drives the guard directly. It is NOT a release - it does not clear the flag.
+uint32_t rrdhost_receiver_replication_withdraw(RRDHOST *host);
+#define rrdhost_receiver_replicating_charts_minus_one(host) rrdhost_receiver_replicating_charts_decrement(host, __FUNCTION__)
+
+// Receiver replication completion, as a percentage over the current connection generation's cohort.
+// Computed from the counters on every read - there is no stored value to go stale. Returns NAN (which
+// the JSON writers emit as `null`) only for a state the counters should make unreachable.
+NETDATA_DOUBLE rrdhost_receiver_replication_completion(RRDHOST *host, uint32_t *instances);
+
+// The receiver-replication claim/release pair is declared in rrdset.h, where RRDSET_FLAGS is visible.
+
+#define rrdhost_sender_replicating_charts(host) (__atomic_load_n(&((host)->stream.snd.status.replication.charts), __ATOMIC_RELAXED))
+#define rrdhost_sender_replicating_charts_plus_one(host) (__atomic_add_fetch(&((host)->stream.snd.status.replication.charts), 1, __ATOMIC_RELAXED))
+#define rrdhost_sender_replicating_charts_minus_one(host) (__atomic_sub_fetch(&((host)->stream.snd.status.replication.charts), 1, __ATOMIC_RELAXED))
+#define rrdhost_sender_replicating_charts_zero(host) (__atomic_store_n(&((host)->stream.snd.status.replication.charts), 0, __ATOMIC_RELAXED))
+
+#define rrdhost_is_virtual(host)                                                                                \
+    rrdhost_flag_check(host, RRDHOST_FLAG_VIRTUAL_HOST)
+
+#define rrdhost_is_local(host)  ( \
+    (host) == localhost ||                                                                                      \
+    rrdhost_is_virtual(host)                                                                                    \
+    )
+
+#define rrdhost_is_online_flags(flags) ((flags & RRDHOST_FLAG_COLLECTOR_ONLINE) && !(flags & RRDHOST_FLAG_ORPHAN))
+
+static inline bool rrdhost_is_online(RRDHOST *host) {
+    if(rrdhost_is_local(host))
+        return true;
+
+    RRDHOST_FLAGS flags = rrdhost_flag_get(host);
+    return rrdhost_is_online_flags(flags);
+}
+
+bool rrdhost_matches_window(RRDHOST *host, time_t after, time_t before, time_t now);
+
+extern DICTIONARY *rrdhost_root_index;
+size_t rrdhost_hosts_available(void);
+
+RRDHOST_ACQUIRED *rrdhost_find_and_acquire(const char *machine_guid);
+RRDHOST *rrdhost_acquired_to_rrdhost(RRDHOST_ACQUIRED *rha);
+void rrdhost_acquired_release(RRDHOST_ACQUIRED *rha);
+
+#define rrdhost_foreach_read(var) \
+    for((var) = localhost; var ; (var) = (var)->next)
+
+#define rrdhost_foreach_write(var) \
+    for((var) = localhost; var ; (var) = (var)->next)
+
+RRDHOST *rrdhost_find_by_hostname(const char *hostname);
+RRDHOST *rrdhost_find_by_guid(const char *guid);
+RRDHOST *rrdhost_find_by_node_id(const char *node_id);
+
+// lifetime-safe host lookup for callers that hold no reference to the host: resolves by machine_guid
+// and runs `cb` under the rrd read lock. `may_block` false skips the callback instead of waiting for
+// the lock, which threads an rrd_wrlock() holder can be blocked on MUST use - see the definition for
+// the lifetime argument, that constraint, and why this is not keyed on node_id
+bool rrdhost_apply_by_machine_guid(const char *machine_guid, void (*cb)(RRDHOST *host, void *data), void *data, bool may_block);
+
+// Pin a host found in the index (see metadata_lifetime_lock). The caller MUST hold rrd_rdlock() or
+// rrd_wrlock() from the lookup until this returns. False means a removal holds the write side or is
+// trying to take it (a failed trywrite sets the writer bit briefly), so it can also fail during a
+// removal attempt that does not succeed: the caller MUST NOT make the host live and SHOULD retry later.
+static inline bool rrdhost_pin_try(RRDHOST *host) {
+    return rw_spinlock_tryread_lock(&host->metadata_lifetime_lock);
+}
+
+static inline void rrdhost_pin_release(RRDHOST *host) {
+    rw_spinlock_read_unlock(&host->metadata_lifetime_lock);
+}
+
+// Copies a machine-guid into a GUID_LEN + 1 byte destination, truncating anything longer.
+// Exposed for rrdhost_machine_guid_unittest().
+void rrdhost_machine_guid_copy(char *dst, const char *guid);
+
+// True when a streamed machine-guid is a UUID that fits in RRDHOST.machine_guid unchanged.
+bool rrdhost_machine_guid_is_valid(const char *guid);
+
+#ifdef RRDHOST_INTERNALS
+RRDHOST *rrdhost_create(
+    const char *hostname,
+    const char *registry_hostname,
+    const char *guid,
+    const char *os,
+    const char *timezone,
+    const char *abbrev_timezone,
+    int32_t utc_offset,
+    const char *prog_name,
+    const char *prog_version,
+    int update_every,
+    long entries,
+    RRD_DB_MODE memory_mode,
+    bool health,
+    bool stream,
+    STRING *parents,
+    STRING *api_key,
+    STRING *send_charts_matching,
+    bool replication,
+    time_t replication_period,
+    time_t replication_step,
+    struct rrdhost_system_info *system_info,
+    int is_localhost,
+    bool archived,
+    bool pin
+    );
+
+void rrdhost_init(void);
+#endif
+
+// The host as an nRPC owner: the token the component keys its function-
+// registry index on and hands back to the owner callbacks. The component never
+// dereferences it - these two lines are the only place that casts.
+static inline NRPC_OWNER rrdhost_nrpc_owner(RRDHOST *host) { return (NRPC_OWNER){ .ptr = host }; }
+static inline RRDHOST *rrdhost_from_nrpc_owner(NRPC_OWNER id) { return (RRDHOST *)id.ptr; }
+
+// fill the host's nRPC function-registry owner vtable (see rrdhost.c); also
+// used by the nRPC unittests to re-init localhost's registry identically
+void rrdhost_nrpc_registry_owner(RRDHOST *host, struct nrpc_registry_owner *owner);
+
+// Returns the host PINNED (see metadata_lifetime_lock): the caller MUST call rrdhost_pin_release()
+// on every path, once the host is marked live or the caller gave up on it. NULL means the host is
+// being created or removed by someone else right now - retry later.
+RRDHOST *rrdhost_find_or_create(
+    const char *hostname,
+    const char *registry_hostname,
+    const char *guid,
+    const char *os,
+    const char *timezone,
+    const char *abbrev_timezone,
+    int32_t utc_offset,
+    const char *prog_name,
+    const char *prog_version,
+    int update_every,
+    long history,
+    RRD_DB_MODE mode,
+    bool health,
+    bool stream,
+    STRING *parents,
+    STRING *api_key,
+    STRING *send_charts_matching,
+    bool replication,
+    time_t replication_period,
+    time_t replication_step,
+    struct rrdhost_system_info *system_info,
+    bool is_archived);
+
+void rrdhost_free_all(void);
+
+void rrdhost_free___while_having_rrd_wrlock(RRDHOST *host);
+void rrdhost_free___consume_metadata_lifetime_writelock(RRDHOST *host);
+void rrdhost_cleanup_data_collection_and_health(RRDHOST *host);
+
+bool rrdhost_should_be_cleaned_up(RRDHOST *host, RRDHOST *protected_host, time_t now_s);
+bool rrdhost_should_run_health(RRDHOST *host);
+
+void set_host_properties(
+    RRDHOST *host, int update_every,
+    RRD_DB_MODE memory_mode, const char *registry_hostname,
+    const char *os, const char *tzone, const char *abbrev_tzone, int32_t utc_offset,
+    const char *prog_name, const char *prog_version);
+
+bool rrdhost_update_timezone(RRDHOST *host, const char *timezone, const char *abbrev_timezone, int32_t utc_offset);
+
+typedef struct {
+    STRING *hostname;
+    STRING *prog_name;
+    STRING *prog_version;
+} RRDHOST_IDENTITY;
+
+RRDHOST_IDENTITY rrdhost_identity_acquire(RRDHOST *host);
+void rrdhost_identity_release(RRDHOST_IDENTITY *identity);
+
+typedef struct {
+    RRDHOST_IDENTITY common;
+    STRING *registry_hostname;
+    STRING *os;
+} RRDHOST_METADATA_IDENTITY;
+
+RRDHOST_METADATA_IDENTITY rrdhost_metadata_identity_acquire(RRDHOST *host);
+void rrdhost_metadata_identity_release(RRDHOST_METADATA_IDENTITY *identity);
+
+// Thread-safe timezone snapshot from an RRDHOST.
+// The returned struct owns strdup'd copies; release with rrdhost_tz_free().
+typedef struct {
+    char *timezone;        // IANA timezone name (owned, strdup'd)
+    char *abbrev_timezone; // abbreviated timezone (owned, strdup'd)
+    int32_t utc_offset;    // offset from UTC in seconds
+} RRDHOST_TZ;
+
+RRDHOST_TZ rrdhost_tz_get(RRDHOST *host);
+void rrdhost_tz_free(RRDHOST_TZ *tz);
+
+static inline void rrdhost_retention(RRDHOST *host, time_t now, bool online, time_t *from, time_t *to) {
+    time_t first_time_s = 0, last_time_s = 0;
+    spinlock_lock(&host->retention.spinlock);
+    first_time_s = host->retention.first_time_s;
+    last_time_s = host->retention.last_time_s;
+    spinlock_unlock(&host->retention.spinlock);
+
+    if(from)
+        *from = first_time_s;
+
+    if(to)
+        *to = online ? now : last_time_s;
+}
+
+extern time_t rrdhost_cleanup_orphan_to_archive_time_s;
+extern time_t rrdhost_free_ephemeral_time_s;
+
+#include "rrdhost-collection.h"
+#include "rrdhost-slots.h"
+#include "rrdhost-labels.h"
+
+#endif //NETDATA_RRDHOST_H

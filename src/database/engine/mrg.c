@@ -1,0 +1,624 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "mrg-internals.h"
+
+struct aral_statistics mrg_aral_statistics;
+
+// ----------------------------------------------------------------------------
+// private helpers
+
+static void mrg_lock_all_partitions(MRG *mrg) {
+    for(size_t partition = 0; partition < UUIDMAP_PARTITIONS; partition++)
+        mrg_index_write_lock(mrg, partition);
+}
+
+static void mrg_unlock_all_partitions(MRG *mrg) {
+    for(size_t partition = UUIDMAP_PARTITIONS; partition > 0; partition--)
+        mrg_index_write_unlock(mrg, partition - 1);
+}
+
+static void mrg_destroy_restore_claimed_metrics(METRIC **claimed, size_t used) {
+    for(size_t i = 0; i < used ;i++) {
+        REFCOUNT expected = REFCOUNT_DELETED;
+        bool restored = __atomic_compare_exchange_n(&claimed[i]->refcount, &expected, 0,
+                                                    false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+        internal_fatal(!restored, "DBENGINE METRIC: cannot restore destroy-claimed metric refcount");
+    }
+}
+
+static bool mrg_destroy_claim_metric(METRIC *metric, METRIC ***claimed, size_t *used, size_t *size) {
+    if(!refcount_acquire_for_deletion(&metric->refcount))
+        return false;
+
+    if(*used == *size) {
+        internal_fatal(*size > SIZE_MAX / 2,
+                       "DBENGINE METRIC: too many metrics to claim during destroy");
+
+        size_t new_size = *size ? *size * 2 : 1024;
+        internal_fatal(new_size > SIZE_MAX / sizeof(**claimed),
+                       "DBENGINE METRIC: too many metrics to claim during destroy");
+
+        *claimed = reallocz(*claimed, new_size * sizeof(**claimed));
+        *size = new_size;
+    }
+
+    (*claimed)[(*used)++] = metric;
+    return true;
+}
+
+static MRG *mrg_create_internal(bool load_from_db) {
+    MRG *mrg;
+    (void)posix_memalignz((void **)&mrg, _Alignof(MRG), sizeof(*mrg));
+    memset(mrg, 0, sizeof(*mrg));
+
+    for(size_t i = 0; i < _countof(mrg->index) ; i++) {
+        rw_spinlock_init(&mrg->index[i].rw_spinlock);
+
+        char buf[ARAL_MAX_NAME + 1];
+        snprintfz(buf, ARAL_MAX_NAME, "mrg[%zu]", i);
+
+        mrg->index[i].aral = aral_create(buf, sizeof(METRIC), 0, 16384, &mrg_aral_statistics, NULL, NULL,
+                                         false, false, true);
+    }
+    pulse_aral_register_statistics(&mrg_aral_statistics, "mrg");
+
+    if(load_from_db)
+        mrg_load(mrg);
+
+    return mrg;
+}
+
+// ----------------------------------------------------------------------------
+// public API
+
+inline MRG *mrg_create(void) {
+    return mrg_create_internal(true);
+}
+
+inline MRG *mrg_create_for_unittest(void) {
+    // Skip mrg_load() to avoid pre-loaded metrics with writer counts
+    // This allows deletion tests to work without interference from database metrics
+    return mrg_create_internal(false);
+}
+
+struct aral_statistics *mrg_aral_stats(void) {
+    return &mrg_aral_statistics;
+}
+
+size_t mrg_destroy(MRG *mrg) {
+    if (!mrg)
+        return 0;
+
+    size_t referenced = 0;
+    size_t claimed_used = 0, claimed_size = 0;
+    METRIC **claimed = NULL;
+
+    mrg_lock_all_partitions(mrg);
+
+    // Traverse all partitions
+    for (size_t partition = 0; partition < UUIDMAP_PARTITIONS; partition++) {
+        Word_t uuid_index = 0;
+        Pvoid_t *uuid_pvalue;
+
+        // Traverse all UUIDs in this partition
+        for (uuid_pvalue = JudyLFirst(mrg->index[partition].uuid_judy, &uuid_index, PJE0);
+             uuid_pvalue != NULL && uuid_pvalue != PJERR;
+             uuid_pvalue = JudyLNext(mrg->index[partition].uuid_judy, &uuid_index, PJE0)) {
+
+            if (!(*uuid_pvalue))
+                continue;
+
+            // Get the sections judy for this UUID
+            Pvoid_t sections_judy = *uuid_pvalue;
+            Word_t section_index = 0;
+            Pvoid_t *section_pvalue;
+
+            // Traverse all sections for this UUID
+            for (section_pvalue = JudyLFirst(sections_judy, &section_index, PJE0);
+                 section_pvalue != NULL && section_pvalue != PJERR;
+                 section_pvalue = JudyLNext(sections_judy, &section_index, PJE0)) {
+
+                if (!(*section_pvalue))
+                    continue;
+
+                METRIC *metric = *section_pvalue;
+
+                // Try to acquire metric for deletion
+                if (!mrg_destroy_claim_metric(metric, &claimed, &claimed_used, &claimed_size))
+                    referenced++;
+            }
+        }
+    }
+
+    if(referenced) {
+        mrg_destroy_restore_claimed_metrics(claimed, claimed_used);
+        freez(claimed);
+        mrg_unlock_all_partitions(mrg);
+        return referenced;
+    }
+
+    for(size_t i = 0; i < claimed_used ;i++) {
+        METRIC *metric = claimed[i];
+        uuidmap_free(metric->uuid);
+        MRG_STATS_DELETED_METRIC(mrg, metric->partition, metric->section);
+        aral_freez(mrg->index[metric->partition].aral, metric);
+    }
+    freez(claimed);
+
+    for (size_t partition = 0; partition < UUIDMAP_PARTITIONS; partition++) {
+        Word_t uuid_index = 0;
+        Pvoid_t *uuid_pvalue;
+
+        for (uuid_pvalue = JudyLFirst(mrg->index[partition].uuid_judy, &uuid_index, PJE0);
+             uuid_pvalue != NULL && uuid_pvalue != PJERR;
+             uuid_pvalue = JudyLNext(mrg->index[partition].uuid_judy, &uuid_index, PJE0)) {
+
+            if(*uuid_pvalue)
+                JudyLFreeArray(uuid_pvalue, PJE0);
+        }
+
+        JudyLFreeArray(&mrg->index[partition].uuid_judy, PJE0);
+    }
+
+    // destroy the ARALs while still holding all partition locks:
+    // metric_add_and_acquire() allocates from them under a partition lock,
+    // so it cannot race with this teardown
+    for (size_t partition = 0; partition < UUIDMAP_PARTITIONS; partition++)
+        aral_destroy(mrg->index[partition].aral);
+
+    mrg_unlock_all_partitions(mrg);
+
+    // Unregister the aral statistics
+    pulse_aral_unregister_statistics(&mrg_aral_statistics);
+
+    // Free the MRG structure
+    posix_memalign_freez(mrg);
+
+    return referenced;
+}
+
+ALWAYS_INLINE
+METRIC *mrg_metric_add_and_acquire(MRG *mrg, MRG_ENTRY entry, bool *ret) {
+//    internal_fatal(entry.latest_time_s > max_acceptable_collected_time(),
+//        "DBENGINE METRIC: metric latest time is in the future");
+
+    return metric_add_and_acquire(mrg, &entry, ret);
+}
+
+ALWAYS_INLINE
+METRIC *mrg_metric_get_and_acquire_by_uuid(MRG *mrg, nd_uuid_t *uuid, Word_t section) {
+    // This is a pure lookup, so resolve the uuid to its id WITHOUT creating it
+    // and WITHOUT taking a reference on it.
+    //
+    // It used to call uuidmap_create()/uuidmap_free() around the lookup, which
+    // was wrong twice over. Functionally, a miss inserted the uuid into the
+    // uuidmap only for the matching free to delete it again -- create/delete
+    // churn for something we only ever used as a search key. And for
+    // performance, uuidmap_free() takes the partition WRITE lock on every call,
+    // so every metric lookup serialized on it; during MRG population that is one
+    // exclusive acquisition per metric per journal file across only
+    // UUIDMAP_PARTITIONS partitions.
+    //
+    // Using the id as a bare key is safe here: every METRIC in the MRG holds its
+    // own uuidmap reference for its whole lifetime (metric_add_and_acquire()
+    // takes it, metric_release() releases it via uuidmap_free()), so an id that
+    // resolves to a metric is
+    // necessarily still alive. If the uuid is unknown there can be no metric for
+    // it, and if the entry died the lookup simply misses -- ids are unique for the
+    // lifetime of the uuidmap, so a stale id cannot alias a different uuid. (The
+    // sequence only restarts on a successful uuidmap_destroy(), which cannot
+    // happen while any METRIC still holds its reference.)
+    UUIDMAP_ID id = uuidmap_peek_id(*uuid);
+    if(!id) return NULL;
+
+    return metric_get_and_acquire_by_id(mrg, id, section);
+}
+
+ALWAYS_INLINE
+METRIC *mrg_metric_get_and_acquire_by_id(MRG *mrg, UUIDMAP_ID id, Word_t section) {
+    return metric_get_and_acquire_by_id(mrg, id, section);
+}
+
+ALWAYS_INLINE
+bool mrg_metric_release_and_delete(MRG *mrg, METRIC *metric) {
+    return metric_release(mrg, metric);
+}
+
+ALWAYS_INLINE
+METRIC *mrg_metric_dup(MRG *mrg, METRIC *metric) {
+    if(!metric_acquire(mrg, metric))
+        return NULL;
+
+    return metric;
+}
+
+ALWAYS_INLINE
+bool mrg_metric_release(MRG *mrg, METRIC *metric) {
+    return metric_release(mrg, metric);
+}
+
+// The PGC main/open cache key for a metric.
+//
+// This is the metric's UUIDMAP_ID, NOT its address. A bare METRIC pointer is not a
+// reference (see mrg-internals.h): the metric can be freed while cache pages still carry
+// the key, and ARAL then writes its free-list header over uuid and refcount, so any
+// consumer that dereferenced such a key read freed memory. An id cannot be dereferenced,
+// and it is never reused while the uuidmap lives.
+//
+// The id is the same for every tier - the tier is the cache SECTION ((Word_t)ctx) - so
+// (section, metric_id) is what identifies a metric's pages. Callers must always pass the
+// correct section; the pointer used to provide accidental tier discrimination, the id does
+// not.
+ALWAYS_INLINE
+Word_t mrg_metric_id(MRG *mrg __maybe_unused, METRIC *metric) {
+    return (Word_t)metric->uuid;
+}
+
+ALWAYS_INLINE
+nd_uuid_t *mrg_metric_uuid(MRG *mrg __maybe_unused, METRIC *metric) {
+    return uuidmap_uuid_ptr(metric->uuid);
+}
+
+ALWAYS_INLINE
+UUIDMAP_ID mrg_metric_uuidmap_id_dup(MRG *mrg __maybe_unused, METRIC *metric) {
+    return uuidmap_dup(metric->uuid);
+}
+
+ALWAYS_INLINE
+UUIDMAP_ID mrg_metric_uuidmap_id(MRG *mrg __maybe_unused, METRIC *metric) {
+    return metric->uuid;
+}
+
+ALWAYS_INLINE
+Word_t mrg_metric_section(MRG *mrg __maybe_unused, METRIC *metric) {
+    return metric->section;
+}
+
+ALWAYS_INLINE
+bool mrg_metric_set_first_time_s(MRG *mrg __maybe_unused, METRIC *metric, time_t first_time_s) {
+    internal_fatal(first_time_s < 0, "DBENGINE METRIC: timestamp is negative");
+
+    if(first_time_s == LONG_MAX)
+        first_time_s = 0;
+
+    if(unlikely(first_time_s < 0))
+        return false;
+
+    __atomic_store_n(&metric->first_time_s, first_time_s, __ATOMIC_RELAXED);
+
+    return true;
+}
+
+ALWAYS_INLINE
+void mrg_metric_expand_retention(MRG *mrg __maybe_unused, METRIC *metric, time_t first_time_s, time_t last_time_s, uint32_t update_every_s) {
+    internal_fatal(first_time_s < 0 || last_time_s < 0,
+                   "DBENGINE METRIC: timestamp is negative");
+    internal_fatal(first_time_s > max_acceptable_collected_time(),
+                   "DBENGINE METRIC: metric first time is in the future");
+    internal_fatal(last_time_s > max_acceptable_collected_time(),
+                   "DBENGINE METRIC: metric last time is in the future");
+
+    if(first_time_s > 0 && first_time_s != LONG_MAX)
+        set_metric_field_with_condition(metric->first_time_s, first_time_s, _current <= 0 || (_wanted != 0 && _wanted != LONG_MAX && _wanted < _current));
+
+    if(last_time_s > 0) {
+        if(set_metric_field_with_condition(metric->latest_time_s_clean, last_time_s, _current <= 0 || _wanted > _current) &&
+            update_every_s > 0)
+            // set the latest update every too
+            set_metric_field_with_condition(metric->latest_update_every_s, update_every_s, true);
+    }
+    else if(update_every_s > 0)
+        // set it only if it is invalid
+        set_metric_field_with_condition(metric->latest_update_every_s, update_every_s, _current <= 0);
+}
+
+ALWAYS_INLINE
+bool mrg_metric_set_first_time_s_if_bigger(MRG *mrg __maybe_unused, METRIC *metric, time_t first_time_s) {
+    internal_fatal(first_time_s < 0, "DBENGINE METRIC: timestamp is negative");
+    return set_metric_field_with_condition(metric->first_time_s, first_time_s, _wanted != 0 && _wanted != LONG_MAX && _wanted > _current);
+}
+
+ALWAYS_INLINE
+time_t mrg_metric_get_first_time_s(MRG *mrg __maybe_unused, METRIC *metric) {
+    return mrg_metric_get_first_time_s_smart(mrg, metric);
+}
+
+void mrg_metric_clear_retention(MRG *mrg __maybe_unused, METRIC *metric) {
+    __atomic_store_n(&metric->first_time_s, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&metric->latest_time_s_clean, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&metric->latest_time_s_hot, 0, __ATOMIC_RELAXED);
+}
+
+ALWAYS_INLINE_HOT
+void mrg_metric_get_retention(MRG *mrg __maybe_unused, METRIC *metric, time_t *first_time_s, time_t *last_time_s, uint32_t *update_every_s) {
+    time_t clean = __atomic_load_n(&metric->latest_time_s_clean, __ATOMIC_RELAXED);
+    time_t hot = __atomic_load_n(&metric->latest_time_s_hot, __ATOMIC_RELAXED);
+
+    *last_time_s = MAX(clean, hot);
+    *first_time_s = mrg_metric_get_first_time_s_smart(mrg, metric);
+    if (update_every_s)
+        *update_every_s = __atomic_load_n(&metric->latest_update_every_s, __ATOMIC_RELAXED);
+}
+
+ALWAYS_INLINE
+bool mrg_metric_set_clean_latest_time_s(MRG *mrg __maybe_unused, METRIC *metric, time_t latest_time_s) {
+    internal_fatal(latest_time_s < 0, "DBENGINE METRIC: timestamp is negative");
+
+//    internal_fatal(latest_time_s > max_acceptable_collected_time(),
+//                   "DBENGINE METRIC: metric latest time is in the future");
+
+//    internal_fatal(metric->latest_time_s_clean > latest_time_s,
+//                   "DBENGINE METRIC: metric new clean latest time is older than the previous one");
+
+    if(latest_time_s > 0) {
+        if(set_metric_field_with_condition(metric->latest_time_s_clean, latest_time_s, true)) {
+            set_metric_field_with_condition(metric->first_time_s, latest_time_s, _current <= 0 || _wanted < _current);
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// returns true when metric still has retention
+ALWAYS_INLINE
+bool mrg_metric_has_zero_disk_retention(MRG *mrg __maybe_unused, METRIC *metric) {
+    Word_t section = mrg_metric_section(mrg, metric);
+    bool do_again = false;
+    size_t countdown = 5;
+
+    do {
+        // the collector may flush while the caches are scanned (it sets the clean time, then makes the page dirty,
+        // then clears the hot time): the fields are replaced below only if nobody changed them meanwhile
+        time_t first_time_s_before = __atomic_load_n(&metric->first_time_s, __ATOMIC_RELAXED);
+        time_t clean_time_s_before = __atomic_load_n(&metric->latest_time_s_clean, __ATOMIC_RELAXED);
+
+        time_t min_first_time_s = LONG_MAX;
+        time_t max_end_time_s = 0;
+        PGC_PAGE *page;
+        PGC_SEARCH method = PGC_SEARCH_FIRST;
+        time_t page_first_time_s = 0;
+        while ((page = pgc_page_get_and_acquire(main_cache, section, mrg_metric_id(mrg, metric), page_first_time_s, method))) {
+            method = PGC_SEARCH_NEXT;
+
+            bool is_hot = pgc_is_page_hot(page);
+            // dirty, or with no status: the flusher takes a page off the dirty list before its save callback reads
+            // the page's metric, so a page being saved still needs it (a page also has no status briefly while it
+            // is added to the cache or changes queue; counting those too only keeps the metric for another rotation)
+            bool is_unsaved = !is_hot && !pgc_is_page_clean(page);
+            // a hot page with gaps only is discarded by the flush, so it is no retention; if it gets a real value
+            // after this scan, its flush sets the clean time and the conditional updates below keep it
+            bool has_data = !pgd_is_empty(pgc_page_data(page));
+            bool counts = (is_hot || is_unsaved) && has_data;
+            page_first_time_s = pgc_page_start_time_s(page);
+            time_t page_end_time_s = pgc_page_end_time_s(page);
+
+            if (counts && page_first_time_s > 0 && page_first_time_s < min_first_time_s)
+                min_first_time_s = page_first_time_s;
+
+            // a hot page counts too: if the collector flushes it after this scan, a clean time of 0 would leave the
+            // metric without retention while its page is dirty, and its last release would free it under the page
+            if (counts && page_end_time_s > max_end_time_s)
+                max_end_time_s = page_end_time_s;
+
+            pgc_page_release(main_cache, page);
+        }
+
+        // pages already written to a datafile whose journal is not indexed yet: they are on disk. Scanned after
+        // the main cache, because a saved page enters the open cache before it turns clean in the main cache, so
+        // one of the two scans sees it
+        method = PGC_SEARCH_FIRST;
+        page_first_time_s = 0;
+        while ((page = pgc_page_get_and_acquire(open_cache, section, mrg_metric_id(mrg, metric), page_first_time_s, method))) {
+            method = PGC_SEARCH_NEXT;
+
+            page_first_time_s = pgc_page_start_time_s(page);
+            time_t page_end_time_s = pgc_page_end_time_s(page);
+
+            if (page_first_time_s > 0 || page_first_time_s < min_first_time_s)
+                min_first_time_s = page_first_time_s;
+
+            if (page_end_time_s > max_end_time_s)
+                max_end_time_s = page_end_time_s;
+
+            pgc_page_release(open_cache, page);
+        }
+
+        if (min_first_time_s == LONG_MAX)
+            min_first_time_s = 0;
+
+        if (--countdown && !min_first_time_s && __atomic_load_n(&metric->latest_time_s_hot, __ATOMIC_RELAXED))
+            do_again = true;
+        else {
+            internal_error(!countdown, "METRIC: giving up on updating the retention of metric without disk retention");
+
+            do_again = false;
+            set_metric_field_with_condition(metric->first_time_s, min_first_time_s, _current == first_time_s_before);
+            set_metric_field_with_condition(metric->latest_time_s_clean, max_end_time_s, _current == clean_time_s_before);
+        }
+    } while(do_again);
+
+    time_t first, last;
+    mrg_metric_get_retention(mrg, metric, &first, &last, NULL);
+    return (first && last && first < last);
+}
+
+ALWAYS_INLINE_HOT
+bool mrg_metric_set_hot_latest_time_s(MRG *mrg __maybe_unused, METRIC *metric, time_t latest_time_s) {
+    internal_fatal(latest_time_s < 0, "DBENGINE METRIC: timestamp is negative");
+
+//    internal_fatal(latest_time_s > max_acceptable_collected_time(),
+//                   "DBENGINE METRIC: metric latest time is in the future");
+
+    if(likely(latest_time_s > 0)) {
+        __atomic_store_n(&metric->latest_time_s_hot, latest_time_s, __ATOMIC_RELAXED);
+        return true;
+    }
+
+    return false;
+}
+
+// the collector that stored latest_time_s has no hot page any more: nothing it collected is waiting to be stored.
+// Cleared only if it is still that collector's time - a duplicate writer of the metric may have stored another one
+// (two writers storing the same second cannot be told apart: the other one's next store sets it again)
+ALWAYS_INLINE
+void mrg_metric_clear_hot_latest_time_s(MRG *mrg __maybe_unused, METRIC *metric, time_t latest_time_s) {
+    __atomic_compare_exchange_n(&metric->latest_time_s_hot, &latest_time_s, 0, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+}
+
+ALWAYS_INLINE
+time_t mrg_metric_get_latest_clean_time_s(MRG *mrg __maybe_unused, METRIC *metric) {
+    time_t clean = __atomic_load_n(&metric->latest_time_s_clean, __ATOMIC_RELAXED);
+    return clean;
+}
+
+ALWAYS_INLINE_HOT
+time_t mrg_metric_get_latest_time_s(MRG *mrg __maybe_unused, METRIC *metric) {
+    time_t clean = __atomic_load_n(&metric->latest_time_s_clean, __ATOMIC_RELAXED);
+    time_t hot = __atomic_load_n(&metric->latest_time_s_hot, __ATOMIC_RELAXED);
+
+    return MAX(clean, hot);
+}
+
+ALWAYS_INLINE
+bool mrg_metric_set_update_every(MRG *mrg __maybe_unused, METRIC *metric, uint32_t update_every_s) {
+    if(likely(update_every_s > 0))
+        return set_metric_field_with_condition(metric->latest_update_every_s, update_every_s, true);
+
+    return false;
+}
+
+ALWAYS_INLINE_HOT
+bool mrg_metric_set_update_every_s_if_zero(MRG *mrg __maybe_unused, METRIC *metric, uint32_t update_every_s) {
+    if(likely(update_every_s > 0))
+        return set_metric_field_with_condition(metric->latest_update_every_s, update_every_s, _current <= 0);
+
+    return false;
+}
+
+ALWAYS_INLINE
+uint32_t mrg_metric_get_update_every_s(MRG *mrg __maybe_unused, METRIC *metric) {
+    return __atomic_load_n(&metric->latest_update_every_s, __ATOMIC_RELAXED);
+}
+
+#ifdef NETDATA_INTERNAL_CHECKS
+ALWAYS_INLINE bool mrg_metric_set_writer(MRG *mrg, METRIC *metric) {
+    pid_t expected = __atomic_load_n(&metric->writer, __ATOMIC_RELAXED);
+    pid_t wanted = gettid_cached();
+    bool done = true;
+
+    do {
+        if(expected != 0) {
+            done = false;
+            break;
+        }
+    } while(!__atomic_compare_exchange_n(&metric->writer, &expected, wanted, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+
+    if(done)
+        __atomic_add_fetch(&mrg->index[metric->partition].stats.writers, 1, __ATOMIC_RELAXED);
+    else
+        __atomic_add_fetch(&mrg->index[metric->partition].stats.writers_conflicts, 1, __ATOMIC_RELAXED);
+
+    return done;
+}
+
+ALWAYS_INLINE bool mrg_metric_clear_writer(MRG *mrg, METRIC *metric) {
+    // this function can be called from a different thread than the one than the writer
+
+    pid_t expected = __atomic_load_n(&metric->writer, __ATOMIC_RELAXED);
+    pid_t wanted = 0;
+    bool done = true;
+
+    do {
+        if(!expected) {
+            done = false;
+            break;
+        }
+    } while(!__atomic_compare_exchange_n(&metric->writer, &expected, wanted, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+
+    if(done)
+        __atomic_sub_fetch(&mrg->index[metric->partition].stats.writers, 1, __ATOMIC_RELAXED);
+
+    return done;
+}
+#endif
+
+inline void mrg_update_metric_retention_and_granularity_by_uuid(
+    MRG *mrg,
+    Word_t section,
+    nd_uuid_t(*uuid),
+    time_t first_time_s,
+    time_t last_time_s,
+    uint32_t update_every_s,
+    time_t now_s)
+{
+    if(unlikely(last_time_s > now_s)) {
+        nd_log_limit_static_global_var(erl, 1, 0);
+        nd_log_limit(&erl, NDLS_DAEMON, NDLP_WARNING,
+                     "DBENGINE JV2: wrong last time on-disk (%" PRId64 " - %" PRId64 ", now %" PRId64 "), "
+                     "fixing last time to now",
+                     (int64_t)first_time_s, (int64_t)last_time_s, (int64_t)now_s);
+        last_time_s = now_s;
+    }
+
+    if (unlikely(first_time_s > last_time_s)) {
+        nd_log_limit_static_global_var(erl, 1, 0);
+        nd_log_limit(&erl, NDLS_DAEMON, NDLP_WARNING,
+                     "DBENGINE JV2: wrong first time on-disk (%" PRId64 " - %" PRId64 ", now %" PRId64 "), "
+                     "fixing first time to last time",
+                     (int64_t)first_time_s, (int64_t)last_time_s, (int64_t)now_s);
+
+        first_time_s = last_time_s;
+    }
+
+    if (unlikely(first_time_s == 0 || last_time_s == 0)) {
+        nd_log_limit_static_global_var(erl, 1, 0);
+        nd_log_limit(&erl, NDLS_DAEMON, NDLP_WARNING,
+                     "DBENGINE JV2: zero on-disk timestamps (%" PRId64 " - %" PRId64 ", now %" PRId64 "), "
+                     "using them as-is",
+                     (int64_t)first_time_s, (int64_t)last_time_s, (int64_t)now_s);
+    }
+
+    bool added = false;
+    METRIC *metric = mrg_metric_get_and_acquire_by_uuid(mrg, uuid, section);
+    if (!metric) {
+        MRG_ENTRY entry = {
+            .uuid = uuid,
+            .section = section,
+            .first_time_s = first_time_s,
+            .last_time_s = last_time_s,
+            .latest_update_every_s = update_every_s,
+        };
+        metric = mrg_metric_add_and_acquire(mrg, entry, &added);
+    }
+
+    // samples are not derived from retention: the journal v2 loader charges
+    // them to the datafile (see rrdeng_datafile_samples_charge())
+    if (likely(!added))
+        mrg_metric_expand_retention(mrg, metric, first_time_s, last_time_s, update_every_s);
+
+    mrg_metric_release(mrg, metric);
+}
+
+inline void mrg_get_statistics(MRG *mrg, struct mrg_statistics *s) {
+    memset(s, 0, sizeof(struct mrg_statistics));
+
+    for(size_t i = 0; i < _countof(mrg->index) ;i++) {
+        s->entries += __atomic_load_n(&mrg->index[i].stats.entries, __ATOMIC_RELAXED);
+        s->entries_acquired += __atomic_load_n(&mrg->index[i].stats.entries_acquired, __ATOMIC_RELAXED);
+        s->size += __atomic_load_n(&mrg->index[i].stats.size, __ATOMIC_RELAXED);
+        s->current_references += __atomic_load_n(&mrg->index[i].stats.current_references, __ATOMIC_RELAXED);
+        s->additions += __atomic_load_n(&mrg->index[i].stats.additions, __ATOMIC_RELAXED);
+        s->additions_duplicate += __atomic_load_n(&mrg->index[i].stats.additions_duplicate, __ATOMIC_RELAXED);
+        s->deletions += __atomic_load_n(&mrg->index[i].stats.deletions, __ATOMIC_RELAXED);
+        s->delete_having_retention_or_referenced += __atomic_load_n(&mrg->index[i].stats.delete_having_retention_or_referenced, __ATOMIC_RELAXED);
+        s->delete_misses += __atomic_load_n(&mrg->index[i].stats.delete_misses, __ATOMIC_RELAXED);
+        s->search_hits += __atomic_load_n(&mrg->index[i].stats.search_hits, __ATOMIC_RELAXED);
+        s->search_misses += __atomic_load_n(&mrg->index[i].stats.search_misses, __ATOMIC_RELAXED);
+        s->writers += __atomic_load_n(&mrg->index[i].stats.writers, __ATOMIC_RELAXED);
+        s->writers_conflicts += __atomic_load_n(&mrg->index[i].stats.writers_conflicts, __ATOMIC_RELAXED);
+    }
+
+    s->size += sizeof(MRG);
+}

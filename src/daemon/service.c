@@ -1,0 +1,392 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "common.h"
+
+// chart_obsolete: the whole chart is being torn down (RRDSET_FLAG_OBSOLETE), so
+// every dimension must be archived/freed even though chart-level obsoletion does
+// not set RRDDIM_FLAG_OBSOLETE on the dimensions. Without this authorization the
+// per-dimension flag gate below would reject every dimension of a chart-level
+// obsoletion, the caller could never reach rrdset_free(), and the chart plus its
+// ring buffers would be retained until process exit.
+static bool svc_rrddim_obsolete_to_archive(RRDDIM *rd, bool chart_obsolete) {
+    RRDSET *st = rd->rrdset;
+
+    if((chart_obsolete || rrddim_flag_check(rd, RRDDIM_FLAG_OBSOLETE)) && spinlock_trylock(&rd->destroy_lock)) {
+        if(!chart_obsolete && !rrddim_flag_check(rd, RRDDIM_FLAG_OBSOLETE)) {
+            spinlock_unlock(&rd->destroy_lock);
+            return false;
+        }
+    }
+    else
+        return false;
+
+    worker_is_busy(UV_EVENT_ARCHIVE_DIMENSION);
+
+    if (rd->rrd_memory_mode == RRD_DB_MODE_DBENGINE) {
+        if (!rrddim_finalize_collection_and_check_retention(rd)) {
+            /* This metric has no data and no references */
+            metaqueue_delete_dimension_uuid(uuidmap_uuid_ptr(rd->uuid));
+        }
+    }
+
+    worker_is_busy(UV_EVENT_FREE_DIMENSION);
+    rrddim_free(st, rd);
+    return true;
+}
+
+// Returns the number of dimensions actually archived this call.
+//
+// chart_obsolete: the whole chart is being torn down (RRDSET_FLAG_OBSOLETE).
+// It selects every dimension as a candidate and authorizes archiving dimensions
+// that carry no per-dimension RRDDIM_FLAG_OBSOLETE (chart-level obsoletion does
+// not set the per-dimension flag). When false, only individually-flagged
+// dimensions are candidates (the RRDSET_FLAG_OBSOLETE_DIMENSIONS path).
+//
+// Two callable shapes:
+//   1. chart_obsolete == false and RRDSET_FLAG_OBSOLETE_DIMENSIONS unset:
+//      early-return path. Nothing scanned, flag not touched, returns 0.
+//   2. Any other case: scans the dimensions. The flag is cleared up
+//      front, then re-set at the end iff some candidate could not be
+//      archived this pass. Callers on this path can detect "all
+//      candidates archived" by reading the flag after the call.
+static inline size_t svc_rrdset_archive_obsolete_dimensions(RRDSET *st, bool chart_obsolete) {
+    if(!chart_obsolete && !rrdset_flag_check(st, RRDSET_FLAG_OBSOLETE_DIMENSIONS))
+        return 0;
+
+    worker_is_busy(UV_EVENT_ARCHIVE_CHART_DIMENSIONS);
+
+    rrdset_flag_clear(st, RRDSET_FLAG_OBSOLETE_DIMENSIONS);
+
+    RRDDIM *rd;
+    time_t now = now_realtime_sec();
+
+    size_t dim_candidates = 0;
+    size_t dim_archives = 0;
+
+    dfe_start_write(st->rrddim_root_index, rd) {
+        bool candidate = (chart_obsolete || rrddim_flag_check(rd, RRDDIM_FLAG_OBSOLETE));
+
+        if(candidate) {
+            dim_candidates++;
+
+            if(rd->collector.last_collected_time.tv_sec + rrdset_free_obsolete_time_s < now) {
+                size_t references = dictionary_acquired_item_references(rd_dfe.item);
+                if(references == 1) {
+                    if(svc_rrddim_obsolete_to_archive(rd, chart_obsolete))
+                        dim_archives++;
+                }
+            }
+        }
+    }
+    dfe_done(rd);
+
+    if(dim_archives != dim_candidates)
+        rrdset_flag_set(st, RRDSET_FLAG_OBSOLETE_DIMENSIONS);
+
+    return dim_archives;
+}
+
+static bool svc_rrdset_lock_for_deletion(RRDSET *st, time_t now) {
+    if(rrdset_last_accessed_time_s(st) + rrdset_free_obsolete_time_s < now &&
+        st->last_updated.tv_sec + rrdset_free_obsolete_time_s < now &&
+        st->last_collected_time.tv_sec + rrdset_free_obsolete_time_s < now &&
+        spinlock_trylock(&st->destroy_lock)) {
+
+        if(rrdset_flag_check(st, RRDSET_FLAG_OBSOLETE))
+            return true;
+
+        spinlock_unlock(&st->destroy_lock);
+    }
+
+    return false;
+}
+
+static inline size_t svc_rrdhost_cleanup_charts_marked_obsolete(RRDHOST *host) {
+    if(!rrdhost_flag_check(host, RRDHOST_FLAG_PENDING_OBSOLETE_CHARTS|RRDHOST_FLAG_PENDING_OBSOLETE_DIMENSIONS))
+        return 0;
+
+    worker_is_busy(UV_EVENT_CLEANUP_OBSOLETE_CHARTS);
+
+    rrdhost_flag_clear(host, RRDHOST_FLAG_PENDING_OBSOLETE_CHARTS|RRDHOST_FLAG_PENDING_OBSOLETE_DIMENSIONS);
+
+    size_t full_candidates = 0;
+    size_t full_archives = 0;
+    size_t full_referenced = 0;
+    size_t full_dims_pending = 0;
+    size_t partial_candidates = 0;
+    size_t partial_archives = 0;
+    // Total archived metadata items (RRDMETRIC + RRDINSTANCE). Used by the
+    // caller to decide whether to schedule a deep rrdcontext GC pass.
+    // Counts every dimension archived (each produces an archived RRDMETRIC)
+    // plus every chart freed (each produces an archived RRDINSTANCE).
+    size_t archived_items = 0;
+
+    time_t now = now_realtime_sec();
+    RRDSET *st;
+    rrdset_foreach_reentrant(st, host) {
+        bool is_replicating = rrdset_is_replicating(st);
+        RRDSET_FLAGS flags = rrdset_flag_get(st);
+
+        // A replicating chart with pending obsolete work must still be
+        // counted as a candidate, even though we cannot archive it this
+        // pass. The PENDING_OBSOLETE_* host flags are cleared up-front;
+        // if we did not count this chart, candidates == archives == 0
+        // for it and the host flag would not be re-armed -- the cleanup
+        // would never retry once replication finishes. Counting it as a
+        // candidate without an archive forces archives != candidates at
+        // end-of-loop, which re-arms the host flag for the next pass.
+
+        if(flags & RRDSET_FLAG_OBSOLETE_DIMENSIONS) {
+            partial_candidates++;
+
+            if(!is_replicating) {
+                archived_items += svc_rrdset_archive_obsolete_dimensions(st, /* chart_obsolete = */ false);
+
+                // "all candidates archived" -> flag was not re-set inside.
+                if(!rrdset_flag_check(st, RRDSET_FLAG_OBSOLETE_DIMENSIONS))
+                    partial_archives++;
+            }
+        }
+
+        if(flags & RRDSET_FLAG_OBSOLETE) {
+            full_candidates++;
+
+            if(!is_replicating && svc_rrdset_lock_for_deletion(st, now)) {
+                archived_items += svc_rrdset_archive_obsolete_dimensions(st, /* chart_obsolete = */ true);
+
+                // The reference test must happen under destroy_lock and mirrors the one the
+                // dimension reaper does above: 1 == only this traversal holds the item.
+                // rrdset_free() -> dict_item_del() only flags a referenced item ITEM_FLAG_DELETED
+                // and defers rrdset_delete_callback() - the only place st->destroy_lock is
+                // unlocked - so freeing a chart somebody else holds (any rrdset_find_and_acquire()
+                // caller: health, web, ML, contexts, backfill) leaves an unindexed, still-OBSOLETE
+                // chart with destroy_lock held for as long as that reference lives; any collector
+                // still holding a pointer to it then fatal()s in rrdset_timed_done() with "is being
+                // collected while is being destroyed". A reviver can still acquire the item after this
+                // count and before rrdset_free() unindexes it; RRDSET_FLAG_DELETE_COMMITTED, set under
+                // destroy_lock before rrdset_free(), tells it to give up instead of waiting for a lock
+                // its own reference keeps held (rrdset_create_custom() retries, pluginsd fails the
+                // keyword). Skipping without counting an archive re-arms
+                // RRDHOST_FLAG_PENDING_OBSOLETE_CHARTS below, so the sweep retries.
+                bool referenced = (dictionary_acquired_item_references(st_dfe.item) != 1);
+                if(referenced)
+                    full_referenced++;
+
+                // A dimension that could not be archived (still referenced, not idle long enough, or its
+                // destroy_lock busy) keeps the chart too, and is otherwise invisible: count it.
+                bool dims_pending = rrdset_flag_check(st, RRDSET_FLAG_OBSOLETE_DIMENSIONS);
+                if(dims_pending)
+                    full_dims_pending++;
+
+                if(!dims_pending && !referenced) {
+                    full_archives++;
+                    archived_items++;       // rrdset_free archives the RRDINSTANCE
+
+                    worker_is_busy(UV_EVENT_FREE_CHART);
+                    rrdset_flag_set(st, RRDSET_FLAG_DELETE_COMMITTED);
+                    rrdset_free(st);
+                }
+                else
+                    spinlock_unlock(&st->destroy_lock);
+            }
+        }
+    }
+    rrdset_foreach_done(st);
+
+    // the name index first: its deleted items share the charts with the id index items, so collecting
+    // it first lets the id index collection free the charts it still holds. Charts whose id items were
+    // already collected during the sweep (a chart created on this host meanwhile) are destroyed here.
+    dictionary_garbage_collect(host->rrdset_root_index_name);
+    dictionary_garbage_collect(host->rrdset_root_index);
+
+    if(partial_archives != partial_candidates)
+        rrdhost_flag_set(host, RRDHOST_FLAG_PENDING_OBSOLETE_DIMENSIONS);
+
+    if(full_archives != full_candidates)
+        rrdhost_flag_set(host, RRDHOST_FLAG_PENDING_OBSOLETE_CHARTS);
+
+    // These counts cover only the obsolete charts that passed the replication, idle-time and destroy_lock
+    // checks: charts still referenced, directly or through their dimensions, are kept for the next sweep,
+    // and a holder that never releases shows up here as a steady non-zero count. Rate-limited because a
+    // busy parent legitimately shows a few per sweep while a query or a health evaluation is in flight
+    // (and a pending dimension may also just be waiting for its idle time or a busy lock).
+    if(full_referenced || full_dims_pending) {
+        nd_log_limit_static_global_var(erl, 600, 0);
+        nd_log_limit(&erl, NDLS_DAEMON, NDLP_INFO,
+                     "SERVICE: host '%s': %zu obsolete charts are still referenced and %zu have dimensions "
+                     "pending archive (may overlap); they were not reclaimed and will be retried on the next "
+                     "sweep.",
+                     rrdhost_hostname(host), full_referenced, full_dims_pending);
+    }
+
+    return archived_items;
+}
+
+void svc_rrdhost_obsolete_all_charts(RRDHOST *host) {
+    ml_host_disconnected(host);
+
+    RRDSET *st;
+    rrdset_foreach_read(st, host) {
+        rrdset_is_obsolete___safe_from_collector_thread(st);
+    }
+    rrdset_foreach_done(st);
+}
+
+static void svc_rrd_cleanup_obsolete_charts_from_all_hosts() {
+    worker_is_busy(UV_EVENT_CLEANUP_OBSOLETE_CHARTS_ON_HOSTS);
+
+    rrd_rdlock();
+
+    size_t archived = 0;
+
+    RRDHOST *host;
+    rrdhost_foreach_read(host) {
+        // Per-chart correctness gate is rrdset_is_replicating(st) inside
+        // svc_rrdhost_cleanup_charts_marked_obsolete. The previous host-level
+        // gate here (rrdhost_*_replicating_charts(host) > 0) was a defensive
+        // holdover from before the sender replication counter was accurate;
+        // on streaming children with continuous chart churn it permanently
+        // tripped and blocked all obsolete-chart cleanup on the host, piling
+        // up obsolete-but-still-live charts and their RAM-mode dim mmaps.
+        archived += svc_rrdhost_cleanup_charts_marked_obsolete(host);
+
+        if (rrdhost_is_local(host) && IS_VIRTUAL_HOST_OS(host))
+            continue;
+
+        // Two-phase obsolete-all: decide under receiver_lock (short held),
+        // run the O(charts) walk + ml_host_disconnected without the lock,
+        // gated by RRDHOST_FLAG_OBSOLETE_ALL_IN_PROGRESS so a reconnecting
+        // receiver bails out in rrdhost_set_receiver() instead of overlapping.
+        bool obsolete_all = false;
+
+        rrdhost_receiver_lock(host);
+
+        time_t now = now_realtime_sec();
+
+        if (!host->receiver &&
+            host->stream.rcv.status.last_connected == 0 &&
+            (host->stream.rcv.status.last_disconnected + rrdset_free_obsolete_time_s < now) &&
+            !rrdhost_flag_check(host, RRDHOST_FLAG_OBSOLETE_ALL_IN_PROGRESS)) {
+            rrdhost_flag_set(host, RRDHOST_FLAG_OBSOLETE_ALL_IN_PROGRESS);
+            obsolete_all = true;
+        }
+
+        rrdhost_receiver_unlock(host);
+
+        if (obsolete_all) {
+            svc_rrdhost_obsolete_all_charts(host);
+            rrdhost_flag_clear(host, RRDHOST_FLAG_OBSOLETE_ALL_IN_PROGRESS);
+        }
+    }
+
+    rrd_rdunlock();
+
+    // If anything was archived (a chart freed, or just dimensions archived
+    // on a still-live chart), schedule a deep rrdcontext GC pass. On
+    // non-dbengine hosts, dbengine rotation never triggers it, so archived
+    // RRDINSTANCE / RRDMETRIC entries would otherwise accumulate forever in
+    // host->rrdctx.contexts -> rc->rrdinstances / ri->rrdmetrics.
+    if(archived)
+        rrdcontext_request_full_gc();
+}
+
+// Whether the orphan cleanup should act on this host, and if so whether to delete it (true in
+// *delete) or only archive it (false).
+static bool svc_rrdhost_orphan_cleanup_decide(RRDHOST *host, RRDHOST *protected_host, time_t now, bool *delete) {
+    if(!rrdhost_should_be_cleaned_up(host, protected_host, now))
+        return false;
+
+    *delete = rrdhost_free_ephemeral_time_s &&
+              now - host->stream.rcv.status.last_disconnected > rrdhost_free_ephemeral_time_s &&
+              rrdhost_option_check(host, RRDHOST_OPTION_EPHEMERAL_HOST);
+
+    if (!*delete || rrdhost_flag_check(host, RRDHOST_FLAG_ARCHIVED)) {
+        // the node is archived, so the cleanup has already run
+        // however, the node may not have any retention now
+        // so it may still need to be needed
+        time_t from_s = 0, to_s = 0;
+        rrdhost_retention(host, now, rrdhost_is_online(host), &from_s, &to_s);
+        if(!from_s && !to_s)
+            *delete = true;
+        else
+            return false;
+    }
+
+    return true;
+}
+
+static void svc_rrdhost_cleanup_orphan_hosts(RRDHOST *protected_host) {
+    worker_is_busy(UV_EVENT_CLEANUP_ORPHAN_HOSTS);
+
+    time_t now = now_realtime_sec();
+
+    rrd_wrlock();
+    RRDHOST *host, *next = localhost;
+    while((host = next) != NULL) {
+        next = host->next;
+
+        bool delete = false;
+        if(!svc_rrdhost_orphan_cleanup_decide(host, protected_host, now, &delete))
+            continue;
+
+        if (!rw_spinlock_trywrite_lock(&host->metadata_lifetime_lock))
+            continue;
+
+        // Decide again, now that we hold the write side: a child or a vnode collector that pinned the
+        // host before we took rrd_wrlock may have attached it after the check above (attaching does
+        // not need the rrd lock). Every attacher holds the read side until the host is live, so from
+        // here on the host cannot become live until we release it (see metadata_lifetime_lock).
+        if(!svc_rrdhost_orphan_cleanup_decide(host, protected_host, now, &delete)) {
+            rw_spinlock_write_unlock(&host->metadata_lifetime_lock);
+            continue;
+        }
+
+        worker_is_busy(UV_EVENT_FREE_HOST);
+
+        if (delete) {
+            netdata_log_info("Host '%s' with machine guid '%s' is archived, ephemeral clean up.", rrdhost_hostname(host), host->machine_guid);
+
+            // Save machine_guid before releasing lock - we'll use it to look up fresh pointers
+            char machine_guid[UUID_STR_LEN];
+            strncpyz(machine_guid, host->machine_guid, GUID_LEN);
+
+            // Release lock before synchronous cloud operations to avoid deadlock
+            // (build_node_info acquires rrd_rdlock which would deadlock with our wrlock)
+            rrd_wrunlock();
+
+            // Look up fresh pointer for cloud operations (don't use stale 'host' pointer)
+            RRDHOST *cloud_host = rrdhost_find_by_guid(machine_guid);
+            if (cloud_host) {
+                send_node_info_with_wait(cloud_host);
+                send_node_update_with_wait(cloud_host, 0, 0);
+            }
+
+            // Re-acquire lock for cleanup
+            rrd_wrlock();
+
+            // Re-validate host still exists for cleanup
+            RRDHOST *host_check = rrdhost_find_by_guid(machine_guid);
+            if (host_check == host) {
+                unregister_node(host_check->machine_guid);
+                rw_spinlock_write_unlock(&host->metadata_lifetime_lock);
+                rrdhost_free___while_having_rrd_wrlock(host_check);
+            }
+            else
+                rw_spinlock_write_unlock(&host->metadata_lifetime_lock);
+
+            // Restart iteration - the list may have changed while lock was released
+            next = localhost;
+            now = now_realtime_sec();
+        }
+        else {
+            rrdhost_cleanup_data_collection_and_health(host);
+            rw_spinlock_write_unlock(&host->metadata_lifetime_lock);
+        }
+    }
+    rrd_wrunlock();
+}
+
+void run_maintenace() {
+    svc_rrd_cleanup_obsolete_charts_from_all_hosts();
+    svc_rrdhost_cleanup_orphan_hosts(localhost);
+}

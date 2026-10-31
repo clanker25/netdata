@@ -1,0 +1,188 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package confgroup
+
+import (
+	"errors"
+	"fmt"
+	"regexp"
+	"strings"
+
+	"github.com/netdata/netdata/go/plugins/plugin/framework/collectorapi"
+
+	"github.com/gohugoio/hashstructure"
+	"gopkg.in/yaml.v2"
+)
+
+const (
+	keyName         = "name"
+	keyModule       = "module"
+	keyUpdateEvery  = "update_every"
+	keyDetectRetry  = "autodetection_retry"
+	keyPriority     = "priority"
+	keyLabels       = "labels"
+	keyVnode        = "vnode"
+	keyFunctionOnly = "function_only"
+
+	ikeySource                 = "__source__"
+	ikeySourceType             = "__source_type__"
+	ikeyProvider               = "__provider__"
+	ikeyTrustDiscoveredTargets = "__trust_discovered_targets__"
+	ikeyDiscoveryPipelineID    = "__discovery_pipeline_id__"
+)
+
+const (
+	TypeStock      = "stock"
+	TypeUser       = "user"
+	TypeDiscovered = "discovered"
+	TypeDyncfg     = "dyncfg"
+)
+
+type Config map[string]any
+
+func (c Config) HashIncludeMap(_ string, k, _ any) (bool, error) {
+	s := k.(string)
+	if s == ikeyTrustDiscoveredTargets {
+		// Opt-in changes effective configuration; absent/false retain the default hash.
+		return c.SourceType() == TypeDiscovered && c.TrustDiscoveredTargets(), nil
+	}
+	if s == ikeyDiscoveryPipelineID {
+		// Reconcile ownership changes too, so later trust revocation uses the current owner.
+		return c.SourceType() == TypeDiscovered && c.TrustDiscoveredTargets() && c.DiscoveryPipelineID() != "", nil
+	}
+	return !strings.HasPrefix(s, "__") && !strings.HasSuffix(s, "__"), nil
+}
+
+func (c Config) Set(key string, value any) Config { c[key] = value; return c }
+func (c Config) Get(key string) any               { return c[key] }
+
+func (c Config) Name() string            { v, _ := c.Get(keyName).(string); return v }
+func (c Config) Module() string          { v, _ := c.Get(keyModule).(string); return v }
+func (c Config) FullName() string        { return fullName(c.Name(), c.Module()) }
+func (c Config) ExposedKey() string      { return c.FullName() }
+func (c Config) UpdateEvery() int        { v, _ := c.Get(keyUpdateEvery).(int); return v }
+func (c Config) AutoDetectionRetry() int { v, _ := c.Get(keyDetectRetry).(int); return v }
+func (c Config) Priority() int           { v, _ := c.Get(keyPriority).(int); return v }
+func (c Config) Labels() map[any]any     { v, _ := c.Get(keyLabels).(map[any]any); return v }
+func (c Config) Hash() uint64            { return calcHash(c) }
+func (c Config) Vnode() string           { v, _ := c.Get(keyVnode).(string); return v }
+func (c Config) FunctionOnly() bool      { v, _ := c.Get(keyFunctionOnly).(bool); return v }
+
+func (c Config) SetName(v string) Config   { return c.Set(keyName, v) }
+func (c Config) SetModule(v string) Config { return c.Set(keyModule, v) }
+
+func (c Config) UID() string {
+	return fmt.Sprintf("%s_%s_%s_%s_%d", c.SourceType(), c.Provider(), c.Source(), c.FullName(), c.Hash())
+}
+
+func (c Config) Source() string                { v, _ := c.Get(ikeySource).(string); return v }
+func (c Config) SourceType() string            { v, _ := c.Get(ikeySourceType).(string); return v }
+func (c Config) Provider() string              { v, _ := c.Get(ikeyProvider).(string); return v }
+func (c Config) SetSource(v string) Config     { return c.Set(ikeySource, v) }
+func (c Config) SetSourceType(v string) Config { return c.Set(ikeySourceType, v) }
+func (c Config) SetProvider(v string) Config   { return c.Set(ikeyProvider, v) }
+
+// TrustDiscoveredTargets reads authority stamped by the discovery pipeline after rendering.
+func (c Config) TrustDiscoveredTargets() bool {
+	v, _ := c.Get(ikeyTrustDiscoveredTargets).(bool)
+	return v
+}
+
+func (c Config) SetTrustDiscoveredTargets(v bool) Config {
+	return c.Set(ikeyTrustDiscoveredTargets, v)
+}
+
+// DiscoveryPipelineID identifies the producing pipeline, independently of target source text.
+func (c Config) DiscoveryPipelineID() string {
+	v, _ := c.Get(ikeyDiscoveryPipelineID).(string)
+	return v
+}
+
+func (c Config) SetDiscoveryPipelineID(v string) Config {
+	return c.Set(ikeyDiscoveryPipelineID, v)
+}
+
+func SourceTypePriority(sourceType string) int {
+	switch sourceType {
+	default:
+		return 0
+	case TypeStock:
+		return 2
+	case TypeDiscovered:
+		return 4
+	case TypeUser:
+		return 8
+	case TypeDyncfg:
+		return 16
+	}
+}
+
+func (c Config) SourceTypePriority() int {
+	return SourceTypePriority(c.SourceType())
+}
+
+func (c Config) Clone() (cloned Config, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			cloned = nil
+			err = errors.New("confgroup: clone config: YAML marshal panic")
+		}
+	}()
+	type plain Config
+	bytes, err := yaml.Marshal((plain)(c))
+	if err != nil {
+		return nil, err
+	}
+	if err := yaml.Unmarshal(bytes, &cloned); err != nil {
+		return nil, err
+	}
+	return cloned, nil
+}
+
+func (c Config) ApplyDefaults(def Default) {
+	if c.UpdateEvery() <= 0 {
+		v := firstPositive(def.UpdateEvery, collectorapi.UpdateEvery)
+		c.Set("update_every", v)
+	}
+	if c.AutoDetectionRetry() <= 0 {
+		v := firstPositive(def.AutoDetectionRetry, collectorapi.AutoDetectionRetry)
+		c.Set("autodetection_retry", v)
+	}
+	if c.Priority() <= 0 {
+		v := firstPositive(def.Priority, collectorapi.Priority)
+		c.Set("priority", v)
+	}
+	if c.UpdateEvery() < def.MinUpdateEvery && def.MinUpdateEvery > 0 {
+		c.Set("update_every", def.MinUpdateEvery)
+	}
+	if c.Name() == "" {
+		c.Set("name", c.Module())
+	} else {
+		c.Set("name", cleanName(c.Name()))
+	}
+}
+
+var reInvalidCharacters = regexp.MustCompile(`\s+|\.+|:+`)
+
+func cleanName(name string) string {
+	return reInvalidCharacters.ReplaceAllString(name, "_")
+}
+
+func fullName(name, module string) string {
+	if name == module {
+		return name
+	}
+	return module + "_" + name
+}
+
+func calcHash(obj any) uint64 {
+	hash, _ := hashstructure.Hash(obj, nil)
+	return hash
+}
+
+func firstPositive(value int, others ...int) int {
+	if value > 0 || len(others) == 0 {
+		return value
+	}
+	return firstPositive(others[0], others[1:]...)
+}

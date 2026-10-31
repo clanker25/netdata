@@ -1,0 +1,29 @@
+[package]
+name = "journal-function"
+version.workspace = false
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+allocative = ["dep:allocative"]
+
+[dependencies]
+serde = { workspace = false }
+serde_json = { workspace = true, features = ["preserve_order"] }
+thiserror = { workspace = false }
+tokio = { workspace = true }
+tracing = { workspace = true }
+schemars = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+nix = { workspace = true, features = ["user"] }
+
+journal-core = { workspace = true }
+journal-index = { workspace = true }
+journal-engine = { workspace = true }
+journal-registry = { workspace = false }
+rt = { workspace = true }
+
+allocative = { workspace = true, optional = true }

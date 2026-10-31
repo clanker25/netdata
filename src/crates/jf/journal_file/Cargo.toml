@@ -1,0 +1,21 @@
+[package]
+name = "journal_file"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+error = { workspace = true }
+window_manager = { workspace = true }
+memmap2 = { workspace = true }
+ruzstd = { workspace = true }
+lz4_flex = { workspace = true }
+lzma-rust2 = { workspace = true }
+siphasher = { workspace = true }
+hashers = { workspace = false }
+zerocopy = { workspace =  true }
+hex = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

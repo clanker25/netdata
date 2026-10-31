@@ -1,0 +1,12 @@
+{
+  "connections": {
+    "accepted": 1,
+    "active": 2,
+    "idle": 1,
+    "closed": 2
+  },
+  "requests": {
+    "total": 1
+  },
+  "applications": {}
+}

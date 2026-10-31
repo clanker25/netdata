@@ -1,0 +1,257 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# ibm.d.plugin: the Go IBM ecosystem collector, built with CGO against the
+# vendored IBM MQ client libraries.
+#
+# include()d from the root file, so paths resolve against the repository and
+# build roots; nothing here may use CMAKE_CURRENT_LIST_DIR.
+
+include_guard()
+
+include(FetchContent)
+include(NetdataUtil)
+
+# add_ibm_plugin_target: builds ibm.d.plugin with CGO.
+#
+# Only the MQ collector needs the IBM MQ headers; the database collectors go
+# through unixODBC. The MQ client libraries themselves are downloaded at
+# configure time via FetchContent.
+macro(add_ibm_plugin_target)
+  set(IBM_MQ_DIR_NAME "ibm-mqclient")
+  set(IBM_MQ_BUILD_DIR "${CMAKE_BINARY_DIR}/${IBM_MQ_DIR_NAME}")
+  set(IBM_MQ_INSTALL_SUFFIX "lib/netdata/${IBM_MQ_DIR_NAME}")
+
+  get_vendored_url_and_hash(ibm_mq IBM_MQ)
+
+  FetchContent_Declare(
+    ibm_mq
+    SOURCE_DIR "${IBM_MQ_BUILD_DIR}"
+    CONFIGURE_COMMAND "${CMAKE_COMMAND} -E true"
+    BUILD_COMMAND "${CMAKE_COMMAND} -E true"
+    INSTALL_COMMAND "${CMAKE_COMMAND} -E true"
+    DOWNLOAD_NO_PROGRESS True
+    STEP_TARGETS build
+    URL ${IBM_MQ_URL}
+    URL_HASH SHA256=${IBM_MQ_HASH}
+  )
+
+  if(FETCHCONTENT_SOURCE_DIR_IBM_MQ)
+    message(STATUS "Copying IBM MQ client library sources from ${FETCHCONTENT_SOURCE_DIR_IBM_MQ} to ${IBM_MQ_BUILD_DIR}")
+    file(REMOVE_RECURSE "${IBM_MQ_BUILD_DIR}")
+    execute_process(
+      COMMAND ${CMAKE_COMMAND} -E copy_directory ${FETCHCONTENT_SOURCE_DIR_IBM_MQ} ${IBM_MQ_BUILD_DIR}
+      RESULT_VARIABLE IBM_MQ_COPY_STATUS
+    )
+
+    if(IBM_MQ_COPY_STATUS)
+      message(FATAL_ERROR "Failed to prepare IBM MQ client library directory")
+    endif()
+    FetchContent_MakeAvailable(ibm_mq)
+  else()
+    message(STATUS "Fetching IBM MQ client libraries for build")
+    FetchContent_MakeAvailable(ibm_mq)
+  endif()
+
+  # Find all Go source files - resolve symlinks for consistent dependency tracking
+  get_filename_component(RESOLVED_SOURCE_DIR "${CMAKE_SOURCE_DIR}" REALPATH)
+  file(GLOB_RECURSE IBM_PLUGIN_DEPS CONFIGURE_DEPENDS "${RESOLVED_SOURCE_DIR}/src/go/*.go")
+  list(APPEND IBM_PLUGIN_DEPS
+    "${RESOLVED_SOURCE_DIR}/src/go/go.mod"
+    "${RESOLVED_SOURCE_DIR}/src/go/go.sum"
+  )
+
+  # Configure build flags for hybrid approach:
+  # - Database collectors (AS/400, DB2) use unixODBC exclusively (no IBM headers needed)
+  # - MQ collector requires IBM MQ headers and libraries
+  set(IBM_CGO_CFLAGS "")
+  set(IBM_CGO_LDFLAGS "")
+  set(IBM_RPATH_FLAGS "")
+
+  # Add MQ support if MQ client libraries are available
+  if(EXISTS "${IBM_MQ_BUILD_DIR}/inc/cmqc.h")
+    set(IBM_CGO_CFLAGS "-I${IBM_MQ_BUILD_DIR}/inc")
+    set(IBM_CGO_LDFLAGS "-L${IBM_MQ_BUILD_DIR}/lib64 -lmqic_r")
+    set(IBM_RPATH_FLAGS "-Wl,-rpath,$ORIGIN/../../../${IBM_MQ_INSTALL_SUFFIX}/lib64")
+    set(MQ_INSTALLATION_PATH "${IBM_MQ_BUILD_DIR}")
+  else()
+    message(WARNING "IBM MQ client libraries not found - MQ PCF collector will be disabled")
+    set(MQ_INSTALLATION_PATH "")
+  endif()
+
+  # Spliced without empty elements: an empty ld.so element (a leading,
+  # trailing or doubled ':') is read by glibc as the current working directory.
+  set(IBM_LD_LIBRARY_PATH_TAIL "")
+  string(REPLACE ":" ";" _ibm_inherited_ld_path "$ENV{LD_LIBRARY_PATH}")
+  list(FILTER _ibm_inherited_ld_path EXCLUDE REGEX "^$")
+  if(NOT "${_ibm_inherited_ld_path}" STREQUAL "")
+    list(JOIN _ibm_inherited_ld_path ":" _ibm_inherited_ld_path)
+    set(IBM_LD_LIBRARY_PATH_TAIL ":${_ibm_inherited_ld_path}")
+  endif()
+
+  # The single $ORIGIN rpath makes the installed plugin find the MQ
+  # libraries where install_ibm_runtime() stages them.
+  add_custom_command(
+    OUTPUT ibm.d.plugin
+    COMMAND "${CMAKE_COMMAND}" -E env
+      GOROOT=${GO_ROOT}
+      CGO_ENABLED=1
+      CGO_CFLAGS=${IBM_CGO_CFLAGS}
+      CGO_LDFLAGS=${IBM_CGO_LDFLAGS}
+      # VERBATIM means no shell: $LD_LIBRARY_PATH would pass through literally,
+      # so the inherited value is spliced in at configure time instead.
+      LD_LIBRARY_PATH=${IBM_MQ_BUILD_DIR}/lib64${IBM_LD_LIBRARY_PATH_TAIL}
+      MQ_INSTALLATION_PATH=${MQ_INSTALLATION_PATH}
+      GOPROXY=https://proxy.golang.org,direct
+      "${GO_EXECUTABLE}" build
+        -buildvcs=false
+        -tags "ibm_mq"
+        -ldflags "${GO_LDFLAGS} -extldflags '${IBM_RPATH_FLAGS}'"
+        -o "${CMAKE_BINARY_DIR}/ibm.d.plugin" "./cmd/ibmdplugin"
+    DEPENDS ${IBM_PLUGIN_DEPS}
+    COMMENT "Building ibm.d.plugin (with CGO)"
+    WORKING_DIRECTORY "${RESOLVED_SOURCE_DIR}/src/go"
+    VERBATIM
+  )
+
+  add_custom_target(
+    ibm-plugin ALL
+    DEPENDS ibm.d.plugin
+  )
+endmacro()
+
+# Install the runtime components for the IBM MQ client libraries.
+#
+# This generates the list of files to install by parsing the manifest
+# file that's included with the libraries.
+function(install_ibm_runtime component)
+  file(READ "${IBM_MQ_BUILD_DIR}/MANIFEST.Redist" _ibm_manifest)
+  string(REPLACE "\n" ";" _ibm_manifest_lines "${_ibm_manifest}")
+  set(_files "")
+
+  foreach(line IN LISTS _ibm_manifest_lines)
+    if("${line}" STREQUAL "" OR "${line}" MATCHES "^#")
+      continue()
+    endif()
+
+    if(NOT "${line}" MATCHES ",(Client|Runtime|GSKit),")
+      continue()
+    endif()
+
+    string(REPLACE "," ";" _fields "${line}")
+
+    list(GET _fields 0 _file)
+
+    if(NOT "${_file}" MATCHES "^samp/")
+      list(APPEND _files "${_file}")
+    endif()
+  endforeach()
+
+  # RPM packaging metadata derived from the same manifest, in enumerated
+  # %files bands: 0750 on executables and libraries, 0640 on data files (all
+  # root:netdata), no ownership of any MQ directory, and no packaging of the
+  # versionless library symlinks. Exported for
+  # Packaging.cmake, which turns these into CPack RPM file-list entries and
+  # ownership/packaging exclusions; unused by other package formats.
+  set(_rpm_filelist "")
+  # The bare MANIFEST entry is real: the staged tree contains it (distinct
+  # from the MANIFEST.Redist file this function parses) and it is deliberately
+  # not packaged.
+  set(_rpm_excludes
+      "/usr/lib/netdata/${IBM_MQ_DIR_NAME}"
+      "/usr/lib/netdata/${IBM_MQ_DIR_NAME}/MANIFEST")
+
+  foreach(_file IN LISTS _files)
+    if(_file MATCHES "(^|/)lib(64)?/libimq[^/]*\\.so$")
+      # versionless C++ compat-library symlinks; staged but never packaged
+      list(APPEND _rpm_excludes "/usr/lib/netdata/${IBM_MQ_DIR_NAME}/${_file}")
+    elseif(_file MATCHES "(^|/)bin/" OR _file MATCHES "\\.so(\\.|$)"
+           OR _file MATCHES "\\.(dll|a)$" OR _file MATCHES "(^|/)gskit8/private_"
+           # the lib64 amqczsc tools belong in the 0750 band; their lib/
+           # twins stay in the 0640 band
+           OR _file MATCHES "(^|/)lib64/amqczscg?$")
+      list(APPEND _rpm_filelist
+           "%attr(0750,root,netdata) /usr/lib/netdata/${IBM_MQ_DIR_NAME}/${_file}")
+    endif()
+  endforeach()
+
+  # Directory entries are derived from the FULL manifest (every type,
+  # including the samp/ tree that is filtered out of the install): CMake's
+  # install(DIRECTORY ... FILES_MATCHING) creates every directory of the
+  # source tree regardless of the file filters, and no package owns any of
+  # them.
+  foreach(line IN LISTS _ibm_manifest_lines)
+    if("${line}" STREQUAL "" OR "${line}" MATCHES "^#")
+      continue()
+    endif()
+
+    string(REPLACE "," ";" _fields "${line}")
+    list(GET _fields 0 _file)
+
+    get_filename_component(_dir "${_file}" DIRECTORY)
+    while(NOT _dir STREQUAL "")
+      list(APPEND _rpm_excludes "/usr/lib/netdata/${IBM_MQ_DIR_NAME}/${_dir}")
+      get_filename_component(_dir "${_dir}" DIRECTORY)
+    endwhile()
+  endforeach()
+
+  list(REMOVE_DUPLICATES _rpm_excludes)
+  set(NETDATA_IBM_MQ_RPM_FILELIST "${_rpm_filelist}" PARENT_SCOPE)
+  set(NETDATA_IBM_MQ_RPM_DIR_EXCLUDES "${_rpm_excludes}" PARENT_SCOPE)
+
+  list(LENGTH _files _file_count)
+  math(EXPR _max_idx "${_file_count} - 1")
+
+  foreach(i RANGE 0 7)
+    foreach(_idx RANGE "${i}" "${_max_idx}" 8)
+      list(GET _files "${_idx}" _file)
+      list(APPEND _files_${i} "${_file}")
+    endforeach()
+
+    list(JOIN _files_${i} "|" _file_group_${i})
+  endforeach()
+
+  install(DIRECTORY ${IBM_MQ_BUILD_DIR}
+          DESTINATION ${LIBDIR_DEST}
+          COMPONENT ${component}
+          USE_SOURCE_PERMISSIONS
+          FILES_MATCHING REGEX "(${_file_group_0})"
+                         REGEX "(${_file_group_1})"
+                         REGEX "(${_file_group_2})"
+                         REGEX "(${_file_group_3})"
+                         REGEX "(${_file_group_4})"
+                         REGEX "(${_file_group_5})"
+                         REGEX "(${_file_group_6})"
+                         REGEX "(${_file_group_7})")
+endfunction()
+
+#
+# The plugin itself. The two helpers above have exactly one call site and it is
+# here, so ibm.d.plugin's whole build definition lives in this file rather than
+# being split between a helper module and a caller in the root.
+#
+if(ENABLE_PLUGIN_IBM)
+    add_ibm_plugin_target()
+
+    install(PROGRAMS ${CMAKE_BINARY_DIR}/ibm.d.plugin
+            COMPONENT plugin-ibm
+            DESTINATION ${PLUGINS_DEST})
+
+    # Install IBM plugin configuration files
+    install(FILES src/go/plugin/ibm.d/config/ibm.d.conf
+            COMPONENT plugin-ibm
+            DESTINATION ${LIBCONFIG_DEST})
+
+    install(FILES
+            src/go/plugin/ibm.d/config/ibm.d/as400.conf
+            src/go/plugin/ibm.d/config/ibm.d/db2.conf
+            src/go/plugin/ibm.d/config/ibm.d/websphere_jmx.conf
+            src/go/plugin/ibm.d/config/ibm.d/websphere_mp.conf
+            src/go/plugin/ibm.d/config/ibm.d/websphere_pmi.conf
+            COMPONENT plugin-ibm
+            DESTINATION ${LIBCONFIG_DEST}/ibm.d
+    )
+
+    install_ibm_runtime(plugin-ibm-libs)
+
+    netdata_add_deb_copyright(plugin-ibm netdata-plugin-ibm)
+    netdata_add_deb_copyright(plugin-ibm-libs netdata-plugin-ibm-libs)
+endif()

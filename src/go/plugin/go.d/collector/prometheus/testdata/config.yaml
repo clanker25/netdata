@@ -1,0 +1,57 @@
+vnode: "ok"
+update_every: 123
+autodetection_retry: 123
+url: "ok"
+body: "ok"
+method: "ok"
+headers:
+  ok: "ok"
+username: "ok"
+password: "ok"
+bearer_token_file: "ok"
+proxy_url: "ok"
+proxy_username: "ok"
+proxy_password: "ok"
+timeout: 123.123
+not_follow_redirects: yes
+tls_ca: "ok"
+tls_cert: "ok"
+tls_key: "ok"
+tls_skip_verify: yes
+force_http2: yes
+name: "ok"
+app: "ok"
+selector:
+  allow:
+    - "ok"
+  deny:
+    - "ok"
+relabeling:
+  - match: "ok"
+    metric_relabel_configs:
+      - source_labels:
+          - "ok"
+        separator: "ok"
+        regex: "ok"
+        modulus: 122
+        target_label: "ok"
+        replacement: "ok"
+        action: "replace"
+profiles:
+  mode: "ok"
+  mode_exact:
+    entries:
+      - name: "ok"
+  mode_combined:
+    entries:
+      - name: "ok"
+expected_prefix: "ok"
+max_input_series: 123
+max_output_series_per_context: 123
+fallback_type:
+  gauge:
+    - "ok"
+  counter:
+    - "ok"
+counter_raw_charts:
+  - "ok"

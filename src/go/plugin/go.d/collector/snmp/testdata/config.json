@@ -1,0 +1,45 @@
+{
+  "update_every": 123,
+  "hostname": "ok",
+  "create_vnode": false,
+  "vnode_device_down_threshold": 123,
+  "vnode": "ok",
+  "community": "ok",
+  "user": {
+    "name": "ok",
+    "level": "ok",
+    "auth_proto": "ok",
+    "auth_key": "ok",
+    "priv_proto": "ok",
+    "priv_key": "ok",
+    "context_name": "ok"
+  },
+  "options": {
+    "port": 123,
+    "retries": 123,
+    "timeout": 123,
+    "version": "ok",
+    "max_request_size": 124,
+    "max_repetitions": 123
+  },
+  "manual_profiles": [
+    "ok"
+  ],
+  "ping_only": false,
+  "ping": {
+    "enabled": false,
+    "network": "ip",
+    "privileged": false,
+    "interface": "eth0",
+    "packets": 5,
+    "interval": 122.123
+  },
+  "local_vnode": {
+    "name": "ok",
+    "guid": "ok",
+    "hostname": "ok",
+    "labels": {
+      "ok": "ok"
+    }
+  }
+}

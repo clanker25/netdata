@@ -1,0 +1,8 @@
+[
+  {
+    "volume_id": "V1",
+    "last_logical_provisioned": 107374182500,
+    "last_logical_used": 53687091200,
+    "last_thin_savings": 1.5
+  }
+]

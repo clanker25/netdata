@@ -1,0 +1,325 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "dictionary-internals.h"
+
+
+// ----------------------------------------------------------------------------
+// traversal with loop
+
+void *dictionary_foreach_start_rw(DICTFE *dfe) {
+    if(unlikely(!dfe || !dfe->dict)) return NULL;
+
+    // Keep the DICTIONARY object alive for the whole traversal: we are about to
+    // take its lock, and dictionary_destroy() would otherwise free the object
+    // (locks included) from under us. Released in dictionary_foreach_done().
+    dictionary_api_enter(dfe->dict);
+
+    DICTIONARY_STATS_TRAVERSALS_PLUS1(dfe->dict);
+
+    if(unlikely(is_dictionary_destroyed(dfe->dict))) {
+        internal_error(true, "DICTIONARY: attempted to dictionary_foreach_start_rw() on a destroyed dictionary");
+        dictionary_api_exit(dfe->dict);
+        dfe->dict = NULL;
+        dfe->item = NULL;
+        dfe->name = NULL;
+        dfe->value = NULL;
+        dfe->counter = 0;
+        return NULL;
+    }
+
+    dfe->counter = 0;
+    dfe->locked = true;
+    ll_recursive_lock(dfe->dict, dfe->rw);
+
+    // Re-check under the lock — dictionary_destroy() sets the flag while
+    // holding this lock, so this is the synchronized check.
+    if(unlikely(is_dictionary_destroyed(dfe->dict))) {
+        ll_recursive_unlock(dfe->dict, dfe->rw);
+        dfe->locked = false;
+        dictionary_api_exit(dfe->dict);
+        dfe->dict = NULL;
+        dfe->item = NULL;
+        dfe->name = NULL;
+        dfe->value = NULL;
+        dfe->counter = 0;
+        return NULL;
+    }
+
+    // get the first item from the list
+    DICTIONARY_ITEM *item = dfe->dict->items.list;
+
+    // skip all the deleted items
+    while(item && !item_check_and_acquire(dfe->dict, item))
+        item = item->next;
+
+    if(likely(item)) {
+        dfe->item = item;
+        dfe->name = (char *)item_get_name(item);
+        dfe->value = item->shared->value;
+    }
+    else {
+        dfe->item = NULL;
+        dfe->name = NULL;
+        dfe->value = NULL;
+    }
+
+    if(unlikely(dfe->rw == DICTIONARY_LOCK_REENTRANT)) {
+        ll_recursive_unlock(dfe->dict, dfe->rw);
+        dfe->locked = false;
+    }
+
+    return dfe->value;
+}
+
+ALWAYS_INLINE void *dictionary_foreach_next(DICTFE *dfe) {
+    if(unlikely(!dfe || !dfe->dict)) return NULL;
+
+    if(unlikely(is_dictionary_destroyed(dfe->dict))) {
+        internal_error(true, "DICTIONARY: attempted to dictionary_foreach_next() on a destroyed dictionary");
+        dictionary_foreach_done(dfe);
+        return NULL;
+    }
+
+    if(unlikely(dfe->rw == DICTIONARY_LOCK_REENTRANT) || !dfe->locked) {
+        ll_recursive_lock(dfe->dict, dfe->rw);
+        dfe->locked = true;
+
+        if(unlikely(is_dictionary_destroyed(dfe->dict))) {
+            // Unlock before foreach_done — in reentrant mode, foreach_done
+            // does not release the lock (it assumes the caller manages it).
+            ll_recursive_unlock(dfe->dict, dfe->rw);
+            dfe->locked = false;
+            dictionary_foreach_done(dfe);
+            return NULL;
+        }
+    }
+
+    // the item we just did
+    DICTIONARY_ITEM *item = dfe->item;
+
+    // get the next item from the list
+    DICTIONARY_ITEM *item_next = (item) ? item->next : NULL;
+
+    // skip all the deleted items until one that can be acquired is found
+    while(item_next && !item_check_and_acquire(dfe->dict, item_next))
+        item_next = item_next->next;
+
+    if(likely(item)) {
+        dict_item_release_and_check_if_it_is_deleted_and_can_be_removed_under_this_lock_mode(dfe->dict, item, dfe->rw);
+        // item_release(dfe->dict, item);
+    }
+
+    item = item_next;
+    if(likely(item)) {
+        dfe->item = item;
+        dfe->name = (char *)item_get_name(item);
+        dfe->value = item->shared->value;
+        dfe->counter++;
+    }
+    else {
+        dfe->item = NULL;
+        dfe->name = NULL;
+        dfe->value = NULL;
+    }
+
+    if(unlikely(dfe->rw == DICTIONARY_LOCK_REENTRANT)) {
+        ll_recursive_unlock(dfe->dict, dfe->rw);
+        dfe->locked = false;
+    }
+
+    return dfe->value;
+}
+
+void dictionary_foreach_unlock(DICTFE *dfe) {
+    if(dfe->locked) {
+        ll_recursive_unlock(dfe->dict, dfe->rw);
+        dfe->locked = false;
+    }
+}
+
+void dictionary_foreach_done(DICTFE *dfe) {
+    if(unlikely(!dfe || !dfe->dict)) return;
+
+    // work on a local copy: the dictionary of this traversal cannot change
+    // while we are tearing it down, and a single load keeps the null check
+    // above provably covering every use below
+    DICTIONARY *dict = dfe->dict;
+
+    // the item we just did
+    DICTIONARY_ITEM *item = dfe->item;
+
+    // release it, so that it can possibly be deleted
+    if(likely(item)) {
+        dict_item_release_and_check_if_it_is_deleted_and_can_be_removed_under_this_lock_mode(dict, item, dfe->rw);
+        // item_release(dict, item);
+    }
+
+    if(likely(dfe->rw != DICTIONARY_LOCK_REENTRANT) && dfe->locked) {
+        ll_recursive_unlock(dict, dfe->rw);
+        dfe->locked = false;
+    }
+
+    // matches dictionary_api_enter() in dictionary_foreach_start_rw()
+    dictionary_api_exit(dict);
+
+    dfe->dict = NULL;
+    dfe->item = NULL;
+    dfe->name = NULL;
+    dfe->value = NULL;
+    dfe->counter = 0;
+}
+
+// ----------------------------------------------------------------------------
+// API - walk through the dictionary.
+// The dictionary is locked for reading while this happens
+// do not use other dictionary calls while walking the dictionary - deadlock!
+
+static int dictionary_walkthrough_rw_internal(DICTIONARY *dict, char rw, dict_walkthrough_callback_t walkthrough_callback, void *data) {
+    if(unlikely(!dict || !walkthrough_callback)) return 0;
+
+    if(unlikely(is_dictionary_destroyed(dict))) {
+        internal_error(true, "DICTIONARY: attempted to dictionary_walkthrough_rw() on a destroyed dictionary");
+        return 0;
+    }
+
+    ll_recursive_lock(dict, rw);
+
+    if(unlikely(is_dictionary_destroyed(dict))) {
+        ll_recursive_unlock(dict, rw);
+        return 0;
+    }
+
+    DICTIONARY_STATS_WALKTHROUGHS_PLUS1(dict);
+
+    // written in such a way, that the callback can delete the active element
+
+    int ret = 0;
+    DICTIONARY_ITEM *item = dict->items.list;
+    while(item && !item_check_and_acquire(dict, item))
+        item = item->next;
+
+    while(item) {
+        if(unlikely(rw == DICTIONARY_LOCK_REENTRANT))
+            ll_recursive_unlock(dict, rw);
+
+        int r = walkthrough_callback(item, item->shared->value, data);
+
+        if(unlikely(rw == DICTIONARY_LOCK_REENTRANT))
+            ll_recursive_lock(dict, rw);
+
+        if(unlikely(r < 0)) {
+            dict_item_release_and_check_if_it_is_deleted_and_can_be_removed_under_this_lock_mode(dict, item, rw);
+            ret = r;
+            break;
+        }
+
+        ret += r;
+
+        DICTIONARY_ITEM *item_next = item->next;
+        while(item_next && !item_check_and_acquire(dict, item_next))
+            item_next = item_next->next;
+
+        dict_item_release_and_check_if_it_is_deleted_and_can_be_removed_under_this_lock_mode(dict, item, rw);
+        // item_release(dict, item);
+
+        item = item_next;
+    }
+
+    ll_recursive_unlock(dict, rw);
+
+    return ret;
+}
+
+// ----------------------------------------------------------------------------
+// sorted walkthrough
+
+typedef int (*qsort_compar)(const void *item1, const void *item2);
+
+static int dictionary_sort_compar(const void *item1, const void *item2) {
+    return strcmp(item_get_name((*(DICTIONARY_ITEM **)item1)), item_get_name((*(DICTIONARY_ITEM **)item2)));
+}
+
+static int dictionary_sorted_walkthrough_rw_internal(DICTIONARY *dict, char rw, dict_walkthrough_callback_t walkthrough_callback, void *data, dict_item_comparator_t item_comparator) {
+    if(unlikely(!dict || !walkthrough_callback)) return 0;
+
+    if(unlikely(is_dictionary_destroyed(dict))) {
+        internal_error(true, "DICTIONARY: attempted to dictionary_sorted_walkthrough_rw() on a destroyed dictionary");
+        return 0;
+    }
+
+    ll_recursive_lock(dict, rw);
+
+    if(unlikely(is_dictionary_destroyed(dict))) {
+        ll_recursive_unlock(dict, rw);
+        return 0;
+    }
+
+    DICTIONARY_STATS_WALKTHROUGHS_PLUS1(dict);
+
+    size_t entries = __atomic_load_n(&dict->entries, __ATOMIC_RELAXED);
+    DICTIONARY_ITEM **array = mallocz(sizeof(DICTIONARY_ITEM *) * entries);
+
+    size_t i;
+    DICTIONARY_ITEM *item;
+    for(item = dict->items.list, i = 0; item && i < entries; item = item->next) {
+        if(likely(item_check_and_acquire(dict, item)))
+            array[i++] = item;
+    }
+    ll_recursive_unlock(dict, rw);
+
+    if(unlikely(i != entries))
+        entries = i;
+
+    if(item_comparator)
+        qsort(array, entries, sizeof(DICTIONARY_ITEM *), (qsort_compar) item_comparator);
+    else
+        qsort(array, entries, sizeof(DICTIONARY_ITEM *), dictionary_sort_compar);
+
+    bool callit = true;
+    int ret = 0, r;
+    for(i = 0; i < entries ;i++) {
+        item = array[i];
+
+        if(callit)
+            r = walkthrough_callback(item, item->shared->value, data);
+
+        dict_item_release_and_check_if_it_is_deleted_and_can_be_removed_under_this_lock_mode(dict, item, rw);
+        // item_release(dict, item);
+
+        if(r < 0) {
+            ret = r;
+            r = 0;
+
+            // stop calling the callback,
+            // but we have to continue, to release all the reference counters
+            callit = false;
+        }
+        else
+            ret += r;
+    }
+
+    freez(array);
+
+    return ret;
+}
+
+
+int dictionary_walkthrough_rw(DICTIONARY *dict, char rw, dict_walkthrough_callback_t walkthrough_callback, void *data) {
+    if(unlikely(!dict)) return 0;
+
+    dictionary_api_enter(dict);
+    int ret = dictionary_walkthrough_rw_internal(dict, rw, walkthrough_callback, data);
+    dictionary_api_exit(dict);
+
+    return ret;
+}
+
+int dictionary_sorted_walkthrough_rw(DICTIONARY *dict, char rw, dict_walkthrough_callback_t walkthrough_callback, void *data, dict_item_comparator_t item_comparator) {
+    if(unlikely(!dict)) return 0;
+
+    dictionary_api_enter(dict);
+    int ret = dictionary_sorted_walkthrough_rw_internal(dict, rw, walkthrough_callback, data, item_comparator);
+    dictionary_api_exit(dict);
+
+    return ret;
+}

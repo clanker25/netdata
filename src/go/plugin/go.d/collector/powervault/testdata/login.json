@@ -1,0 +1,10 @@
+{
+  "status": [
+    {
+      "response-type": "Success",
+      "response": "abc123sessionkey",
+      "return-code": 1,
+      "response-type-numeric": 1
+    }
+  ]
+}

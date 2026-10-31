@@ -1,0 +1,145 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#ifndef NETDATA_DATAFILE_H
+#define NETDATA_DATAFILE_H
+
+#include "rrdengine.h"
+
+/* Forward declarations */
+struct rrdengine_datafile;
+struct rrdengine_journalfile;
+struct rrdengine_instance;
+
+#define DATAFILE_PREFIX "datafile-"
+#define DATAFILE_EXTENSION ".ndf"
+
+#define MIN_DATAFILE_SIZE   (512LU * 1024LU)
+#ifndef MAX_DATAFILE_SIZE
+#define MAX_DATAFILE_SIZE   (1LLU * 1024LLU * 1024LLU * 1024LLU)
+#endif
+#if  MIN_DATAFILE_SIZE > MAX_DATAFILE_SIZE
+#error MIN_DATAFILE_SIZE > MAX_DATAFILE_SIZE
+#endif
+
+#define MAX_DATAFILES (65536 * 4) /* Supports up to 64TiB for now */
+#define TARGET_DATAFILES (100)
+
+typedef enum __attribute__ ((__packed__)) {
+    DATAFILE_ACQUIRE_OPEN_CACHE = 0,
+    DATAFILE_ACQUIRE_PAGE_DETAILS,
+    DATAFILE_ACQUIRE_RETENTION,
+    DATAFILE_ACQUIRE_INDEXING,
+
+    // terminator
+    DATAFILE_ACQUIRE_MAX,
+} DATAFILE_ACQUIRE_REASONS;
+
+struct extent_page_details_list;
+typedef struct {
+    SPINLOCK spinlock;
+    struct extent_page_details_list *base;
+} EPDL_EXTENT;
+void epdl_extent_release(EPDL_EXTENT *e);
+
+#define DATAFILE_MAGIC 0xDA7AF11E
+
+/* only one event loop is supported for now */
+struct rrdengine_datafile {
+    uint32_t magic1;
+
+    unsigned tier;
+    unsigned fileno;
+    uv_file file;
+    uint64_t pos;
+    netdata_rwlock_t extent_rwlock;
+    struct rrdengine_instance *ctx;
+    struct rrdengine_journalfile *journalfile;
+
+    struct {
+        SPINLOCK spinlock;
+        bool populated;
+        bool v1_replayed;           // journalfile_load() replayed its journal v1; a rejected v2 is then not rebuilt
+                                    // (written only at load, before any reader runs)
+    } populate_mrg;
+
+    // its loaded journal v2 was rejected or could not be mapped: the size it is charged
+    // for, discharged when it is rebuilt, removed or deleted (atomic)
+    size_t rejected_v2_size;
+
+    // the startup rebuild replayed the journal v1 of its rejected v2 but published no new one:
+    // the replayed pages are still hot, so the journal indexer retries it (other rejected
+    // journals v2 have nothing to index until the next start)
+    bool rebuild_unpublished;
+
+    struct {
+        SPINLOCK spinlock;
+        size_t running;
+        size_t flushed_to_open_running;
+        bool failed; // a write to this datafile failed unrecoverably - report it full to force rotation
+#ifdef OS_WINDOWS
+        time_t last_sync_time;
+#endif
+    } writers;
+
+    struct {
+        SPINLOCK_TRACKED spinlock;  // tracked: 3600s deadlock fatals here are un-triagable without holder identity
+        unsigned lockers;
+        unsigned lockers_by_reason[DATAFILE_ACQUIRE_MAX];
+        bool available;
+        bool pending_deletion;
+    } users;
+
+    struct {
+        RW_SPINLOCK spinlock;
+        Pvoid_t epdl_per_extent;
+    } extent_epdl;
+
+    // The stored slots (samples) charged to this datafile - the tier's samples
+    // counter is the sum of these. See rrdeng_datafile_samples_charge().
+    struct {
+        uint64_t charged;
+        bool estimated;             // part of the charge is an estimate (a journal v2 without a samples section)
+    } samples;
+
+    uint32_t magic2;
+};
+
+// samples accounting of a datafile, see datafile.c
+void rrdeng_datafile_samples_charge(struct rrdengine_datafile *datafile, uint64_t samples);
+void rrdeng_datafile_samples_set(struct rrdengine_datafile *datafile, uint64_t samples, bool estimated);
+void rrdeng_datafile_samples_uncharge(struct rrdengine_datafile *datafile);
+
+bool datafile_acquire(struct rrdengine_datafile *df, DATAFILE_ACQUIRE_REASONS reason);
+void datafile_release_with_trace(struct rrdengine_datafile *df, DATAFILE_ACQUIRE_REASONS reason, const char *func);
+#define datafile_release(df, reason) datafile_release_with_trace(df, reason, __FUNCTION__)
+bool datafile_acquire_for_deletion(struct rrdengine_datafile *df);
+
+void datafile_list_insert(struct rrdengine_instance *ctx, struct rrdengine_datafile *datafile);
+void datafile_list_delete_unsafe(struct rrdengine_instance *ctx, struct rrdengine_datafile *datafile);
+void generate_datafilepath(struct rrdengine_datafile *datafile, char *str, size_t maxlen);
+bool datafile_name_parse(const char *name, unsigned *fileno);
+int close_data_file(struct rrdengine_datafile *datafile);
+int unlink_data_file(struct rrdengine_datafile *datafile);
+int destroy_data_file_unsafe(struct rrdengine_datafile *datafile);
+int create_data_file(struct rrdengine_datafile *datafile);
+int create_new_datafile_pair(struct rrdengine_instance *ctx);
+int init_data_files(struct rrdengine_instance *ctx);
+void finalize_data_files(struct rrdengine_instance *ctx);
+void cleanup_datafile_epdl_structures(struct rrdengine_datafile *datafile);
+
+NEVERNULL ALWAYS_INLINE
+static struct rrdengine_instance *datafile_ctx(struct rrdengine_datafile *datafile) {
+    if(unlikely(!datafile->ctx))
+        fatal("DBENGINE: datafile %u of tier %u has no ctx", datafile->fileno, datafile->tier);
+
+    if(unlikely(datafile->magic1 != DATAFILE_MAGIC || datafile->magic2 != DATAFILE_MAGIC))
+        fatal("DBENGINE: datafile %u of tier %u has invalid magic", datafile->fileno, datafile->tier);
+
+    return datafile->ctx;
+}
+
+#ifdef OS_WINDOWS
+void sync_uv_file_data(uv_file file);
+#endif
+
+#endif /* NETDATA_DATAFILE_H */

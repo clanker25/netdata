@@ -1,0 +1,10 @@
+vnode: "ok"
+update_every: 122
+autodetection_retry: 124
+dsn: "ok"
+timeout: 123.123
+functions:
+  top_queries:
+    disabled: true
+    timeout: 123.123
+    limit: 123

@@ -1,0 +1,169 @@
+# Netdata Static Binary Build
+
+Netdata provides pre-built static binaries for Linux systems where native packages aren't available. The [installer](/packaging/installer/methods/kickstart.md) automatically uses these static builds when needed.
+
+**Key Features**:
+
+- Self-contained installation (no system dependencies required, no interference with system libraries)
+- Installed under `/opt/netdata`
+
+## State permissions during updates
+
+Installation makes package directories traversable and initializes the service's library, cache and log roots.
+A build-generated inventory identifies the exact shipped paths; updates never discover directories by walking
+the installed tree. Application state directories outside shipped package paths retain their modes, including custom
+state paths outside the standard roots and execution-completion records. Paths occupied by shipped content remain
+installer-owned, including when a package directory is relocated through a symlink. Shared root initialization does
+not recursively change file owners. The eBPF ownership adjustment also targets exact shipped entries. Fleet preparation
+filters the inventory to match retained package content. The source installer's fallback directory setup uses the same
+ownership boundary.
+Explicit systemd-tmpfiles policies for database/claiming files and the historical static OTEL ownership repair still
+apply; an update is not a general recursive permission repair. Modes or owners changed by earlier updates are not
+automatically restored: recovery requires the affected application's intended permissions, which the installer cannot
+infer from the current state.
+
+The isolated regression suite exercises both directory-setup paths and actual makeself archive overlays:
+
+```sh
+python3 packaging/installer/tests/test_install_state.py -v
+sudo python3 packaging/installer/tests/test_install_state.py -v
+```
+
+The Linux root run additionally verifies distinct state owners and the historical ownership repair. It tests
+systemd-tmpfiles only when that command is available; otherwise that case is reported as skipped.
+All fixtures live in temporary directories; the tests do not install services or change host Netdata directories.
+
+## Supported Architectures
+
+| Architecture | Identifier | Notes                            |
+|--------------|------------|----------------------------------|
+| x86_64       | `x86_64`   | 64-bit Intel/AMD processors      |
+| ARMv6        | `armv6l`   | Raspberry Pi 1, some older SBCs  |
+| ARMv7        | `armv7l`   | Raspberry Pi 2/3, many SBCs      |
+| AArch64      | `aarch64`  | ARM 64-bit (Pi 4, newer devices) |
+
+---
+
+## Prepare Packages for Edge Device Monitoring
+
+Reduce the installed size of Netdata on robots and other edge devices with the [fleet preparation script](https://github.com/netdata/netdata/blob/master/packaging/makeself/prepare-fleet.py). Run it on your build host to strip symbols and keep the optional capabilities your devices use, then include the reduced package in your device image.
+
+Preparation requires Python 3.9 or newer, a GNU binutils or LLVM strip tool supporting the target's Linux ELF files, and a build filesystem supporting Unix permissions, symbolic links and hard links. The guide includes Linux and macOS tool setup.
+
+See [Minimize the Disk Footprint of Fleet Devices](/docs/fleet-management/minimize-disk-footprint.md) for the capability policy, tools, validation and image-controlled updates. The standard static updater downloads the full package again, so reduced images need a fleet-managed release workflow.
+
+## Build Process
+
+### Requirements
+
+| Requirement      | Purpose                                   |
+|------------------|-------------------------------------------|
+| Docker or Podman | Container environment for isolated builds |
+| ~10GB disk space | For build artifacts and containers        |
+
+### Preparation
+
+Before building, ensure your repository is clean from previous builds.
+
+→ [Perform a cleanup](/packaging/installer/methods/manual.md#perform-a-cleanup-in-your-netdata-repo)
+
+### Building the Static Binary
+
+Run the build script with your target [architecture identifier](#supported-architectures):
+
+```bash
+# For x86_64 (default)
+./packaging/makeself/build-static.sh x86_64
+
+# For ARM 64-bit (AArch64)
+./packaging/makeself/build-static.sh aarch64
+
+# For ARMv6
+./packaging/makeself/build-static.sh armv6l
+
+# For ARMv7
+./packaging/makeself/build-static.sh armv7l
+```
+
+The script will automatically:
+
+- Launch an Alpine Linux container
+- Install necessary build dependencies
+- Compile required third-party tools (bash, curl, etc.)
+- Build Netdata with optimized settings
+- Package everything into a self-extracting installer
+
+When building for an architecture different from your host:
+
+- The build process uses QEMU for emulation
+- Build times will be significantly longer
+- More disk space may be required
+- Some features may have architecture-specific limitations
+
+### Build Output
+
+The process generates several installer files in the artifacts/ directory:
+
+```
+artifacts/
+├── netdata-latest.gz.run                    # Latest version
+├── netdata-v[VERSION]-[BUILD].gz.run        # Specific version
+├── netdata-[ARCH]-latest.gz.run             # Architecture-specific latest
+└── netdata-[ARCH]-v[VERSION]-[BUILD].gz.run # Architecture-specific version
+```
+
+Example output:
+
+```
+$ ls -l artifacts/
+drwxrwxr-x   - user group     cache
+.rwxrwxr-x 94M user group     netdata-latest.gz.run
+.rwxrwxr-x 94M user group     netdata-v2.3.0-193-nightly.gz.run
+.rwxrwxr-x 94M user group     netdata-x86_64-latest.gz.run
+.rwxrwxr-x 94M user group     netdata-x86_64-v2.3.0-193-nightly.gz.run
+```
+
+## Advanced Build Options
+
+### Debug Builds
+
+For troubleshooting, you can create a debug-enabled build:
+
+```bash
+./packaging/makeself/build-static.sh x86_64 debug
+```
+
+Debug build characteristics:
+
+- Larger file size
+- Runtime performance impact
+- Additional diagnostic information
+- Disabled optimizations
+- Enhanced tracing capabilities
+
+## Troubleshooting
+
+### Running with Valgrind
+
+To diagnose memory issues or crashes:
+
+```bash
+PATH="/opt/netdata/bin:${PATH}" valgrind --undef-value-errors=no /opt/netdata/bin/srv/netdata -D
+```
+
+**Important notes**:
+
+- Performance will be significantly reduced (~10x slower)
+- Stop Valgrind with Ctrl+C
+- The `--undef-value-errors=no` flag suppresses hundreds of false positives from the bundled libraries
+
+### Crash Reporting
+
+If Netdata crashes during development or testing:
+
+1. Capture the complete Valgrind output
+2. [Open a GitHub Issue](https://github.com/netdata/netdata/issues/new/choose)
+3. Include:
+    - Build details (architecture, version)
+    - Complete stack trace
+    - Steps to reproduce the issue

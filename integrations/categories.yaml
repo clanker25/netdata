@@ -1,0 +1,125 @@
+- id: deploy
+  name: Deploy
+  description: ""
+  children:
+    - id: deploy.operating-systems
+      name: Operating Systems
+      description: ""
+      children: []
+    - id: deploy.docker-kubernetes
+      name: Docker & Kubernetes
+      description: ""
+      children: []
+    - id: deploy.provisioning-systems
+      name: Provisioning Systems
+      description: ""
+      children: []
+- id: data-collection
+  name: Data Collection
+  description: ""
+  children:
+    - id: data-collection.databases
+      name: Databases
+      description: ""
+      children: []
+    - id: data-collection.web-servers-and-proxies
+      name: Web Servers and Proxies
+      description: ""
+      children: []
+    - id: data-collection.containers-and-vms
+      name: Containers and VMs
+      description: ""
+      children: []
+    - id: data-collection.operating-systems
+      name: Operating Systems
+      description: ""
+      children: []
+    - id: data-collection.networking
+      name: Networking
+      description: ""
+      children: []
+    - id: data-collection.cloud-and-devops
+      name: Cloud and DevOps
+      description: ""
+      children: []
+    - id: data-collection.hardware-and-sensors
+      name: Hardware and Sensors
+      description: ""
+      children: []
+    - id: data-collection.applications
+      name: Applications
+      description: ""
+      collector_default: true
+      children: []
+    - id: data-collection.storage
+      name: Storage and Filesystems
+      description: ""
+      children: []
+    - id: data-collection.synthetic-testing
+      name: Synthetic Testing
+      description: ""
+      children: []
+- id: network-performance-monitoring
+  name: Network Performance Monitoring
+  description: "Monitor the network fabric end to end with Netdata: per-vendor device metrics over SNMP and vendor APIs, BGP, licensing, network topologies, network flows, SNMP traps, and syslog from network devices."
+  children:
+    - id: network-performance-monitoring.device-metrics
+      name: Device Metrics
+      description: "Per-vendor metrics from routers, switches, firewalls, access points, load balancers, and other network devices, collected over SNMP profiles and vendor APIs."
+      children: []
+    - id: network-performance-monitoring.licensing
+      name: Licensing Monitoring
+      description: "Track license state, entitlements, and expiry across supported network device vendors."
+      children: []
+    - id: network-performance-monitoring.topologies
+      name: Topologies
+      description: "Discover and visualize how the network is connected: L2/L3 device topology, live network connections, streaming, and virtual infrastructure."
+      children: []
+    - id: network-performance-monitoring.bgp
+      name: BGP Monitoring
+      description: "Monitor BGP peering and routing health across network devices and software routing stacks."
+      children: []
+    - id: network-performance-monitoring.flows
+      name: Network Flows
+      description: "Network flow ingestion and enrichment data sources for NetFlow / IPFIX / sFlow analysis"
+      children:
+        - id: network-performance-monitoring.flows.sources
+          name: Flow Protocols
+          description: "Flow protocols Netdata receives directly from routers, switches, and software exporters"
+          children: []
+        - id: network-performance-monitoring.flows.enrichment-methods
+          name: Enrichment Methods
+          description: "Configurable data sources that label flow records with operational context: geolocation, AS / BGP routing, network ownership, exporter / interface metadata, classifiers, and inner-packet decapsulation"
+          children: []
+    - id: network-performance-monitoring.traps
+      name: SNMP Traps
+      description: "Receive, decode, store, query, and forward SNMP Trap and INFORM events from network devices."
+      children: []
+    - id: network-performance-monitoring.syslog
+      name: Syslog from Network Devices
+      description: "Ingest syslog from network devices via the OpenTelemetry Collector."
+      children: []
+- id: logs
+  name: Logs
+  description: "Monitoring logs on your infrastructure"
+  children: []
+- id: export
+  name: exporters
+  description: "Exporter Integrations"
+  children: []
+- id: notify
+  name: notifications
+  description: "Notification Integrations"
+  children:
+    - id: notify.agent
+      name: Agent Dispatched Notifications
+      description: ""
+      children: []
+    - id: notify.cloud
+      name: Centralized Cloud Notifications
+      description: ""
+      children: []
+- id: auth
+  name: authentication
+  description: "Authentication & Authorization"
+  children: []

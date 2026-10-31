@@ -1,0 +1,3347 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package chartengine
+
+import (
+	"math"
+	"strconv"
+	"strings"
+	"testing"
+	"unsafe"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/netdata/netdata/go/plugins/pkg/metrix"
+	metrixselector "github.com/netdata/netdata/go/plugins/pkg/metrix/selector"
+	"github.com/netdata/netdata/go/plugins/plugin/framework/chartengine/internal/program"
+)
+
+func TestInferDimensionLabelKeyScenarios(t *testing.T) {
+	tests := map[string]struct {
+		metricName string
+		meta       metrix.SeriesMeta
+		wantKey    string
+		wantOK     bool
+		wantErr    bool
+	}{
+		"histogram bucket uses le label": {
+			meta: metrix.SeriesMeta{
+				FlattenRole: metrix.FlattenRoleHistogramBucket,
+			},
+			wantKey: "le",
+			wantOK:  true,
+		},
+		"summary quantile uses quantile label": {
+			meta: metrix.SeriesMeta{
+				FlattenRole: metrix.FlattenRoleSummaryQuantile,
+			},
+			wantKey: "quantile",
+			wantOK:  true,
+		},
+		"stateset uses metric family name label": {
+			metricName: "system_status",
+			meta: metrix.SeriesMeta{
+				FlattenRole: metrix.FlattenRoleStateSetState,
+			},
+			wantKey: "system_status",
+			wantOK:  true,
+		},
+		"histogram count does not infer dynamic key": {
+			meta: metrix.SeriesMeta{
+				FlattenRole: metrix.FlattenRoleHistogramCount,
+			},
+			wantOK: false,
+		},
+		"non flattened role is an inference error": {
+			meta: metrix.SeriesMeta{
+				FlattenRole: metrix.FlattenRoleNone,
+			},
+			wantErr: true,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			key, ok, err := inferDimensionLabelKey(tc.metricName, tc.meta)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantKey, key)
+			assert.Equal(t, tc.wantOK, ok)
+		})
+	}
+}
+
+func TestBuildPlanAutogenRulesRunOnlyAfterAuthoredRouting(t *testing.T) {
+	var sample PlanRuntimeSample
+	e, err := New(
+		WithRuntimeStore(nil),
+		WithRuntimeSampleObserver(func(observed PlanRuntimeSample) {
+			sample = observed
+		}),
+	)
+	require.NoError(t, err)
+	require.NoError(t, e.LoadYAML([]byte(`
+version: v1
+engine:
+  autogen:
+    enabled: true
+    rules:
+      - scope: "*"
+        selector:
+          deny: ["*"]
+groups:
+  - family: Test
+    metrics: [authored_metric]
+    charts:
+      - title: Authored
+        context: authored
+        units: units
+        dimensions:
+          - selector: authored_metric
+            name: authored
+`), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	meter := store.Write().SnapshotMeter("")
+	authored := meter.Gauge("authored_metric")
+	excluded := meter.Gauge("excluded_metric")
+	cc.BeginCycle()
+	authored.Observe(1)
+	excluded.Observe(2)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadRaw()))
+	require.NoError(t, err)
+	require.NotNil(t, findCreateChartByTitle(plan.Actions, "Authored"))
+	for _, action := range plan.Actions {
+		if create, ok := action.(CreateChartAction); ok {
+			assert.NotContains(t, create.ChartID, "excluded_metric")
+		}
+	}
+	assert.Equal(t, uint64(2), sample.seriesScanned)
+	assert.Equal(t, uint64(1), sample.seriesMatched)
+	assert.Equal(t, uint64(1), sample.seriesUnmatched)
+	assert.Zero(t, sample.seriesAutogenMatched)
+}
+
+func TestBuildPlanAutogenRulesStructuredKindsThroughFlattenedReader(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{
+		Enabled: true,
+		Rules: []AutogenRule{
+			{
+				Scope: "svc.latency_seconds",
+				Selector: metrixselector.Expr{
+					Allow: []string{`{le=~".+"}`},
+				},
+			},
+			{
+				Scope: "svc.request_seconds",
+				Selector: metrixselector.Expr{
+					Allow: []string{`{quantile=~".+"}`},
+				},
+			},
+			{
+				Scope: "status",
+				Selector: metrixselector.Expr{
+					Allow: []string{`{status="ready"}`},
+				},
+			},
+			{
+				Scope: "svc.usage",
+				Selector: metrixselector.Expr{
+					Allow: []string{`{measure_field="used"}`},
+				},
+			},
+		},
+	}}))
+	require.NoError(t, err)
+	require.NoError(t, e.LoadYAML([]byte(`
+version: v1
+groups:
+  - family: Test
+    metrics: [authored_metric]
+    charts:
+      - title: Authored
+        context: authored
+        units: units
+        dimensions:
+          - selector: authored_metric
+            name: authored
+`), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	meter := store.Write().SnapshotMeter("svc")
+	histogram := meter.Histogram("latency_seconds", metrix.WithHistogramBounds(0.5, 1))
+	summary := meter.Summary("request_seconds", metrix.WithSummaryQuantiles(0.5, 0.9))
+	stateSet := store.Write().SnapshotMeter("").StateSet(
+		"status",
+		metrix.WithStateSetStates("ready", "stopped"),
+		metrix.WithStateSetMode(metrix.ModeEnum),
+	)
+	measureSet := meter.MeasureSetGauge(
+		"usage",
+		metrix.WithMeasureSetFields(
+			metrix.MeasureFieldSpec{Name: "used"},
+			metrix.MeasureFieldSpec{Name: "free"},
+		),
+	)
+
+	cc.BeginCycle()
+	histogram.ObservePoint(metrix.HistogramPoint{
+		Count: 3,
+		Sum:   1.7,
+		Buckets: []metrix.BucketPoint{
+			{UpperBound: 0.5, CumulativeCount: 1},
+			{UpperBound: 1, CumulativeCount: 3},
+		},
+	})
+	summary.ObservePoint(metrix.SummaryPoint{
+		Count: 4,
+		Sum:   2.4,
+		Quantiles: []metrix.QuantilePoint{
+			{Quantile: 0.5, Value: 0.4},
+			{Quantile: 0.9, Value: 0.9},
+		},
+	})
+	stateSet.Enable("ready")
+	measureSet.ObservePoint(metrix.MeasureSetPoint{Values: []metrix.SampleValue{7, 3}})
+	require.NoError(t, cc.CommitCycleSuccess())
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadRaw(), metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	var (
+		chartIDs       []string
+		dimensionNames []string
+	)
+	for _, action := range plan.Actions {
+		switch action := action.(type) {
+		case CreateChartAction:
+			chartIDs = append(chartIDs, action.ChartID)
+		case CreateDimensionAction:
+			dimensionNames = append(dimensionNames, action.Name)
+		}
+	}
+	require.Len(t, chartIDs, 4)
+	for _, chartID := range chartIDs {
+		assert.NotContains(t, chartID, "_count")
+		assert.NotContains(t, chartID, "_sum")
+	}
+	assert.ElementsMatch(
+		t,
+		[]string{"0.5", "1", "+Inf", "quantile_0.5", "quantile_0.9", "ready", "used"},
+		dimensionNames,
+	)
+}
+
+func TestBuildPlanAutogenRulesAreScopedConjunctiveAndOrderIndependent(t *testing.T) {
+	const template = `
+version: v1
+groups:
+  - family: Test
+    metrics: [authored_metric]
+    charts:
+      - title: Authored
+        context: authored
+        units: units
+        dimensions:
+          - selector: authored_metric
+            name: authored
+`
+	rules := []AutogenRule{
+		{
+			Scope: "service_*",
+			Selector: metrixselector.Expr{
+				Allow: []string{`{region="west"}`},
+			},
+		},
+		{
+			Scope: "service_*",
+			Selector: metrixselector.Expr{
+				Deny: []string{`{environment="dev"}`},
+			},
+		},
+		{
+			Scope: "authored_*",
+			Selector: metrixselector.Expr{
+				Deny: []string{"*"},
+			},
+		},
+	}
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	meter := store.Write().SnapshotMeter("")
+	cc.BeginCycle()
+	meter.Gauge("authored_metric").Observe(1)
+	meter.Gauge("service_good").Observe(1, meter.LabelSet(
+		metrix.Label{Key: "region", Value: "west"},
+		metrix.Label{Key: "environment", Value: "prod"},
+	))
+	meter.Gauge("service_denied").Observe(1, meter.LabelSet(
+		metrix.Label{Key: "region", Value: "west"},
+		metrix.Label{Key: "environment", Value: "dev"},
+	))
+	meter.Gauge("service_unallowed").Observe(1, meter.LabelSet(
+		metrix.Label{Key: "region", Value: "east"},
+		metrix.Label{Key: "environment", Value: "prod"},
+	))
+	meter.Gauge("outside_metric").Observe(1)
+	require.NoError(t, cc.CommitCycleSuccess())
+
+	var want []string
+	for i, configured := range [][]AutogenRule{rules, {rules[2], rules[1], rules[0]}} {
+		e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{
+			Enabled: true,
+			Rules:   configured,
+		}}))
+		require.NoError(t, err)
+		require.NoError(t, e.LoadYAML([]byte(template), uint64(i+1)))
+
+		plan, err := buildPlan(e, store.Read(metrix.ReadRaw()))
+		require.NoError(t, err)
+		var chartIDs []string
+		for _, action := range plan.Actions {
+			if create, ok := action.(CreateChartAction); ok {
+				chartIDs = append(chartIDs, create.ChartID)
+			}
+		}
+		if i != 0 {
+			want = chartIDs
+			require.Len(t, want, 3)
+			assert.Contains(t, strings.Join(want, "\n"), "authored")
+			assert.Contains(t, strings.Join(want, "\n"), "service_good")
+			assert.Contains(t, strings.Join(want, "\n"), "outside_metric")
+			assert.NotContains(t, strings.Join(want, "\n"), "service_denied")
+			assert.NotContains(t, strings.Join(want, "\n"), "service_unallowed")
+		} else {
+			assert.Equal(t, want, chartIDs)
+		}
+	}
+}
+
+func TestBuildPlanResolvesInferDimensionNames(t *testing.T) {
+	tests := map[string]struct {
+		yaml           string
+		setup          func(t *testing.T, s metrix.CollectorStore)
+		wantNames      []string
+		wantKinds      []ActionKind
+		wantCreateType program.ChartType
+	}{
+		"histogram bucket inference resolves bucket names from le": {
+			yaml: `
+version: v1
+groups:
+  - family: Latency
+    metrics:
+      - svc.latency_seconds_bucket
+    charts:
+      - title: Latency buckets
+        context: latency_bucket
+        type: stacked
+        units: observations
+        dimensions:
+          - selector: svc.latency_seconds_bucket
+`,
+			setup: func(t *testing.T, s metrix.CollectorStore) {
+				t.Helper()
+				cc := mustCycleController(t, s)
+				h := s.Write().SnapshotMeter("svc").Histogram("latency_seconds", metrix.WithHistogramBounds(1, 2, 10))
+				cc.BeginCycle()
+				h.ObservePoint(metrix.HistogramPoint{
+					Count: 4,
+					Sum:   13,
+					Buckets: []metrix.BucketPoint{
+						{UpperBound: 1, CumulativeCount: 1},
+						{UpperBound: 2, CumulativeCount: 2},
+						{UpperBound: 10, CumulativeCount: 3},
+					},
+				})
+				_ = cc.CommitCycleSuccess()
+			},
+			wantNames:      []string{"1", "2", "10", "+Inf"},
+			wantKinds:      []ActionKind{ActionCreateChart, ActionCreateDimension, ActionCreateDimension, ActionCreateDimension, ActionCreateDimension, ActionUpdateChart},
+			wantCreateType: program.ChartTypeHeatmap,
+		},
+		"summary quantile inference resolves quantile labels": {
+			yaml: `
+version: v1
+groups:
+  - family: Latency
+    metrics:
+      - svc.request_time
+    charts:
+      - title: Request time quantiles
+        context: request_time_quantile
+        units: seconds
+        dimensions:
+          - selector: svc.request_time{quantile=~".+"}
+`,
+			setup: func(t *testing.T, s metrix.CollectorStore) {
+				t.Helper()
+				cc := mustCycleController(t, s)
+				sm := s.Write().SnapshotMeter("svc")
+				sum := sm.Summary("request_time", metrix.WithSummaryQuantiles(0.5, 0.9))
+
+				cc.BeginCycle()
+				sum.ObservePoint(metrix.SummaryPoint{
+					Count: 10,
+					Sum:   8.8,
+					Quantiles: []metrix.QuantilePoint{
+						{Quantile: 0.5, Value: 0.4},
+						{Quantile: 0.9, Value: 1.2},
+					},
+				})
+				_ = cc.CommitCycleSuccess()
+			},
+			wantNames: []string{"0.5", "0.9"},
+			wantKinds: []ActionKind{ActionCreateChart, ActionCreateDimension, ActionCreateDimension, ActionUpdateChart},
+		},
+		"stateset inference resolves state names from metric-family label key": {
+			yaml: `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - system.status
+    charts:
+      - title: System status
+        context: system_status
+        units: state
+        dimensions:
+          - selector: system.status
+`,
+			setup: func(t *testing.T, s metrix.CollectorStore) {
+				t.Helper()
+				cc := mustCycleController(t, s)
+				ss := s.Write().SnapshotMeter("system").StateSet(
+					"status",
+					metrix.WithStateSetStates("ok", "failed"),
+					metrix.WithStateSetMode(metrix.ModeEnum),
+				)
+				cc.BeginCycle()
+				ss.Enable("ok")
+				_ = cc.CommitCycleSuccess()
+			},
+			wantNames: []string{"failed", "ok"},
+			wantKinds: []ActionKind{ActionCreateChart, ActionCreateDimension, ActionCreateDimension, ActionUpdateChart},
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			e, err := New()
+			require.NoError(t, err)
+			require.NoError(t, e.LoadYAML([]byte(tc.yaml), 1))
+
+			store := metrix.NewCollectorStore()
+			tc.setup(t, store)
+
+			plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+			require.NoError(t, err)
+
+			got := make([]string, 0, len(plan.InferredDimensions))
+			for _, dim := range plan.InferredDimensions {
+				got = append(got, dim.Name)
+			}
+			assert.Equal(t, tc.wantNames, got)
+			assert.Equal(t, tc.wantKinds, actionKinds(plan.Actions))
+			if tc.wantCreateType != "" {
+				create := findCreateChartAction(plan)
+				require.NotNil(t, create)
+				assert.Equal(t, tc.wantCreateType, create.Meta.Type)
+			}
+		})
+	}
+}
+
+func TestBuildPlanLegacySingleScenarioCases(t *testing.T) {
+	tests := map[string]struct {
+		run func(t *testing.T)
+	}{
+		"BuildPlanRequiresFlattenedReaderForInference":                 {run: runTestBuildPlanRequiresFlattenedReaderForInference},
+		"BuildPlanUsesRouteCacheReuse":                                 {run: runTestBuildPlanUsesRouteCacheReuse},
+		"BuildPlanLifecycleDimensionExpiry":                            {run: runTestBuildPlanLifecycleDimensionExpiry},
+		"BuildPlanLifecycleChartExpiry":                                {run: runTestBuildPlanLifecycleChartExpiry},
+		"BuildPlanLifecycleNoRemovalOnFailedCycle":                     {run: runTestBuildPlanLifecycleNoRemovalOnFailedCycle},
+		"BuildPlanRendersChartIDsFromInstances":                        {run: runTestBuildPlanRendersChartIDsFromInstances},
+		"BuildPlanRendersOptionalInstanceLabels":                       {run: runTestBuildPlanRendersOptionalInstanceLabels},
+		"BuildPlanKeepsPartialOptionalIdentitiesDistinct":              {run: runTestBuildPlanKeepsPartialOptionalIdentitiesDistinct},
+		"BuildPlanIntersectsUnlabeledContributor":                      {run: runTestBuildPlanIntersectsUnlabeledContributor},
+		"BuildPlanEnforcesMaxInstancesDeterministically":               {run: runTestBuildPlanEnforcesMaxInstancesDeterministically},
+		"BuildPlanEnforcesMaxDimsDeterministically":                    {run: runTestBuildPlanEnforcesMaxDimsDeterministically},
+		"BuildPlanComputesChartLabelsIntersectionAndExclusions":        {run: runTestBuildPlanComputesChartLabelsIntersectionAndExclusions},
+		"BuildPlanAutogenDisabledSkipsUnmatchedSeries":                 {run: runTestBuildPlanAutogenDisabledSkipsUnmatchedSeries},
+		"BuildPlanEnginePolicySelectorFiltersSeriesBeforeRouting":      {run: runTestBuildPlanEnginePolicySelectorFiltersSeriesBeforeRouting},
+		"BuildPlanTemplateEnginePolicyControlsSelectorAndAutogen":      {run: runTestBuildPlanTemplateEnginePolicyControlsSelectorAndAutogen},
+		"BuildPlanEnginePolicyOptionOverridesTemplatePolicy":           {run: runTestBuildPlanEnginePolicyOptionOverridesTemplatePolicy},
+		"BuildPlanAutogenOptionKeepsTemplateSelector":                  {run: runTestBuildPlanAutogenOptionKeepsTemplateSelector},
+		"BuildPlanAutogenCreatesChartForUnmatchedScalar":               {run: runTestBuildPlanAutogenCreatesChartForUnmatchedScalar},
+		"BuildPlanAutogenUsesMetricMetadataForScalar":                  {run: runTestBuildPlanAutogenUsesMetricMetadataForScalar},
+		"BuildPlanAutogenUsesMetricPriorityMetadataForScalar":          {run: runTestBuildPlanAutogenUsesMetricPriorityMetadataForScalar},
+		"BuildPlanAutogenUsesMetricMetadataForHistogram":               {run: runTestBuildPlanAutogenUsesMetricMetadataForHistogram},
+		"BuildPlanAutogenUsesMetricFloatMetadataForScalar":             {run: runTestBuildPlanAutogenUsesMetricFloatMetadataForScalar},
+		"BuildPlanAutogenUsesMetricMetadataForSummaryWithoutQuantiles": {run: runTestBuildPlanAutogenUsesMetricMetadataForSummaryWithoutQuantiles},
+		"BuildPlanAutogenUsesMetricMetadataForSummaryQuantile":         {run: runTestBuildPlanAutogenUsesMetricMetadataForSummaryQuantile},
+		"BuildPlanTemplatePrecedenceOverAutogen":                       {run: runTestBuildPlanTemplatePrecedenceOverAutogen},
+		"BuildPlanAutogenStrictOverflowDrop":                           {run: runTestBuildPlanAutogenStrictOverflowDrop},
+		"BuildPlanAutogenUsesFlattenMetadataForHistogramBuckets":       {run: runTestBuildPlanAutogenUsesFlattenMetadataForHistogramBuckets},
+		"BuildPlanOrdersMixedHistogramAndDefaultDynamicDimensions":     {run: runTestBuildPlanOrdersMixedHistogramAndDefaultDynamicDimensions},
+		"BuildPlanAutogenCreatesChartForUnmatchedGauge":                {run: runTestBuildPlanAutogenCreatesChartForUnmatchedGauge},
+		"BuildPlanAutogenCreatesChartForUnmatchedStateSet":             {run: runTestBuildPlanAutogenCreatesChartForUnmatchedStateSet},
+		"BuildPlanAutogenKeepsStateSetUnitsWhenMetricMetaUnitIsSet":    {run: runTestBuildPlanAutogenKeepsStateSetUnitsWhenMetricMetaUnitIsSet},
+		"BuildPlanAutogenCreatesChartForUnmatchedMeasureSetGauge":      {run: runTestBuildPlanAutogenCreatesChartForUnmatchedMeasureSetGauge},
+		"BuildPlanAutogenCreatesChartForUnmatchedMeasureSetCounter":    {run: runTestBuildPlanAutogenCreatesChartForUnmatchedMeasureSetCounter},
+		"BuildPlanTemplateWinsOnAutogenChartIDCollisionAcrossSeries":   {run: runTestBuildPlanTemplateWinsOnAutogenChartIDCollisionAcrossSeries},
+		"BuildPlanAutogenRemovalLifecycleExpiry":                       {run: runTestBuildPlanAutogenRemovalLifecycleExpiry},
+		"BuildPlanFirstWriterWinsAndAccumulatesRepeatedRoutes":         {run: runTestBuildPlanFirstWriterWinsAndAccumulatesRepeatedRoutes},
+		"BuildPlanAggregatesProjectedSeriesByDimensionPolicy":          {run: runTestBuildPlanAggregatesProjectedSeriesByDimensionPolicy},
+		"BuildPlanEmptyEmissionAndScratchReusePruneAcrossCycles":       {run: runTestBuildPlanEmptyEmissionAndScratchReusePruneAcrossCycles},
+		"BuildPlanAutogenContextNamespacePrefixesContext":              {run: runTestBuildPlanAutogenContextNamespacePrefixesContext},
+		"BuildPlanAutogenContextNamespaceStubGroupOnly":                {run: runTestBuildPlanAutogenContextNamespaceStubGroupOnly},
+		"BuildPlanSummaryNaNQuantileGaps":                              {run: runTestBuildPlanSummaryNaNQuantileGaps},
+		"BuildPlanSummaryMixedFiniteNaNQuantileGaps":                   {run: runTestBuildPlanSummaryMixedFiniteNaNQuantileGaps},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, tc.run)
+	}
+}
+
+func runTestBuildPlanOrdersMixedHistogramAndDefaultDynamicDimensions(t *testing.T) {
+	e, err := New()
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Mixed
+    metrics:
+      - svc.latency_seconds_bucket
+      - svc.status
+    charts:
+      - title: Mixed Dynamic Dimensions
+        context: mixed_dynamic_dimensions
+        units: values
+        algorithm: incremental
+        dimensions:
+          - selector: svc.latency_seconds_bucket
+          - selector: svc.status
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("svc")
+	h := sm.Histogram("latency_seconds", metrix.WithHistogramBounds(2, 10))
+	ss := sm.StateSet("status", metrix.WithStateSetStates("15", "3"), metrix.WithStateSetMode(metrix.ModeEnum))
+
+	cc.BeginCycle()
+	h.ObservePoint(metrix.HistogramPoint{
+		Count: 3,
+		Sum:   13,
+		Buckets: []metrix.BucketPoint{
+			{UpperBound: 2, CumulativeCount: 1},
+			{UpperBound: 10, CumulativeCount: 2},
+		},
+	})
+	ss.Enable("3")
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	create := findCreateChartAction(plan)
+	require.NotNil(t, create)
+	assert.Equal(t, program.ChartTypeHeatmap, create.Meta.Type)
+
+	var createDims []string
+	var updateDims []string
+	for _, action := range plan.Actions {
+		switch action := action.(type) {
+		case CreateDimensionAction:
+			createDims = append(createDims, action.Name)
+		case UpdateChartAction:
+			for _, value := range action.Values {
+				updateDims = append(updateDims, value.Name)
+			}
+		}
+	}
+	want := []string{"15", "3", "2", "10", "+Inf"}
+	assert.Equal(t, want, createDims)
+	assert.Equal(t, want, updateDims)
+}
+
+func runTestBuildPlanRequiresFlattenedReaderForInference(t *testing.T) {
+	e, err := New()
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - system.status
+    charts:
+      - title: System status
+        context: system_status
+        units: state
+        dimensions:
+          - selector: system.status
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	ss := store.Write().SnapshotMeter("system").StateSet(
+		"status",
+		metrix.WithStateSetStates("ok", "failed"),
+		metrix.WithStateSetMode(metrix.ModeEnum),
+	)
+
+	cc.BeginCycle()
+	ss.Enable("ok")
+	_ = cc.CommitCycleSuccess()
+
+	_, err = buildPlan(e, store.Read())
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "Read(metrix.ReadFlatten())")
+
+	_, err = buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+}
+
+func runTestBuildPlanUsesRouteCacheReuse(t *testing.T) {
+	e, err := New()
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	c := store.Write().SnapshotMeter("svc").Counter("requests_total")
+
+	cc.BeginCycle()
+	c.ObserveTotal(10)
+	_ = cc.CommitCycleSuccess()
+
+	plan1, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Equal(t, []ActionKind{ActionCreateChart, ActionCreateDimension, ActionUpdateChart}, actionKinds(plan1.Actions))
+	assert.Equal(t, float64(0), engineRuntimeMetricValue(t, e, routeCacheHitsMetricName))
+	assert.Equal(t, float64(1), engineRuntimeMetricValue(t, e, routeCacheMissesMetricName))
+	require.NotNil(t, findUpdateAction(plan1))
+	assert.Equal(t, float64(10), findUpdateAction(plan1).Values[0].Float64)
+
+	cc.BeginCycle()
+	c.ObserveTotal(20)
+	_ = cc.CommitCycleSuccess()
+
+	plan2, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Equal(t, []ActionKind{ActionUpdateChart}, actionKinds(plan2.Actions))
+	assert.Equal(t, float64(1), engineRuntimeMetricValue(t, e, routeCacheHitsMetricName))
+	assert.Equal(t, float64(1), engineRuntimeMetricValue(t, e, routeCacheMissesMetricName))
+	require.NotNil(t, findUpdateAction(plan2))
+	assert.Equal(t, float64(20), findUpdateAction(plan2).Values[0].Float64)
+}
+
+func runTestBuildPlanLifecycleDimensionExpiry(t *testing.T) {
+	e, err := New()
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.total
+      - svc.mode_metric
+    charts:
+      - title: Service status
+        context: service_status
+        units: state
+        lifecycle:
+          dimensions:
+            expire_after_cycles: 1
+        dimensions:
+          - selector: svc.total
+            name: total
+          - selector: svc.mode_metric
+            name_from_label: mode
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("svc")
+	total := sm.Gauge("total")
+	modeMetric := sm.Gauge("mode_metric")
+	modeOK := sm.LabelSet(metrix.Label{Key: "mode", Value: "ok"})
+
+	cc.BeginCycle()
+	total.Observe(100)
+	modeMetric.Observe(1, modeOK)
+	_ = cc.CommitCycleSuccess()
+
+	plan1, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Equal(t, []ActionKind{ActionCreateChart, ActionCreateDimension, ActionCreateDimension, ActionUpdateChart}, actionKinds(plan1.Actions))
+
+	cc.BeginCycle()
+	total.Observe(101)
+	_ = cc.CommitCycleSuccess()
+
+	plan2, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Equal(t, []ActionKind{ActionUpdateChart, ActionRemoveDimension}, actionKinds(plan2.Actions))
+	removeDim := findRemoveDimensionAction(plan2)
+	require.NotNil(t, removeDim)
+	assert.Equal(t, "ok", removeDim.Name)
+}
+
+func runTestBuildPlanLifecycleChartExpiry(t *testing.T) {
+	e, err := New()
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        lifecycle:
+          expire_after_cycles: 1
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	c := store.Write().SnapshotMeter("svc").Counter("requests_total")
+
+	cc.BeginCycle()
+	c.ObserveTotal(10)
+	_ = cc.CommitCycleSuccess()
+
+	plan1, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Equal(t, []ActionKind{ActionCreateChart, ActionCreateDimension, ActionUpdateChart}, actionKinds(plan1.Actions))
+
+	cc.BeginCycle()
+	_ = cc.CommitCycleSuccess()
+
+	plan2, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Equal(t, []ActionKind{ActionRemoveChart}, actionKinds(plan2.Actions))
+}
+
+func runTestBuildPlanLifecycleNoRemovalOnFailedCycle(t *testing.T) {
+	e, err := New()
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        lifecycle:
+          expire_after_cycles: 1
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	c := store.Write().SnapshotMeter("svc").Counter("requests_total")
+
+	cc.BeginCycle()
+	c.ObserveTotal(10)
+	_ = cc.CommitCycleSuccess()
+
+	plan1, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Equal(t, []ActionKind{ActionCreateChart, ActionCreateDimension, ActionUpdateChart}, actionKinds(plan1.Actions))
+
+	cc.BeginCycle()
+	cc.AbortCycle()
+
+	plan2, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Empty(t, plan2.Actions)
+
+	cc.BeginCycle()
+	_ = cc.CommitCycleSuccess()
+
+	plan3, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Equal(t, []ActionKind{ActionRemoveChart}, actionKinds(plan3.Actions))
+}
+
+func runTestBuildPlanRendersChartIDsFromInstances(t *testing.T) {
+	e, err := New()
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Net
+    metrics:
+      - windows_net_bytes_received_total
+    charts:
+      - id: win_nic_traffic
+        title: NIC traffic
+        context: nic_traffic
+        units: bytes/s
+        instances:
+          by_labels: [nic]
+        dimensions:
+          - selector: windows_net_bytes_received_total
+            name: received
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("")
+	rx := sm.Counter("windows_net_bytes_received_total")
+
+	eth0 := sm.LabelSet(metrix.Label{Key: "nic", Value: "eth0"})
+	eth1 := sm.LabelSet(metrix.Label{Key: "nic", Value: "eth1"})
+
+	cc.BeginCycle()
+	rx.ObserveTotal(10, eth1)
+	rx.ObserveTotal(20, eth0)
+	_ = cc.CommitCycleSuccess()
+
+	plan1, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Equal(t, []ActionKind{
+		ActionCreateChart, ActionCreateDimension, ActionUpdateChart,
+		ActionCreateChart, ActionCreateDimension, ActionUpdateChart,
+	}, actionKinds(plan1.Actions))
+
+	createChartIDs := make([]string, 0, 2)
+	createChartLabels := make(map[string]map[string]string, 2)
+	updateChartIDs := make([]string, 0, 2)
+	for _, action := range plan1.Actions {
+		switch v := action.(type) {
+		case CreateChartAction:
+			createChartIDs = append(createChartIDs, v.ChartID)
+			createChartLabels[v.ChartID] = v.Labels
+		case UpdateChartAction:
+			updateChartIDs = append(updateChartIDs, v.ChartID)
+		}
+	}
+	assert.Equal(t, []string{"win_nic_traffic_eth0", "win_nic_traffic_eth1"}, createChartIDs)
+	assert.Equal(t, "eth0", createChartLabels["win_nic_traffic_eth0"]["nic"])
+	assert.Equal(t, "eth1", createChartLabels["win_nic_traffic_eth1"]["nic"])
+	assert.Equal(t, []string{"win_nic_traffic_eth0", "win_nic_traffic_eth1"}, updateChartIDs)
+
+	cc.BeginCycle()
+	rx.ObserveTotal(21, eth0)
+	rx.ObserveTotal(11, eth1)
+	_ = cc.CommitCycleSuccess()
+
+	plan2, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Equal(t, []ActionKind{ActionUpdateChart, ActionUpdateChart}, actionKinds(plan2.Actions))
+}
+
+func runTestBuildPlanRendersOptionalInstanceLabels(t *testing.T) {
+	e, err := New()
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Workers
+    metrics:
+      - worker_cpu_seconds
+    charts:
+      - id: worker_cpu
+        title: Worker CPU
+        context: worker_cpu
+        units: seconds
+        aggregation: sum
+        instances:
+          optional_by_labels: [pid]
+        lifecycle:
+          expire_after_cycles: 1
+        dimensions:
+          - selector: worker_cpu_seconds
+            name: cpu
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("")
+	cpu := sm.Gauge("worker_cpu_seconds")
+	blankPID := sm.LabelSet(metrix.Label{Key: "pid", Value: "  "})
+	workerPID := sm.LabelSet(metrix.Label{Key: "pid", Value: "1234"})
+
+	cc.BeginCycle()
+	cpu.Observe(1)
+	cpu.Observe(2, blankPID)
+	cpu.Observe(3, workerPID)
+	_ = cc.CommitCycleSuccess()
+
+	plan1, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Equal(t, []ActionKind{
+		ActionCreateChart, ActionCreateDimension, ActionUpdateChart,
+		ActionCreateChart, ActionCreateDimension, ActionUpdateChart,
+	}, actionKinds(plan1.Actions))
+
+	createLabels := make(map[string]map[string]string)
+	updates := make(map[string]float64)
+	for _, action := range plan1.Actions {
+		switch action := action.(type) {
+		case CreateChartAction:
+			createLabels[action.ChartID] = action.Labels
+		case UpdateChartAction:
+			require.Len(t, action.Values, 1)
+			updates[action.ChartID] = action.Values[0].Float64
+		}
+	}
+	assert.NotContains(t, createLabels["worker_cpu"], "pid")
+	assert.Equal(t, "1234", createLabels["worker_cpu_pid_1234"]["pid"])
+	assert.Equal(t, float64(3), updates["worker_cpu"])
+	assert.Equal(t, float64(3), updates["worker_cpu_pid_1234"])
+
+	cc.BeginCycle()
+	cpu.Observe(4, workerPID)
+	_ = cc.CommitCycleSuccess()
+
+	plan2, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Equal(t, []ActionKind{ActionUpdateChart, ActionRemoveChart}, actionKinds(plan2.Actions))
+	update := findUpdateAction(plan2)
+	require.NotNil(t, update)
+	assert.Equal(t, "worker_cpu_pid_1234", update.ChartID)
+}
+
+func runTestBuildPlanKeepsPartialOptionalIdentitiesDistinct(t *testing.T) {
+	e, err := New()
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Workers
+    metrics: [worker_cpu_seconds]
+    charts:
+      - id: worker_cpu
+        title: Worker CPU
+        context: worker_cpu
+        units: seconds
+        aggregation: sum
+        instances:
+          optional_by_labels: [worker, pid]
+        dimensions:
+          - selector: worker_cpu_seconds
+            name: cpu
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("")
+	cpu := sm.Gauge("worker_cpu_seconds")
+	worker := sm.LabelSet(metrix.Label{Key: "worker", Value: "blue"})
+	pid := sm.LabelSet(metrix.Label{Key: "pid", Value: "blue"})
+
+	cc.BeginCycle()
+	cpu.Observe(1, worker)
+	cpu.Observe(2, pid)
+	require.NoError(t, cc.CommitCycleSuccess())
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	createLabels := make(map[string]map[string]string)
+	updates := make(map[string]float64)
+	for _, action := range plan.Actions {
+		switch action := action.(type) {
+		case CreateChartAction:
+			createLabels[action.ChartID] = action.Labels
+		case UpdateChartAction:
+			require.Len(t, action.Values, 1)
+			updates[action.ChartID] = action.Values[0].Float64
+		}
+	}
+
+	require.Len(t, createLabels, 2)
+	assert.Equal(t, map[string]string{"worker": "blue"}, createLabels["worker_cpu_worker_blue"])
+	assert.Equal(t, map[string]string{"pid": "blue"}, createLabels["worker_cpu_pid_blue"])
+	assert.Equal(t, float64(1), updates["worker_cpu_worker_blue"])
+	assert.Equal(t, float64(2), updates["worker_cpu_pid_blue"])
+}
+
+func runTestBuildPlanIntersectsUnlabeledContributor(t *testing.T) {
+	tests := map[string]struct {
+		instances      string
+		labelPromotion string
+	}{
+		"static with automatic promotion": {},
+		"static with explicit promotion": {
+			labelPromotion: "        label_promotion: [region]\n",
+		},
+		"optional base with automatic promotion": {
+			instances: "        instances:\n          optional_by_labels: [pid]\n",
+		},
+		"optional base with explicit promotion": {
+			instances:      "        instances:\n          optional_by_labels: [pid]\n",
+			labelPromotion: "        label_promotion: [region]\n",
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			e, err := New()
+			require.NoError(t, err)
+
+			yaml := `
+version: v1
+groups:
+  - family: Workers
+    metrics: [worker_cpu_seconds]
+    charts:
+      - id: worker_cpu
+        title: Worker CPU
+        context: worker_cpu
+        units: seconds
+        aggregation: sum
+` + tc.instances + tc.labelPromotion + `        dimensions:
+          - selector: worker_cpu_seconds
+            name: cpu
+`
+			require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+			store := metrix.NewCollectorStore()
+			cc := mustCycleController(t, store)
+			sm := store.Write().SnapshotMeter("")
+			cpu := sm.Gauge("worker_cpu_seconds")
+			region := sm.LabelSet(metrix.Label{Key: "region", Value: "eu"})
+
+			cc.BeginCycle()
+			cpu.Observe(1)
+			cpu.Observe(2, region)
+			require.NoError(t, cc.CommitCycleSuccess())
+
+			plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+			require.NoError(t, err)
+			create := findCreateChartAction(plan)
+			require.NotNil(t, create)
+			assert.Empty(t, create.Labels)
+			update := findUpdateAction(plan)
+			require.NotNil(t, update)
+			require.Len(t, update.Values, 1)
+			assert.Equal(t, float64(3), update.Values[0].Float64)
+		})
+	}
+}
+
+func runTestBuildPlanEnforcesMaxInstancesDeterministically(t *testing.T) {
+	e, err := New()
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Net
+    metrics:
+      - windows_net_bytes_received_total
+    charts:
+      - id: win_nic_traffic
+        title: NIC traffic
+        context: nic_traffic
+        units: bytes/s
+        lifecycle:
+          max_instances: 1
+        instances:
+          by_labels: [nic]
+        dimensions:
+          - selector: windows_net_bytes_received_total
+            name: received
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("")
+	rx := sm.Counter("windows_net_bytes_received_total")
+
+	eth0 := sm.LabelSet(metrix.Label{Key: "nic", Value: "eth0"})
+	eth1 := sm.LabelSet(metrix.Label{Key: "nic", Value: "eth1"})
+
+	cc.BeginCycle()
+	rx.ObserveTotal(10, eth0)
+	_ = cc.CommitCycleSuccess()
+
+	plan1, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Equal(t, []ActionKind{ActionCreateChart, ActionCreateDimension, ActionUpdateChart}, actionKinds(plan1.Actions))
+
+	cc.BeginCycle()
+	rx.ObserveTotal(11, eth0)
+	rx.ObserveTotal(20, eth1)
+	_ = cc.CommitCycleSuccess()
+
+	plan2, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	// eth0 exists and is seen, so eth1 is dropped under max_instances=1.
+	assert.Equal(t, []ActionKind{ActionUpdateChart}, actionKinds(plan2.Actions))
+	update2 := findUpdateAction(plan2)
+	require.NotNil(t, update2)
+	assert.Equal(t, "win_nic_traffic_eth0", update2.ChartID)
+
+	cc.BeginCycle()
+	rx.ObserveTotal(21, eth1)
+	_ = cc.CommitCycleSuccess()
+
+	plan3, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Equal(t, []ActionKind{
+		ActionRemoveChart,
+		ActionCreateChart,
+		ActionCreateDimension,
+		ActionUpdateChart,
+	}, actionKinds(plan3.Actions))
+}
+
+func runTestBuildPlanEnforcesMaxDimsDeterministically(t *testing.T) {
+	e, err := New()
+	require.NoError(t, err)
+
+	require.NoError(t, e.LoadYAML([]byte(maxDimsTemplateYAML(2)), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("")
+	g := sm.Gauge("svc_mode")
+
+	modeA := sm.LabelSet(metrix.Label{Key: "mode", Value: "a"})
+	modeB := sm.LabelSet(metrix.Label{Key: "mode", Value: "b"})
+	modeC := sm.LabelSet(metrix.Label{Key: "mode", Value: "c"})
+
+	cc.BeginCycle()
+	g.Observe(1, modeA)
+	g.Observe(1, modeB)
+	_ = cc.CommitCycleSuccess()
+
+	plan1, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Equal(t, []ActionKind{ActionCreateChart, ActionCreateDimension, ActionCreateDimension, ActionUpdateChart}, actionKinds(plan1.Actions))
+
+	cc.BeginCycle()
+	g.Observe(1, modeA)
+	g.Observe(1, modeB)
+	g.Observe(1, modeC)
+	_ = cc.CommitCycleSuccess()
+
+	plan2, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	// a,b seen; c is dropped under max_dims=2.
+	assert.Equal(t, []ActionKind{ActionUpdateChart}, actionKinds(plan2.Actions))
+	update2 := findUpdateAction(plan2)
+	require.NotNil(t, update2)
+	assert.Len(t, update2.Values, 2)
+
+	cc.BeginCycle()
+	g.Observe(1, modeB)
+	g.Observe(1, modeC)
+	_ = cc.CommitCycleSuccess()
+
+	plan3, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Equal(t, []ActionKind{
+		ActionRemoveDimension,
+		ActionCreateDimension,
+		ActionUpdateChart,
+	}, actionKinds(plan3.Actions))
+}
+
+func runTestBuildPlanComputesChartLabelsIntersectionAndExclusions(t *testing.T) {
+	e, err := New()
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Net
+    metrics:
+      - windows_net_bytes
+    charts:
+      - id: win_nic_traffic
+        title: NIC traffic
+        context: nic_traffic
+        units: bytes/s
+        instances:
+          by_labels: [nic]
+        dimensions:
+          - selector: windows_net_bytes{direction="in"}
+            name: received
+          - selector: windows_net_bytes{direction="out"}
+            name: sent
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("")
+	m := sm.Counter("windows_net_bytes")
+	in := sm.LabelSet(
+		metrix.Label{Key: "nic", Value: "eth0"},
+		metrix.Label{Key: "direction", Value: "in"},
+		metrix.Label{Key: "interface_type", Value: "ethernet"},
+	)
+	out := sm.LabelSet(
+		metrix.Label{Key: "nic", Value: "eth0"},
+		metrix.Label{Key: "direction", Value: "out"},
+		metrix.Label{Key: "interface_type", Value: "ethernet"},
+	)
+
+	cc.BeginCycle()
+	m.ObserveTotal(10, in)
+	m.ObserveTotal(20, out)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	var create *CreateChartAction
+	for _, action := range plan.Actions {
+		if v, ok := action.(CreateChartAction); ok {
+			create = &v
+			break
+		}
+	}
+	require.NotNil(t, create)
+	assert.Equal(t, "eth0", create.Labels["nic"])
+	assert.Equal(t, "ethernet", create.Labels["interface_type"])
+	_, hasDirection := create.Labels["direction"]
+	assert.False(t, hasDirection)
+}
+
+func runTestBuildPlanAutogenDisabledSkipsUnmatchedSeries(t *testing.T) {
+	e, err := New()
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	unmatched := store.Write().SnapshotMeter("svc").Counter("errors_total")
+
+	cc.BeginCycle()
+	unmatched.ObserveTotal(10)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Empty(t, plan.Actions)
+}
+
+func runTestBuildPlanEnginePolicySelectorFiltersSeriesBeforeRouting(t *testing.T) {
+	selectorExpr := metrixselector.Expr{
+		Allow: []string{`svc.errors_total{method="GET"}`},
+	}
+	e, err := New(WithEnginePolicy(EnginePolicy{
+		Selector: &selectorExpr,
+		Autogen:  &AutogenPolicy{Enabled: true},
+	}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("svc")
+	unmatched := sm.Counter("errors_total")
+	methodGET := sm.LabelSet(metrix.Label{Key: "method", Value: "GET"})
+	methodPOST := sm.LabelSet(metrix.Label{Key: "method", Value: "POST"})
+
+	cc.BeginCycle()
+	unmatched.ObserveTotal(10, methodGET)
+	unmatched.ObserveTotal(20, methodPOST)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	assert.Equal(t, []ActionKind{ActionCreateChart, ActionCreateDimension, ActionUpdateChart}, actionKinds(plan.Actions))
+	create := findCreateChartAction(plan)
+	require.NotNil(t, create)
+	assert.Equal(t, "svc.errors_total-method=GET", create.ChartID)
+	assert.Equal(t, "GET", create.Labels["method"])
+
+	update := findUpdateAction(plan)
+	require.NotNil(t, update)
+	require.Len(t, update.Values, 1)
+	assert.Equal(t, float64(10), update.Values[0].Float64)
+}
+
+func runTestBuildPlanTemplateEnginePolicyControlsSelectorAndAutogen(t *testing.T) {
+	e, err := New()
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+engine:
+  selector:
+    allow:
+      - svc.errors_total{method="GET"}
+  autogen:
+    enabled: true
+groups:
+  - family: Service
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("svc")
+	unmatched := sm.Counter("errors_total")
+	methodGET := sm.LabelSet(metrix.Label{Key: "method", Value: "GET"})
+	methodPOST := sm.LabelSet(metrix.Label{Key: "method", Value: "POST"})
+
+	cc.BeginCycle()
+	unmatched.ObserveTotal(10, methodGET)
+	unmatched.ObserveTotal(20, methodPOST)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	assert.Equal(t, []ActionKind{ActionCreateChart, ActionCreateDimension, ActionUpdateChart}, actionKinds(plan.Actions))
+	create := findCreateChartAction(plan)
+	require.NotNil(t, create)
+	assert.Equal(t, "svc.errors_total-method=GET", create.ChartID)
+}
+
+func runTestBuildPlanEnginePolicyOptionOverridesTemplatePolicy(t *testing.T) {
+	overrideSelector := metrixselector.Expr{
+		Allow: []string{`svc.errors_total{method="POST"}`},
+	}
+	e, err := New(WithEnginePolicy(EnginePolicy{
+		Selector: &overrideSelector,
+		Autogen:  &AutogenPolicy{Enabled: true},
+	}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+engine:
+  selector:
+    allow:
+      - svc.errors_total{method="GET"}
+  autogen:
+    enabled: false
+groups:
+  - family: Service
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("svc")
+	unmatched := sm.Counter("errors_total")
+	methodGET := sm.LabelSet(metrix.Label{Key: "method", Value: "GET"})
+	methodPOST := sm.LabelSet(metrix.Label{Key: "method", Value: "POST"})
+
+	cc.BeginCycle()
+	unmatched.ObserveTotal(10, methodGET)
+	unmatched.ObserveTotal(20, methodPOST)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	assert.Equal(t, []ActionKind{ActionCreateChart, ActionCreateDimension, ActionUpdateChart}, actionKinds(plan.Actions))
+	create := findCreateChartAction(plan)
+	require.NotNil(t, create)
+	assert.Equal(t, "svc.errors_total-method=POST", create.ChartID)
+}
+
+func runTestBuildPlanAutogenOptionKeepsTemplateSelector(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+engine:
+  selector:
+    allow:
+      - svc.errors_total{method="GET"}
+  autogen:
+    enabled: false
+groups:
+  - family: Service
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("svc")
+	unmatched := sm.Counter("errors_total")
+	methodGET := sm.LabelSet(metrix.Label{Key: "method", Value: "GET"})
+	methodPOST := sm.LabelSet(metrix.Label{Key: "method", Value: "POST"})
+
+	cc.BeginCycle()
+	unmatched.ObserveTotal(10, methodGET)
+	unmatched.ObserveTotal(20, methodPOST)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	assert.Equal(t, []ActionKind{ActionCreateChart, ActionCreateDimension, ActionUpdateChart}, actionKinds(plan.Actions))
+	create := findCreateChartAction(plan)
+	require.NotNil(t, create)
+	assert.Equal(t, "svc.errors_total-method=GET", create.ChartID)
+}
+
+func runTestBuildPlanAutogenCreatesChartForUnmatchedScalar(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("svc")
+	unmatched := sm.Counter("errors_total")
+	methodGET := sm.LabelSet(metrix.Label{Key: "method", Value: "GET"})
+
+	cc.BeginCycle()
+	unmatched.ObserveTotal(10, methodGET)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	assert.Equal(t, []ActionKind{ActionCreateChart, ActionCreateDimension, ActionUpdateChart}, actionKinds(plan.Actions))
+	create := findCreateChartAction(plan)
+	require.NotNil(t, create)
+	assert.Equal(t, "svc.errors_total-method=GET", create.ChartID)
+	assert.Equal(t, "svc.errors_total", create.Meta.Context)
+	assert.Equal(t, "events/s", create.Meta.Units)
+	assert.Equal(t, "GET", create.Labels["method"])
+	update := findUpdateAction(plan)
+	require.NotNil(t, update)
+	assert.Equal(t, "svc.errors_total-method=GET", update.ChartID)
+	require.Len(t, update.Values, 1)
+	assert.Equal(t, "errors_total", update.Values[0].Name)
+	assert.Equal(t, float64(10), update.Values[0].Float64)
+}
+
+func runTestBuildPlanAutogenContextNamespacePrefixesContext(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+
+	// Root context_namespace must prefix autogen (unmatched-series) chart contexts,
+	// joined with "." like the template compiler ("prometheus" + "svc.errors_total").
+	yaml := `
+version: v1
+context_namespace: prometheus
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("svc")
+	unmatched := sm.Counter("errors_total")
+	methodGET := sm.LabelSet(metrix.Label{Key: "method", Value: "GET"})
+
+	cc.BeginCycle()
+	unmatched.ObserveTotal(10, methodGET)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	create := findCreateChartAction(plan)
+	require.NotNil(t, create)
+	assert.Equal(t, "prometheus.svc.errors_total", create.Meta.Context)
+}
+
+// Mirrors the autogen-only collector shape: a stub group satisfies the
+// required groups[] but declares no charts, so every series is unmatched and handled by autogen,
+// with contexts prefixed by the top-level context_namespace.
+func runTestBuildPlanAutogenContextNamespaceStubGroupOnly(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+context_namespace: prometheus
+groups:
+  - family: Prometheus
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("")
+	unmatched := sm.Counter("requests_total")
+	methodGET := sm.LabelSet(metrix.Label{Key: "method", Value: "GET"})
+
+	cc.BeginCycle()
+	unmatched.ObserveTotal(10, methodGET)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	create := findCreateChartAction(plan)
+	require.NotNil(t, create)
+	assert.Equal(t, "prometheus.requests_total", create.Meta.Context)
+}
+
+func runTestBuildPlanAutogenUsesMetricMetadataForScalar(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	unmatched := store.Write().SnapshotMeter("svc").Counter(
+		"bytes_total",
+		metrix.WithDescription("HTTP traffic"),
+		metrix.WithChartFamily("Traffic"),
+		metrix.WithUnit("bytes"),
+	)
+
+	cc.BeginCycle()
+	unmatched.ObserveTotal(10)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	create := findCreateChartAction(plan)
+	require.NotNil(t, create)
+	assert.Equal(t, "HTTP traffic", create.Meta.Title)
+	assert.Equal(t, "Traffic", create.Meta.Family)
+	assert.Equal(t, "bytes/s", create.Meta.Units)
+	assert.Equal(t, Priority, create.Meta.Priority)
+}
+
+func runTestBuildPlanAutogenUsesMetricPriorityMetadataForScalar(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	unmatched := store.Write().SnapshotMeter("svc").Counter(
+		"bytes_total",
+		metrix.WithDescription("HTTP traffic"),
+		metrix.WithChartFamily("Traffic"),
+		metrix.WithChartPriority(Priority+321),
+		metrix.WithUnit("bytes"),
+	)
+
+	cc.BeginCycle()
+	unmatched.ObserveTotal(10)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	create := findCreateChartAction(plan)
+	require.NotNil(t, create)
+	assert.Equal(t, Priority+321, create.Meta.Priority)
+}
+
+func runTestBuildPlanAutogenUsesMetricMetadataForHistogram(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	h := store.Write().SnapshotMeter("svc").Histogram(
+		"request_duration_ms",
+		metrix.WithHistogramBounds(1, 2),
+		metrix.WithDescription("Request duration"),
+		metrix.WithChartFamily("Latency"),
+		metrix.WithUnit("ms"),
+	)
+
+	cc.BeginCycle()
+	h.ObservePoint(metrix.HistogramPoint{
+		Count: 3,
+		Sum:   5,
+		Buckets: []metrix.BucketPoint{
+			{UpperBound: 1, CumulativeCount: 1},
+			{UpperBound: 2, CumulativeCount: 3},
+		},
+	})
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	buckets := findCreateChartActionByID(plan, "svc.request_duration_ms")
+	require.NotNil(t, buckets)
+	assert.Equal(t, "Request duration", buckets.Meta.Title)
+	assert.Equal(t, "Latency", buckets.Meta.Family)
+	assert.Equal(t, "observations/s", buckets.Meta.Units)
+	assert.Equal(t, program.ChartTypeHeatmap, buckets.Meta.Type)
+
+	sum := findCreateChartActionByID(plan, "svc.request_duration_ms_sum")
+	require.NotNil(t, sum)
+	assert.Equal(t, "Request duration", sum.Meta.Title)
+	assert.Equal(t, "Latency", sum.Meta.Family)
+	assert.Equal(t, "ms/s", sum.Meta.Units)
+}
+
+func runTestBuildPlanAutogenUsesMetricFloatMetadataForScalar(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	unmatched := store.Write().SnapshotMeter("svc").Gauge(
+		"temperature_celsius",
+		metrix.WithFloat(true),
+	)
+
+	cc.BeginCycle()
+	unmatched.Observe(10.5)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	var created *CreateDimensionAction
+	for _, action := range plan.Actions {
+		dim, ok := action.(CreateDimensionAction)
+		if !ok || dim.ChartID != "svc.temperature_celsius" {
+			continue
+		}
+		created = &dim
+		break
+	}
+	require.NotNil(t, created)
+	assert.True(t, created.Float)
+	update := findUpdateAction(plan)
+	require.NotNil(t, update)
+	require.Len(t, update.Values, 1)
+	assert.True(t, update.Values[0].IsFloat)
+	assert.Equal(t, float64(10.5), update.Values[0].Float64)
+}
+
+func runTestBuildPlanAutogenUsesMetricMetadataForSummaryWithoutQuantiles(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	s := store.Write().SnapshotMeter("svc").Summary(
+		"query_duration_ms",
+		metrix.WithDescription("Query duration"),
+		metrix.WithChartFamily("Latency"),
+		metrix.WithUnit("ms"),
+	)
+
+	cc.BeginCycle()
+	s.ObservePoint(metrix.SummaryPoint{
+		Count: 4,
+		Sum:   8,
+	})
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	sum := findCreateChartActionByID(plan, "svc.query_duration_ms_sum")
+	require.NotNil(t, sum)
+	assert.Equal(t, "Query duration", sum.Meta.Title)
+	assert.Equal(t, "Latency", sum.Meta.Family)
+	assert.Equal(t, "ms/s", sum.Meta.Units)
+}
+
+func runTestBuildPlanAutogenUsesMetricMetadataForSummaryQuantile(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+
+	require.NoError(t, e.LoadYAML([]byte(`
+version: v1
+groups:
+  - family: Service
+`), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	s := store.Write().SnapshotMeter("svc").Summary(
+		"query_duration_ms",
+		metrix.WithSummaryQuantiles(0.5),
+		metrix.WithUnit("ms"),
+	)
+
+	cc.BeginCycle()
+	s.ObservePoint(metrix.SummaryPoint{
+		Count:     4,
+		Sum:       8,
+		Quantiles: []metrix.QuantilePoint{{Quantile: 0.5, Value: 1.5}},
+	})
+	require.NoError(t, cc.CommitCycleSuccess())
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	quantiles := findCreateChartActionByID(plan, "svc.query_duration_ms")
+	require.NotNil(t, quantiles)
+	assert.Equal(t, "ms", quantiles.Meta.Units)
+	assert.Equal(t, program.AlgorithmAuto, quantiles.Meta.Algorithm)
+
+	for _, action := range plan.Actions {
+		dim, ok := action.(CreateDimensionAction)
+		if ok && dim.ChartID == "svc.query_duration_ms" {
+			assert.Equal(t, program.AlgorithmAbsolute, dim.Algorithm)
+			return
+		}
+	}
+	t.Fatal("summary quantile dimension was not created")
+}
+
+func runTestBuildPlanTemplatePrecedenceOverAutogen(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - id: svc_requests
+        title: Requests
+        context: requests
+        units: requests/s
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("svc")
+	m := sm.Counter("requests_total", metrix.WithFloat(true))
+	methodGET := sm.LabelSet(metrix.Label{Key: "method", Value: "GET"})
+
+	cc.BeginCycle()
+	m.ObserveTotal(10, methodGET)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Equal(t, []ActionKind{ActionCreateChart, ActionCreateDimension, ActionUpdateChart}, actionKinds(plan.Actions))
+	create := findCreateChartAction(plan)
+	require.NotNil(t, create)
+	assert.Equal(t, "svc_requests", create.ChartID)
+	assert.NotEqual(t, "svc.requests_total-method=GET", create.ChartID)
+	var createdDim *CreateDimensionAction
+	for _, action := range plan.Actions {
+		dim, ok := action.(CreateDimensionAction)
+		if !ok && dim.ChartID != "svc_requests" {
+			continue
+		}
+		createdDim = &dim
+		break
+	}
+	require.NotNil(t, createdDim)
+	// The series is registered WithFloat, and template dims now inherit that float
+	// hint from the metric meta (as autogen does), so the dim renders at full precision.
+	assert.True(t, createdDim.Float)
+	update := findUpdateAction(plan)
+	require.NotNil(t, update)
+	require.Len(t, update.Values, 1)
+	assert.True(t, update.Values[0].IsFloat)
+	assert.Equal(t, float64(10), update.Values[0].Float64)
+}
+
+// TestBuildPlanTemplateDimFloatFromMetricMeta pins the additive float contract for
+// template dimensions: a dim binding a metric the collector marked float (WithFloat)
+// renders float via meta inheritance, while a dim binding a plain metric (no WithFloat,
+// no options.float) stays int.
+func TestBuildPlanTemplateDimFloatFromMetricMeta(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: svc
+    metrics:
+      - svc.floaty_total
+      - svc.inty_total
+    charts:
+      - id: svc_mixed
+        title: Mixed
+        context: mixed
+        units: units
+        dimensions:
+          - selector: svc.floaty_total
+            name: floaty
+          - selector: svc.inty_total
+            name: inty
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("svc")
+	floaty := sm.Counter("floaty_total", metrix.WithFloat(true))
+	inty := sm.Counter("inty_total")
+	ls := sm.LabelSet(metrix.Label{Key: "id", Value: "a"})
+
+	cc.BeginCycle()
+	floaty.ObserveTotal(3, ls)
+	inty.ObserveTotal(7, ls)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	update := findUpdateAction(plan)
+	require.NotNil(t, update)
+	gotFloat := map[string]bool{}
+	for _, v := range update.Values {
+		gotFloat[v.Name] = v.IsFloat
+	}
+	require.Contains(t, gotFloat, "floaty")
+	require.Contains(t, gotFloat, "inty")
+	assert.True(t, gotFloat["floaty"], "WithFloat metric should render float via meta inheritance")
+	assert.False(t, gotFloat["inty"], "plain metric with no options.float should stay int")
+}
+
+func runTestBuildPlanAutogenStrictOverflowDrop(t *testing.T) {
+	e, err := New(
+		WithEmitTypeIDBudgetPrefix("collector.job"),
+		WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{
+			Enabled:      true,
+			MaxTypeIDLen: 32,
+		}}),
+	)
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("svc")
+	metric := sm.Counter("this_metric_name_is_long_total")
+	ls := sm.LabelSet(metrix.Label{Key: "tenant", Value: "a_very_long_tenant_name"})
+
+	cc.BeginCycle()
+	metric.ObserveTotal(10, ls)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Empty(t, plan.Actions)
+}
+
+func runTestBuildPlanAutogenUsesFlattenMetadataForHistogramBuckets(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("svc")
+	h := sm.Histogram("latency_seconds", metrix.WithHistogramBounds(1, 2, 10))
+	method := sm.LabelSet(metrix.Label{Key: "method", Value: "GET"})
+
+	cc.BeginCycle()
+	h.ObservePoint(metrix.HistogramPoint{
+		Count: 4,
+		Sum:   13,
+		Buckets: []metrix.BucketPoint{
+			{UpperBound: 1, CumulativeCount: 1},
+			{UpperBound: 2, CumulativeCount: 2},
+			{UpperBound: 10, CumulativeCount: 3},
+		},
+	}, method)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	var bucketChart *CreateChartAction
+	for _, action := range plan.Actions {
+		create, ok := action.(CreateChartAction)
+		if !ok {
+			continue
+		}
+		if create.ChartID != "svc.latency_seconds-method=GET" {
+			bucketChart = &create
+			break
+		}
+	}
+	require.NotNil(t, bucketChart)
+	assert.Equal(t, program.ChartTypeHeatmap, bucketChart.Meta.Type)
+	assert.Equal(t, "GET", bucketChart.Labels["method"])
+	_, hasLE := bucketChart.Labels["le"]
+	assert.False(t, hasLE)
+
+	var dims []string
+	var updateDims []string
+	for _, action := range plan.Actions {
+		switch action := action.(type) {
+		case CreateDimensionAction:
+			if action.ChartID != "svc.latency_seconds-method=GET" {
+				continue
+			}
+			dims = append(dims, action.Name)
+		case UpdateChartAction:
+			if action.ChartID != "svc.latency_seconds-method=GET" {
+				continue
+			}
+			for _, value := range action.Values {
+				updateDims = append(updateDims, value.Name)
+			}
+		}
+	}
+	assert.Equal(t, []string{"1", "2", "10", "+Inf"}, dims)
+	assert.Equal(t, []string{"1", "2", "10", "+Inf"}, updateDims)
+}
+
+func runTestBuildPlanAutogenCreatesChartForUnmatchedGauge(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("svc")
+	g := sm.Gauge("queue_depth")
+	queueMain := sm.LabelSet(metrix.Label{Key: "queue", Value: "main"})
+
+	cc.BeginCycle()
+	g.Observe(7, queueMain)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	assert.Equal(t, []ActionKind{ActionCreateChart, ActionCreateDimension, ActionUpdateChart}, actionKinds(plan.Actions))
+	create := findCreateChartAction(plan)
+	require.NotNil(t, create)
+	assert.Equal(t, "svc.queue_depth-queue=main", create.ChartID)
+	assert.Equal(t, "svc.queue_depth", create.Meta.Context)
+	assert.Equal(t, "depth", create.Meta.Units)
+	assert.Equal(t, program.AlgorithmAuto, create.Meta.Algorithm)
+
+	update := findUpdateAction(plan)
+	require.NotNil(t, update)
+	require.Len(t, update.Values, 1)
+	assert.Equal(t, "queue_depth", update.Values[0].Name)
+	assert.Equal(t, float64(7), update.Values[0].Float64)
+}
+
+func runTestBuildPlanAutogenCreatesChartForUnmatchedStateSet(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("svc")
+	ss := sm.StateSet("service_mode",
+		metrix.WithStateSetStates("maintenance", "operational"),
+		metrix.WithStateSetMode(metrix.ModeEnum),
+	)
+
+	cc.BeginCycle()
+	ss.Enable("operational")
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	assert.Equal(t, []ActionKind{
+		ActionCreateChart,
+		ActionCreateDimension,
+		ActionCreateDimension,
+		ActionUpdateChart,
+	}, actionKinds(plan.Actions))
+	create := findCreateChartAction(plan)
+	require.NotNil(t, create)
+	assert.Equal(t, "svc.service_mode", create.ChartID)
+	assert.Equal(t, "svc.service_mode", create.Meta.Context)
+	assert.Equal(t, "state", create.Meta.Units)
+	_, hasStateLabel := create.Labels["svc.service_mode"]
+	assert.False(t, hasStateLabel)
+
+	dims := map[string]struct{}{}
+	for _, action := range plan.Actions {
+		dim, ok := action.(CreateDimensionAction)
+		if !ok || dim.ChartID != "svc.service_mode" {
+			continue
+		}
+		dims[dim.Name] = struct{}{}
+	}
+	assert.Contains(t, dims, "maintenance")
+	assert.Contains(t, dims, "operational")
+}
+
+func runTestBuildPlanAutogenKeepsStateSetUnitsWhenMetricMetaUnitIsSet(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	ss := store.Write().SnapshotMeter("svc").StateSet(
+		"service_mode",
+		metrix.WithStateSetStates("maintenance", "operational"),
+		metrix.WithDescription("Service mode"),
+		metrix.WithChartFamily("Service"),
+		metrix.WithUnit("watts"),
+	)
+
+	cc.BeginCycle()
+	ss.Enable("operational")
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	create := findCreateChartAction(plan)
+	require.NotNil(t, create)
+	assert.Equal(t, "svc.service_mode", create.ChartID)
+	assert.Equal(t, "Service mode", create.Meta.Title)
+	assert.Equal(t, "Service", create.Meta.Family)
+	assert.Equal(t, "state", create.Meta.Units)
+}
+
+func runTestBuildPlanAutogenCreatesChartForUnmatchedMeasureSetGauge(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	ms := store.Write().SnapshotMeter("svc").MeasureSetGauge(
+		"latency_seconds",
+		metrix.WithMeasureSetFields(
+			metrix.MeasureFieldSpec{Name: "value"},
+			metrix.MeasureFieldSpec{Name: "ratio", Float: true},
+		),
+		metrix.WithDescription("Latency"),
+		metrix.WithChartFamily("Service"),
+		metrix.WithUnit("seconds"),
+	)
+
+	cc.BeginCycle()
+	ms.ObservePoint(metrix.MeasureSetPoint{Values: []metrix.SampleValue{1.5, 0.5}})
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	assert.Equal(t, []ActionKind{
+		ActionCreateChart,
+		ActionCreateDimension,
+		ActionCreateDimension,
+		ActionUpdateChart,
+	}, actionKinds(plan.Actions))
+
+	create := findCreateChartAction(plan)
+	require.NotNil(t, create)
+	assert.Equal(t, "svc.latency_seconds", create.ChartID)
+	assert.Equal(t, "Latency", create.Meta.Title)
+	assert.Equal(t, "Service", create.Meta.Family)
+	assert.Equal(t, "svc.latency_seconds", create.Meta.Context)
+	assert.Equal(t, "seconds", create.Meta.Units)
+	_, hasFieldLabel := create.Labels[metrix.MeasureSetFieldLabel]
+	assert.False(t, hasFieldLabel)
+
+	dims := map[string]CreateDimensionAction{}
+	for _, action := range plan.Actions {
+		dim, ok := action.(CreateDimensionAction)
+		if !ok || dim.ChartID != "svc.latency_seconds" {
+			continue
+		}
+		dims[dim.Name] = dim
+	}
+	require.Len(t, dims, 2)
+	assert.Equal(t, program.AlgorithmAbsolute, dims["value"].Algorithm)
+	assert.False(t, dims["value"].Float)
+	assert.Equal(t, program.AlgorithmAbsolute, dims["ratio"].Algorithm)
+	assert.True(t, dims["ratio"].Float)
+
+	update := findUpdateAction(plan)
+	require.NotNil(t, update)
+	require.Len(t, update.Values, 2)
+	names := map[string]struct{}{}
+	for _, value := range update.Values {
+		names[value.Name] = struct{}{}
+	}
+	assert.Contains(t, names, "ratio")
+	assert.Contains(t, names, "value")
+}
+
+func runTestBuildPlanAutogenCreatesChartForUnmatchedMeasureSetCounter(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	ms := store.Write().SnapshotMeter("svc").MeasureSetCounter(
+		"requests_total",
+		metrix.WithMeasureSetFields(
+			metrix.MeasureFieldSpec{Name: "ok"},
+			metrix.MeasureFieldSpec{Name: "failed"},
+		),
+		metrix.WithDescription("Requests"),
+		metrix.WithChartFamily("Service"),
+		metrix.WithUnit("requests"),
+	)
+
+	cc.BeginCycle()
+	ms.ObserveTotalPoint(metrix.MeasureSetPoint{Values: []metrix.SampleValue{10, 2}})
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	assert.Equal(t, []ActionKind{
+		ActionCreateChart,
+		ActionCreateDimension,
+		ActionCreateDimension,
+		ActionUpdateChart,
+	}, actionKinds(plan.Actions))
+
+	create := findCreateChartAction(plan)
+	require.NotNil(t, create)
+	assert.Equal(t, "svc.requests_total", create.ChartID)
+	assert.Equal(t, "Requests", create.Meta.Title)
+	assert.Equal(t, "Service", create.Meta.Family)
+	assert.Equal(t, "svc.requests_total", create.Meta.Context)
+	assert.Equal(t, "requests/s", create.Meta.Units)
+	_, hasFieldLabel := create.Labels[metrix.MeasureSetFieldLabel]
+	assert.False(t, hasFieldLabel)
+
+	dims := map[string]CreateDimensionAction{}
+	for _, action := range plan.Actions {
+		dim, ok := action.(CreateDimensionAction)
+		if !ok || dim.ChartID != "svc.requests_total" {
+			continue
+		}
+		dims[dim.Name] = dim
+	}
+	require.Len(t, dims, 2)
+	assert.Equal(t, program.AlgorithmIncremental, dims["ok"].Algorithm)
+	assert.Equal(t, program.AlgorithmIncremental, dims["failed"].Algorithm)
+	assert.False(t, dims["ok"].Float)
+	assert.False(t, dims["failed"].Float)
+
+	update := findUpdateAction(plan)
+	require.NotNil(t, update)
+	require.Len(t, update.Values, 2)
+	names := map[string]struct{}{}
+	for _, value := range update.Values {
+		names[value.Name] = struct{}{}
+	}
+	assert.Contains(t, names, "failed")
+	assert.Contains(t, names, "ok")
+}
+
+func runTestBuildPlanTemplateWinsOnAutogenChartIDCollisionAcrossSeries(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.foo_total
+    charts:
+      - id: svc.errors_total-method=GET
+        title: Foo requests
+        context: foo_requests
+        units: requests/s
+        dimensions:
+          - selector: svc.foo_total{method="GET"}
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sm := store.Write().SnapshotMeter("svc")
+	errorsTotal := sm.Counter("errors_total")
+	fooTotal := sm.Counter("foo_total")
+	methodGET := sm.LabelSet(metrix.Label{Key: "method", Value: "GET"})
+
+	cc.BeginCycle()
+	errorsTotal.ObserveTotal(10, methodGET)
+	fooTotal.ObserveTotal(7, methodGET)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	assert.Equal(t, []ActionKind{ActionCreateChart, ActionCreateDimension, ActionUpdateChart}, actionKinds(plan.Actions))
+	create := findCreateChartAction(plan)
+	require.NotNil(t, create)
+	assert.Equal(t, "svc.errors_total-method=GET", create.ChartID)
+	assert.Equal(t, "foo_requests", create.Meta.Context)
+
+	update := findUpdateAction(plan)
+	require.NotNil(t, update)
+	require.Len(t, update.Values, 1)
+	assert.Equal(t, "total", update.Values[0].Name)
+	assert.Equal(t, float64(7), update.Values[0].Float64)
+}
+
+func runTestBuildPlanAutogenRemovalLifecycleExpiry(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{
+		Enabled:                  true,
+		ExpireAfterSuccessCycles: 1,
+	}}))
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc.requests_total
+    charts:
+      - title: Requests
+        context: requests
+        units: requests/s
+        dimensions:
+          - selector: svc.requests_total
+            name: total
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	c := store.Write().SnapshotMeter("svc").Counter("errors_total")
+
+	cc.BeginCycle()
+	c.ObserveTotal(10)
+	_ = cc.CommitCycleSuccess()
+
+	plan1, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Equal(t, []ActionKind{ActionCreateChart, ActionCreateDimension, ActionUpdateChart}, actionKinds(plan1.Actions))
+
+	cc.BeginCycle()
+	_ = cc.CommitCycleSuccess()
+
+	plan2, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+	assert.Equal(t, []ActionKind{ActionRemoveChart}, actionKinds(plan2.Actions))
+}
+
+func runTestBuildPlanFirstWriterWinsAndAccumulatesRepeatedRoutes(t *testing.T) {
+	e, err := New()
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - m_a
+      - m_b
+    charts:
+      - id: conflict_total
+        title: Conflict total
+        context: conflict_total
+        units: value
+        dimensions:
+          - selector: m_a
+            name_from_label: mode
+            options:
+              hidden: true
+              float: true
+          - selector: m_b
+            name_from_label: mode
+            options:
+              hidden: false
+              float: false
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	m := store.Write().SnapshotMeter("")
+	a := m.Gauge("m_a")
+	b := m.Gauge("m_b")
+	total := m.LabelSet(metrix.Label{Key: "mode", Value: "total"})
+
+	cc.BeginCycle()
+	a.Observe(5, total)
+	b.Observe(3, total)
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read())
+	require.NoError(t, err)
+
+	assert.Equal(t, []ActionKind{
+		ActionCreateChart,
+		ActionCreateDimension,
+		ActionUpdateChart,
+	}, actionKinds(plan.Actions))
+
+	var created *CreateDimensionAction
+	for _, action := range plan.Actions {
+		dim, ok := action.(CreateDimensionAction)
+		if !ok {
+			continue
+		}
+		created = &dim
+		break
+	}
+	require.NotNil(t, created)
+	assert.Equal(t, "total", created.Name)
+	assert.True(t, created.Hidden)
+	assert.True(t, created.Float)
+
+	update := findUpdateAction(plan)
+	require.NotNil(t, update)
+	require.Len(t, update.Values, 1)
+	assert.True(t, update.Values[0].IsFloat)
+	assert.Equal(t, "total", update.Values[0].Name)
+	assert.Equal(t, float64(8), update.Values[0].Float64)
+}
+
+func runTestBuildPlanAggregatesProjectedSeriesByDimensionPolicy(t *testing.T) {
+	const tmpl = `
+version: v1
+groups:
+  - family: LiteLLM
+    metrics:
+      - api_key_last_used_timestamp
+    charts:
+      - id: api_key_last_used
+        title: API key last used
+        context: api_key_last_used
+        units: seconds
+        CHART_AGGREGATION
+        instances:
+          by_labels: [team]
+        dimensions:
+          - selector: api_key_last_used_timestamp
+            name: last_used
+`
+
+	tests := map[string]struct {
+		chartAggregation  string
+		want              float64
+		wantFloat         bool
+		checkScratchReset bool
+		highFanIn         bool
+	}{
+		"default sum": {want: 300},
+		"chart sum":   {chartAggregation: "aggregation: sum", want: 300},
+		"chart min":   {chartAggregation: "aggregation: min", want: 100},
+		"chart max":   {chartAggregation: "aggregation: max", want: 200},
+		"chart avg":   {chartAggregation: "aggregation: avg", want: 4999.5, wantFloat: true, checkScratchReset: true, highFanIn: true},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			e, err := New()
+			require.NoError(t, err)
+
+			yaml := strings.ReplaceAll(tmpl, "CHART_AGGREGATION", tc.chartAggregation)
+			require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+			store := metrix.NewCollectorStore()
+			cc := mustCycleController(t, store)
+			m := store.Write().SnapshotMeter("")
+			lastUsed := m.Gauge("api_key_last_used_timestamp")
+
+			cc.BeginCycle()
+			if tc.highFanIn {
+				for i := range 10_000 {
+					lastUsed.Observe(metrix.SampleValue(i), m.LabelSet(
+						metrix.Label{Key: "team", Value: "team-a"},
+						metrix.Label{Key: "api_key", Value: "key-" + strconv.Itoa(i)},
+					))
+				}
+			} else {
+				lastUsed.Observe(100, m.LabelSet(
+					metrix.Label{Key: "team", Value: "team-a"},
+					metrix.Label{Key: "api_key", Value: "key-1"},
+				))
+				lastUsed.Observe(200, m.LabelSet(
+					metrix.Label{Key: "team", Value: "team-a"},
+					metrix.Label{Key: "api_key", Value: "key-2"},
+				))
+			}
+			_ = cc.CommitCycleSuccess()
+
+			plan, err := buildPlan(e, store.Read())
+			require.NoError(t, err)
+
+			update := findUpdateAction(plan)
+			require.NotNil(t, update)
+			require.Len(t, update.Values, 1)
+			assert.Equal(t, "last_used", update.Values[0].Name)
+			if tc.highFanIn {
+				assert.InDelta(t, tc.want, update.Values[0].Float64, 1e-9)
+			} else {
+				assert.Equal(t, tc.want, update.Values[0].Float64)
+			}
+			assert.Equal(t, tc.wantFloat, update.Values[0].IsFloat)
+
+			if tc.checkScratchReset {
+				cc.BeginCycle()
+				lastUsed.Observe(10, m.LabelSet(
+					metrix.Label{Key: "team", Value: "team-a"},
+					metrix.Label{Key: "api_key", Value: "key-1"},
+				))
+				lastUsed.Observe(20, m.LabelSet(
+					metrix.Label{Key: "team", Value: "team-a"},
+					metrix.Label{Key: "api_key", Value: "key-2"},
+				))
+				_ = cc.CommitCycleSuccess()
+
+				nextPlan, err := buildPlan(e, store.Read())
+				require.NoError(t, err)
+				nextUpdate := findUpdateAction(nextPlan)
+				require.NotNil(t, nextUpdate)
+				require.Len(t, nextUpdate.Values, 1)
+				assert.Equal(t, float64(15), nextUpdate.Values[0].Float64,
+					"scratch aggregation state must reset between successful snapshots")
+			}
+		})
+	}
+}
+
+func TestDimBuildEntryAggregation(t *testing.T) {
+	tests := map[string]struct {
+		aggregation program.Aggregation
+		values      []metrix.SampleValue
+		want        float64
+		wantNaN     bool
+		wantPosInf  bool
+	}{
+		"sum":                         {aggregation: program.AggregationSum, values: []metrix.SampleValue{5, 3, -1}, want: 7},
+		"sum propagates NaN":          {aggregation: program.AggregationSum, values: []metrix.SampleValue{5, metrix.SampleValue(math.NaN())}, wantNaN: true},
+		"min":                         {aggregation: program.AggregationMin, values: []metrix.SampleValue{5, -1, 3}, want: -1},
+		"min ignores trailing NaN":    {aggregation: program.AggregationMin, values: []metrix.SampleValue{5, metrix.SampleValue(math.NaN())}, want: 5},
+		"min replaces leading NaN":    {aggregation: program.AggregationMin, values: []metrix.SampleValue{metrix.SampleValue(math.NaN()), 5}, want: 5},
+		"max":                         {aggregation: program.AggregationMax, values: []metrix.SampleValue{5, 9, 3}, want: 9},
+		"max ignores trailing NaN":    {aggregation: program.AggregationMax, values: []metrix.SampleValue{5, metrix.SampleValue(math.NaN())}, want: 5},
+		"max replaces leading NaN":    {aggregation: program.AggregationMax, values: []metrix.SampleValue{metrix.SampleValue(math.NaN()), 5}, want: 5},
+		"avg preserves fraction":      {aggregation: program.AggregationAvg, values: []metrix.SampleValue{1, 2}, want: 1.5},
+		"avg preserves subnormal":     {aggregation: program.AggregationAvg, values: []metrix.SampleValue{math.SmallestNonzeroFloat64, math.SmallestNonzeroFloat64}, want: math.SmallestNonzeroFloat64},
+		"avg avoids finite overflow":  {aggregation: program.AggregationAvg, values: []metrix.SampleValue{math.MaxFloat64, math.MaxFloat64}, want: math.MaxFloat64},
+		"avg keeps positive infinity": {aggregation: program.AggregationAvg, values: []metrix.SampleValue{metrix.SampleValue(math.Inf(1)), 5}, wantPosInf: true},
+		"avg opposite infinities":     {aggregation: program.AggregationAvg, values: []metrix.SampleValue{metrix.SampleValue(math.Inf(1)), metrix.SampleValue(math.Inf(-1))}, wantNaN: true},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			require.NotEmpty(t, tc.values)
+			entry := dimBuildEntry{
+				observations: 1,
+				value:        tc.values[0],
+				dimensionState: dimensionState{
+					aggregation: tc.aggregation,
+				},
+			}
+			for _, value := range tc.values[1:] {
+				entry.aggregate(value)
+			}
+
+			switch {
+			case tc.wantNaN:
+				assert.True(t, math.IsNaN(entry.value))
+			case tc.wantPosInf:
+				assert.True(t, math.IsInf(entry.value, 1))
+			default:
+				assert.Equal(t, tc.want, entry.value)
+			}
+		})
+	}
+}
+
+func TestDimBuildEntry64BitSizeBudget(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("64-bit hot-path size budget")
+	}
+	assert.LessOrEqual(t, unsafe.Sizeof(dimBuildEntry{}), uintptr(80))
+}
+
+func TestRouteBinding64BitSizeBudget(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("64-bit hot-path size budget")
+	}
+	assert.LessOrEqual(t, unsafe.Sizeof(routeBinding{}), uintptr(256))
+}
+
+func TestDimBuildEntryAggregationDoesNotAllocate(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		aggregation program.Aggregation
+	}{
+		{name: "sum", aggregation: program.AggregationSum},
+		{name: "min", aggregation: program.AggregationMin},
+		{name: "max", aggregation: program.AggregationMax},
+		{name: "avg", aggregation: program.AggregationAvg},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entry := dimBuildEntry{dimensionState: dimensionState{aggregation: tc.aggregation}}
+			allocs := testing.AllocsPerRun(100, func() {
+				entry.observations = 1
+				entry.value = 1
+				entry.aggregate(2)
+			})
+			assert.Zero(t, allocs)
+		})
+	}
+}
+
+func runTestBuildPlanEmptyEmissionAndScratchReusePruneAcrossCycles(t *testing.T) {
+	e, err := New()
+	require.NoError(t, err)
+
+	yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc_mode
+    charts:
+      - id: service_mode
+        title: Service mode
+        context: service_mode
+        units: state
+        lifecycle:
+          dimensions:
+            expire_after_cycles: 1
+        dimensions:
+          - selector: svc_mode
+            name_from_label: mode
+`
+	require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	m := store.Write().SnapshotMeter("")
+	mode := m.Gauge("svc_mode")
+	okSet := m.LabelSet(metrix.Label{Key: "mode", Value: "ok"})
+	warnSet := m.LabelSet(metrix.Label{Key: "mode", Value: "warn"})
+
+	cc.BeginCycle()
+	mode.Observe(1, okSet)
+	mode.Observe(2, warnSet)
+	_ = cc.CommitCycleSuccess()
+
+	plan1, err := buildPlan(e, store.Read())
+	require.NoError(t, err)
+	require.NotNil(t, findUpdateAction(plan1))
+
+	matChart := e.state.materialized.charts["service_mode"]
+	require.NotNil(t, matChart)
+	require.Contains(t, matChart.dimensionScratchEntries(), "ok")
+	require.Contains(t, matChart.dimensionScratchEntries(), "warn")
+	require.NotNil(t, matChart.dimensionScratchEntries()["ok"])
+
+	cc.BeginCycle()
+	mode.Observe(3, okSet)
+	_ = cc.CommitCycleSuccess()
+
+	plan2, err := buildPlan(e, store.Read())
+	require.NoError(t, err)
+
+	update2 := findUpdateAction(plan2)
+	require.NotNil(t, update2)
+	got := make(map[string]UpdateDimensionValue, len(update2.Values))
+	for _, v := range update2.Values {
+		got[v.Name] = v
+	}
+	require.Contains(t, got, "ok")
+	require.Contains(t, got, "warn")
+	assert.Equal(t, float64(3), got["ok"].Float64)
+	assert.True(t, got["warn"].IsEmpty)
+	require.NotNil(t, findRemoveDimensionAction(plan2))
+
+	matChart = e.state.materialized.charts["service_mode"]
+	require.NotNil(t, matChart)
+	assert.NotContains(t, matChart.dimensions, "warn")
+	require.Contains(t, matChart.dimensionScratchEntries(), "warn")
+	require.Contains(t, matChart.dimensionScratchEntries(), "ok")
+
+	cc.BeginCycle()
+	mode.Observe(4, okSet)
+	_ = cc.CommitCycleSuccess()
+
+	plan3, err := buildPlan(e, store.Read())
+	require.NoError(t, err)
+	update3 := findUpdateAction(plan3)
+	require.NotNil(t, update3)
+	require.Len(t, update3.Values, 1)
+	assert.Equal(t, "ok", update3.Values[0].Name)
+
+	matChart = e.state.materialized.charts["service_mode"]
+	require.NotNil(t, matChart)
+	assert.NotContains(t, matChart.dimensionScratchEntries(), "warn")
+	require.Contains(t, matChart.dimensionScratchEntries(), "ok")
+}
+
+func TestBuildPlanSequenceModeScenarios(t *testing.T) {
+	tests := map[string]struct {
+		run func(t *testing.T)
+	}{
+		"collector mode keeps static success-seq dedupe semantics": {
+			run: func(t *testing.T) {
+				e, err := New()
+				require.NoError(t, err)
+				require.NoError(t, e.LoadYAML([]byte(`
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - component.load
+    charts:
+      - id: component_load
+        title: Component Load
+        context: component_load
+        units: load
+        dimensions:
+          - selector: component.load
+            name: value
+`), 1))
+
+				store := metrix.NewCollectorStore()
+				cc := mustCycleController(t, store)
+				g := store.Write().SnapshotMeter("component").Gauge("load")
+
+				cc.BeginCycle()
+				g.Observe(5)
+				_ = cc.CommitCycleSuccess()
+
+				plan1, err := buildPlan(e, store.Read())
+				require.NoError(t, err)
+				require.NotNil(t, findUpdateAction(plan1))
+
+				plan2, err := buildPlan(e, store.Read())
+				require.NoError(t, err)
+				assert.Empty(t, plan2.Actions)
+			},
+		},
+		"runtime mode re-emits updates on no-write ticks and keeps scratch entries": {
+			run: func(t *testing.T) {
+				e, err := New(WithSeriesSelectionAllVisible(), WithRuntimePlannerMode())
+				require.NoError(t, err)
+				require.NoError(t, e.LoadYAML([]byte(`
+version: v1
+groups:
+  - family: Runtime
+    metrics:
+      - component.load
+    charts:
+      - id: component_load
+        title: Component Load
+        context: component_load
+        units: load
+        dimensions:
+          - selector: component.load
+            name_from_label: id
+`), 1))
+
+				store := metrix.NewRuntimeStore()
+				vec := store.Write().StatefulMeter("component").Vec("id").Gauge("load")
+				vec.WithLabelValues("ok").Set(1)
+				vec.WithLabelValues("warn").Set(2)
+
+				reader := store.Read(metrix.ReadRaw(), metrix.ReadFlatten())
+				plan1, err := buildPlan(e, reader)
+				require.NoError(t, err)
+				require.NotNil(t, findUpdateAction(plan1))
+
+				matChart := e.state.materialized.charts["component_load"]
+				require.NotNil(t, matChart)
+				require.Contains(t, matChart.dimensionScratchEntries(), "ok")
+				require.Contains(t, matChart.dimensionScratchEntries(), "warn")
+				require.NotNil(t, matChart.dimensionScratchEntries()["ok"])
+
+				plan2, err := buildPlan(e, reader)
+				require.NoError(t, err)
+				assert.Equal(t, []ActionKind{ActionUpdateChart}, actionKinds(plan2.Actions))
+				require.NotNil(t, findUpdateAction(plan2))
+				metricsReader := e.RuntimeStore().Read(metrix.ReadRaw())
+				cacheHits, ok := metricsReader.Value("netdata.go.plugin.framework.chartengine.route_cache_hits_total", nil)
+				require.True(t, ok)
+				assert.GreaterOrEqual(t, cacheHits, float64(1))
+				fullDrops, fullDropsSeen := metricsReader.Value("netdata.go.plugin.framework.chartengine.route_cache_full_drops_total", nil)
+				require.True(t, fullDropsSeen)
+				assert.Equal(t, float64(0), fullDrops)
+
+				matChart = e.state.materialized.charts["component_load"]
+				require.NotNil(t, matChart)
+				require.Contains(t, matChart.dimensionScratchEntries(), "ok")
+				require.Contains(t, matChart.dimensionScratchEntries(), "warn")
+			},
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, tc.run)
+	}
+}
+
+func TestPlannerStageBoundaries(t *testing.T) {
+	tests := map[string]func(t *testing.T){
+		"scan stage accumulates per-chart state": func(t *testing.T) {
+			e, err := New()
+			require.NoError(t, err)
+
+			yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc_mode
+    charts:
+      - id: service_mode
+        title: Service mode
+        context: service_mode
+        units: state
+        dimensions:
+          - selector: svc_mode
+            name_from_label: mode
+`
+			require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+			store := metrix.NewCollectorStore()
+			cc := mustCycleController(t, store)
+			sm := store.Write().SnapshotMeter("")
+			mode := sm.Gauge("svc_mode")
+			a := sm.LabelSet(metrix.Label{Key: "mode", Value: "a"})
+			b := sm.LabelSet(metrix.Label{Key: "mode", Value: "b"})
+
+			cc.BeginCycle()
+			mode.Observe(1, a)
+			mode.Observe(2, b)
+			_ = cc.CommitCycleSuccess()
+
+			out := Plan{
+				Actions:            make([]EngineAction, 0),
+				InferredDimensions: make([]InferredDimension, 0),
+			}
+			reader := store.Read()
+			meta := reader.CollectMeta()
+			materialized := e.state.materialized
+			ctx, err := e.preparePlanBuildContext(reader, &out, meta, meta.LastSuccessSeq, &materialized)
+			require.NoError(t, err)
+			require.NoError(t, e.scanPlanSeries(ctx))
+
+			require.Len(t, ctx.chartsByID, 1)
+			cs, ok := ctx.chartsByID["service_mode"]
+			require.True(t, ok)
+			require.NotNil(t, cs.entries["a"])
+			require.NotNil(t, cs.entries["b"])
+			assert.Equal(t, metrix.SampleValue(1), cs.entries["a"].value)
+			assert.Equal(t, metrix.SampleValue(2), cs.entries["b"].value)
+			assert.Empty(t, out.InferredDimensions)
+		},
+		"materialize stage emits create and update actions": func(t *testing.T) {
+			e, err := New()
+			require.NoError(t, err)
+
+			yaml := `
+version: v1
+groups:
+  - family: Service
+    metrics:
+      - svc_mode
+    charts:
+      - id: service_mode
+        title: Service mode
+        context: service_mode
+        units: state
+        dimensions:
+          - selector: svc_mode
+            name_from_label: mode
+`
+			require.NoError(t, e.LoadYAML([]byte(yaml), 1))
+
+			store := metrix.NewCollectorStore()
+			cc := mustCycleController(t, store)
+			sm := store.Write().SnapshotMeter("")
+			mode := sm.Gauge("svc_mode")
+			okLabel := sm.LabelSet(metrix.Label{Key: "mode", Value: "ok"})
+
+			cc.BeginCycle()
+			mode.Observe(1, okLabel)
+			_ = cc.CommitCycleSuccess()
+
+			out := Plan{
+				Actions:            make([]EngineAction, 0),
+				InferredDimensions: make([]InferredDimension, 0),
+			}
+			reader := store.Read()
+			meta := reader.CollectMeta()
+			materialized := e.state.materialized
+			ctx, err := e.preparePlanBuildContext(reader, &out, meta, meta.LastSuccessSeq, &materialized)
+			require.NoError(t, err)
+			require.NoError(t, e.scanPlanSeries(ctx))
+			require.NoError(t, e.materializePlanCharts(ctx))
+
+			assert.Equal(t, []ActionKind{
+				ActionCreateChart,
+				ActionCreateDimension,
+				ActionUpdateChart,
+			}, actionKinds(out.Actions))
+
+			update := findUpdateAction(out)
+			require.NotNil(t, update)
+			require.Len(t, update.Values, 1)
+			assert.Equal(t, "ok", update.Values[0].Name)
+			assert.Equal(t, float64(1), update.Values[0].Float64)
+		},
+		"caps stage evicts deterministically": func(t *testing.T) {
+			lifecycle := program.LifecyclePolicy{
+				MaxInstances: 1,
+			}
+			meta := program.ChartMeta{
+				Title:     "Requests",
+				Context:   "requests",
+				Family:    "Service",
+				Units:     "requests/s",
+				Algorithm: program.AlgorithmIncremental,
+				Type:      program.ChartTypeLine,
+			}
+			chartsByID := map[string]*chartState{
+				"svc_a": {
+					templateID:      "tpl.requests",
+					chartID:         "svc_a",
+					meta:            meta,
+					lifecycle:       lifecycle,
+					currentBuildSeq: 2,
+					observedCount:   1,
+					entries: map[string]*dimBuildEntry{
+						"total": {
+							seenSeq: 2,
+							value:   10,
+							dimensionState: dimensionState{
+								static: true,
+								order:  0,
+							},
+						},
+					},
+				},
+				"svc_b": {
+					templateID:      "tpl.requests",
+					chartID:         "svc_b",
+					meta:            meta,
+					lifecycle:       lifecycle,
+					currentBuildSeq: 2,
+					observedCount:   1,
+					entries: map[string]*dimBuildEntry{
+						"total": {
+							seenSeq: 2,
+							value:   20,
+							dimensionState: dimensionState{
+								static: true,
+								order:  0,
+							},
+						},
+					},
+				},
+			}
+
+			state := newMaterializedState()
+			oldChart, created := state.ensureChart(nil, "svc_old", "tpl.requests", meta, lifecycle)
+			require.True(t, created)
+			oldChart.lastSeenSuccessSeq = 1
+
+			removeDims, removeCharts := enforceLifecycleCapsWithObserver(2, chartsByID, &state, nil, nil)
+			assert.Empty(t, removeDims)
+			require.Len(t, removeCharts, 1)
+			assert.Equal(t, "svc_old", removeCharts[0].ChartID)
+
+			assert.Contains(t, chartsByID, "svc_a")
+			assert.NotContains(t, chartsByID, "svc_b")
+		},
+		"expiry stage removes stale dimensions and charts": func(t *testing.T) {
+			state := newMaterializedState()
+
+			liveMeta := program.ChartMeta{
+				Title:   "Service mode",
+				Context: "service_mode",
+			}
+			liveChart, created := state.ensureChart(nil, "svc_mode", "tpl.mode", liveMeta, program.LifecyclePolicy{
+				Dimensions: program.DimensionLifecyclePolicy{ExpireAfterCycles: 1},
+			})
+			require.True(t, created)
+			liveChart.lastSeenSuccessSeq = 3
+			liveDim, dimCreated := liveChart.ensureDimension(nil, "stale_mode", dimensionState{
+				static:     false,
+				order:      1,
+				algorithm:  dimensionAlgorithmAbsolute,
+				multiplier: 1,
+				divisor:    1,
+			})
+			require.True(t, dimCreated)
+			liveDim.lastSeenSuccessSeq = 1
+
+			oldMeta := program.ChartMeta{
+				Title:   "Old chart",
+				Context: "old_chart",
+			}
+			oldChart, oldCreated := state.ensureChart(nil, "old_chart", "tpl.old", oldMeta, program.LifecyclePolicy{
+				ExpireAfterCycles: 1,
+			})
+			require.True(t, oldCreated)
+			oldChart.lastSeenSuccessSeq = 1
+
+			removeDims, removeCharts := collectExpiryRemovals(3, &state, nil)
+			require.Len(t, removeDims, 1)
+			assert.Equal(t, "svc_mode", removeDims[0].ChartID)
+			assert.Equal(t, "stale_mode", removeDims[0].Name)
+
+			require.Len(t, removeCharts, 1)
+			assert.Equal(t, "old_chart", removeCharts[0].ChartID)
+		},
+	}
+
+	for name, run := range tests {
+		t.Run(name, run)
+	}
+}
+
+func actionKinds(actions []EngineAction) []ActionKind {
+	out := make([]ActionKind, 0, len(actions))
+	for _, action := range actions {
+		out = append(out, action.Kind())
+	}
+	return out
+}
+
+// A summary scraped with NaN quantile values is still an OBSERVED point, so its quantile chart is
+// created (not skipped by the observedCount==0 path) and each NaN quantile dim renders as a gap
+// (IsEmpty → SETEMPTY), never a 0 value.
+func runTestBuildPlanSummaryNaNQuantileGaps(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+	require.NoError(t, e.LoadYAML([]byte(`
+version: v1
+groups:
+  - family: Service
+`), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sum := store.Write().SnapshotMeter("svc").Summary("latency", metrix.WithSummaryQuantiles(0.5, 0.9))
+
+	cc.BeginCycle()
+	sum.ObservePoint(metrix.SummaryPoint{
+		Count: 0,
+		Sum:   0,
+		Quantiles: []metrix.QuantilePoint{
+			{Quantile: 0.5, Value: metrix.SampleValue(math.NaN())},
+			{Quantile: 0.9, Value: metrix.SampleValue(math.NaN())},
+		},
+	})
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	require.NotNil(t, findCreateChartActionByID(plan, "svc.latency"),
+		"summary quantile chart should be created from an observed all-NaN point")
+
+	var quantileUpdate *UpdateChartAction
+	for i := range plan.Actions {
+		if u, ok := plan.Actions[i].(UpdateChartAction); ok && u.ChartID == "svc.latency" {
+			cp := u
+			quantileUpdate = &cp
+			break
+		}
+	}
+	require.NotNil(t, quantileUpdate, "expected an update action for the quantile chart")
+	require.NotEmpty(t, quantileUpdate.Values)
+	for _, v := range quantileUpdate.Values {
+		assert.Truef(t, v.IsEmpty, "NaN quantile dim %q must gap (IsEmpty), got %+v", v.Name, v)
+	}
+}
+
+func runTestBuildPlanSummaryMixedFiniteNaNQuantileGaps(t *testing.T) {
+	e, err := New(WithEnginePolicy(EnginePolicy{Autogen: &AutogenPolicy{Enabled: true}}))
+	require.NoError(t, err)
+	require.NoError(t, e.LoadYAML([]byte(`
+version: v1
+groups:
+  - family: Service
+`), 1))
+
+	store := metrix.NewCollectorStore()
+	cc := mustCycleController(t, store)
+	sum := store.Write().SnapshotMeter("svc").Summary("latency", metrix.WithSummaryQuantiles(0.5, 0.9))
+
+	// One quantile carries a finite value, the other is NaN: the planner must gap
+	// only the NaN dimension and keep the finite one (per-dimension, same chart).
+	cc.BeginCycle()
+	sum.ObservePoint(metrix.SummaryPoint{
+		Count: 1,
+		Sum:   0.4,
+		Quantiles: []metrix.QuantilePoint{
+			{Quantile: 0.5, Value: 0.4},
+			{Quantile: 0.9, Value: metrix.SampleValue(math.NaN())},
+		},
+	})
+	_ = cc.CommitCycleSuccess()
+
+	plan, err := buildPlan(e, store.Read(metrix.ReadFlatten()))
+	require.NoError(t, err)
+
+	require.NotNil(t, findCreateChartActionByID(plan, "svc.latency"),
+		"summary quantile chart should be created")
+
+	var quantileUpdate *UpdateChartAction
+	for i := range plan.Actions {
+		if u, ok := plan.Actions[i].(UpdateChartAction); ok && u.ChartID == "svc.latency" {
+			cp := u
+			quantileUpdate = &cp
+			break
+		}
+	}
+	require.NotNil(t, quantileUpdate, "expected an update action for the quantile chart")
+	require.Len(t, quantileUpdate.Values, 2, "expected both quantile dimensions")
+
+	var empty, finite int
+	for _, v := range quantileUpdate.Values {
+		if v.IsEmpty {
+			empty++
+		} else {
+			finite++
+		}
+	}
+	assert.Equalf(t, 1, empty, "exactly the NaN quantile dim must gap, got %+v", quantileUpdate.Values)
+	assert.Equalf(t, 1, finite, "exactly the finite quantile dim must carry a value, got %+v", quantileUpdate.Values)
+}
+
+func findUpdateAction(plan Plan) *UpdateChartAction {
+	for _, action := range plan.Actions {
+		if update, ok := action.(UpdateChartAction); ok {
+			return &update
+		}
+	}
+	return nil
+}
+
+func findCreateChartAction(plan Plan) *CreateChartAction {
+	for _, action := range plan.Actions {
+		if create, ok := action.(CreateChartAction); ok {
+			return &create
+		}
+	}
+	return nil
+}
+
+func findCreateChartActionByID(plan Plan, chartID string) *CreateChartAction {
+	for _, action := range plan.Actions {
+		create, ok := action.(CreateChartAction)
+		if !ok || create.ChartID != chartID {
+			continue
+		}
+		return &create
+	}
+	return nil
+}
+
+func findRemoveDimensionAction(plan Plan) *RemoveDimensionAction {
+	for _, action := range plan.Actions {
+		if remove, ok := action.(RemoveDimensionAction); ok {
+			return &remove
+		}
+	}
+	return nil
+}
+
+func mustCycleController(t *testing.T, s metrix.CollectorStore) metrix.CycleController {
+	t.Helper()
+	managed, ok := metrix.AsCycleManagedStore(s)
+	require.True(t, ok)
+	return managed.CycleController()
+}

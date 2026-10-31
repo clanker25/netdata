@@ -1,0 +1,8 @@
+{
+  "vnode": "ok",
+  "update_every": 124,
+  "autodetection_retry": 123,
+  "address": "ok",
+  "timeout": 123.123,
+  "collect_peers": false
+}

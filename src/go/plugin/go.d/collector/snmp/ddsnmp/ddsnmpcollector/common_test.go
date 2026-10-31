@@ -1,0 +1,192 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package ddsnmpcollector
+
+import (
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/golang/mock/gomock"
+	"github.com/gosnmp/gosnmp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	snmpmock "github.com/gosnmp/gosnmp/mocks"
+
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp/ddsnmp"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp/ddsnmp/ddprofiledefinition"
+)
+
+func mustCompileRegex(pattern string) *regexp.Regexp {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		panic(err)
+	}
+	return re
+}
+
+func setupMockHandler(t *testing.T) (*gomock.Controller, *snmpmock.MockHandler) {
+	ctrl := gomock.NewController(t)
+	mockHandler := snmpmock.NewMockHandler(ctrl)
+	mockHandler.EXPECT().MaxOids().Return(10).AnyTimes()
+	return ctrl, mockHandler
+}
+
+func matchedProfileByFile(t *testing.T, sysObjectID, profileFile string) *ddsnmp.Profile {
+	t.Helper()
+
+	matched := ddsnmp.FindProfiles(sysObjectID, "", nil)
+	for _, prof := range matched {
+		if strings.HasSuffix(prof.SourceFile, profileFile) {
+			return prof
+		}
+	}
+
+	require.FailNowf(t, "missing profile", "expected %s for %s", profileFile, sysObjectID)
+	return nil
+}
+
+func oidWithIndex(baseOID, index string) string {
+	return strings.Trim(baseOID, ".") + "." + strings.Trim(index, ".")
+}
+
+func createTestProfile(sourceFile string, metrics []ddprofiledefinition.MetricsConfig) *ddsnmp.Profile {
+	return &ddsnmp.Profile{
+		SourceFile: sourceFile,
+		Definition: &ddprofiledefinition.ProfileDefinition{
+			Metrics: metrics,
+		},
+	}
+}
+
+func createScalarMetric(oid, name string) ddprofiledefinition.MetricsConfig {
+	return ddprofiledefinition.MetricsConfig{
+		Symbol: ddprofiledefinition.SymbolConfig{
+			OID:  oid,
+			Name: name,
+		},
+	}
+}
+
+func expectSNMPGet(mockHandler *snmpmock.MockHandler, oids []string, pdus []gosnmp.SnmpPDU) {
+	mockHandler.EXPECT().Get(gomock.InAnyOrder(oids)).Return(
+		&gosnmp.SnmpPacket{Variables: pdus}, nil,
+	)
+}
+
+func expectSNMPGetError(mockHandler *snmpmock.MockHandler, oids []string, err error) {
+	mockHandler.EXPECT().Get(gomock.InAnyOrder(oids)).Return(nil, err)
+}
+
+func expectSystemMetadataGets(mockHandler *snmpmock.MockHandler, sysObjectID, sysName string) {
+	mockHandler.EXPECT().Get(gomock.Any()).Return(&gosnmp.SnmpPacket{Variables: []gosnmp.SnmpPDU{
+		createStringPDU("1.0.8802.1.1.2.1.3.1.0", sysName),
+		createStringPDU("1.0.8802.1.1.2.1.3.2.0", sysName),
+		createStringPDU("1.0.8802.1.1.2.1.3.3.0", sysName),
+		createStringPDU("1.0.8802.1.1.2.1.3.4.0", sysName),
+		createStringPDU("1.0.8802.1.1.2.1.3.5.0", sysName),
+		createStringPDU("1.0.8802.1.1.2.1.3.6.0", sysName),
+		createStringPDU("1.3.6.1.2.1.1.1.0", "SNMP device"),
+		createPDU("1.3.6.1.2.1.1.2.0", gosnmp.ObjectIdentifier, sysObjectID),
+		createStringPDU("1.3.6.1.2.1.1.5.0", sysName),
+		createStringPDU("1.3.6.1.2.1.1.6.0", "lab"),
+	}}, nil).AnyTimes()
+}
+
+func expectSNMPWalk(mockHandler *snmpmock.MockHandler, version gosnmp.SnmpVersion, oid string, pdus []gosnmp.SnmpPDU) {
+	mockHandler.EXPECT().Version().Return(version)
+	if version == gosnmp.Version1 {
+		mockHandler.EXPECT().WalkAll(oid).Return(pdus, nil)
+	} else {
+		mockHandler.EXPECT().BulkWalkAll(oid).Return(pdus, nil)
+	}
+}
+
+func expectSNMPWalkError(mockHandler *snmpmock.MockHandler, version gosnmp.SnmpVersion, oid string, err error) {
+	mockHandler.EXPECT().Version().Return(version)
+	if version == gosnmp.Version1 {
+		mockHandler.EXPECT().WalkAll(oid).Return(nil, err)
+	} else {
+		mockHandler.EXPECT().BulkWalkAll(oid).Return(nil, err)
+	}
+}
+
+func createPDU(name string, pduType gosnmp.Asn1BER, value any) gosnmp.SnmpPDU {
+	return gosnmp.SnmpPDU{
+		Name:  name,
+		Type:  pduType,
+		Value: value,
+	}
+}
+
+func createStringPDU(name string, value string) gosnmp.SnmpPDU {
+	return createPDU(name, gosnmp.OctetString, []byte(value))
+}
+
+func createIntegerPDU(name string, value int) gosnmp.SnmpPDU {
+	return createPDU(name, gosnmp.Integer, value)
+}
+
+func createCounter32PDU(name string, value uint) gosnmp.SnmpPDU {
+	return createPDU(name, gosnmp.Counter32, value)
+}
+
+func createCounter64PDU(name string, value uint64) gosnmp.SnmpPDU {
+	return createPDU(name, gosnmp.Counter64, value)
+}
+
+func createGauge32PDU(name string, value uint) gosnmp.SnmpPDU {
+	return createPDU(name, gosnmp.Gauge32, value)
+}
+
+func createTimeTicksPDU(name string, value uint32) gosnmp.SnmpPDU {
+	return createPDU(name, gosnmp.TimeTicks, value)
+}
+
+func createDateAndTimePDU(name string, value time.Time) gosnmp.SnmpPDU {
+	return createPDU(name, gosnmp.OctetString, []byte{
+		byte(value.Year() >> 8),
+		byte(value.Year()),
+		byte(value.Month()),
+		byte(value.Day()),
+		byte(value.Hour()),
+		byte(value.Minute()),
+		byte(value.Second()),
+		0,
+	})
+}
+
+func createNoSuchObjectPDU(name string) gosnmp.SnmpPDU {
+	return createPDU(name, gosnmp.NoSuchObject, nil)
+}
+
+func assertMetricsEqual(t *testing.T, expected, actual []ddsnmp.Metric) {
+	t.Helper()
+	assert.Equal(t, len(expected), len(actual))
+	require.Equal(t, len(expected), len(actual), "number of metrics")
+
+	// Sort metrics for consistent comparison
+
+	for i := range expected {
+		assert.Equal(t, expected[i].Name, actual[i].Name, "metric name")
+		assert.Equal(t, expected[i].Value, actual[i].Value, "metric value")
+		assert.Equal(t, expected[i].MetricType, actual[i].MetricType, "metric type")
+		assert.Equal(t, expected[i].Tags, actual[i].Tags, "metric tags")
+		assert.Equal(t, expected[i].StaticTags, actual[i].StaticTags, "metric static tags")
+		assert.Equal(t, expected[i].IsTable, actual[i].IsTable, "metric is table")
+		assert.Equal(t, expected[i].Unit, actual[i].Unit, "metric unit")
+		assert.Equal(t, expected[i].Family, actual[i].Family, "metric family")
+		assert.Equal(t, expected[i].Description, actual[i].Description, "metric description")
+		assert.Equal(t, expected[i].MultiValue, actual[i].MultiValue, "metric multi value")
+	}
+}
+
+func assertTableMetricsEqual(t *testing.T, expected, actual []ddsnmp.Metric) {
+	t.Helper()
+	assert.Equal(t, len(expected), len(actual), "number of metrics")
+
+	// Use ElementsMatch for unordered comparison
+	assert.ElementsMatch(t, expected, actual, "table metrics should match (unordered)")
+}

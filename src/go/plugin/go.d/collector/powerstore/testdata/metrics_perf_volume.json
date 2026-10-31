@@ -1,0 +1,15 @@
+[
+  {
+    "volume_id": "V1",
+    "appliance_id": "A1",
+    "avg_read_iops": 500.2,
+    "avg_write_iops": 300.1,
+    "avg_total_iops": 800.3,
+    "avg_read_bandwidth": 52428900,
+    "avg_write_bandwidth": 31457290,
+    "avg_total_bandwidth": 83886080,
+    "avg_read_latency": 200.0,
+    "avg_write_latency": 300.0,
+    "avg_latency": 240.0
+  }
+]

@@ -1,0 +1,229 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "rrdset.h"
+#include "storage-engine.h"
+
+void rrdset_metadata_updated(RRDSET *st) {
+    __atomic_add_fetch(&st->version, 1, __ATOMIC_RELAXED);
+    rrdcontext_updated_rrdset(st);
+}
+
+// ----------------------------------------------------------------------------
+
+// get the timestamp of the last entry in the round-robin database
+time_t rrdset_last_entry_s(RRDSET *st) {
+    RRDDIM *rd;
+    time_t last_entry_s  = 0;
+
+    rrddim_foreach_read(rd, st) {
+        time_t t = rrddim_last_entry_s(rd);
+        if(t > last_entry_s) last_entry_s = t;
+    }
+    rrddim_foreach_done(rd);
+
+    return last_entry_s;
+}
+
+time_t rrdset_last_entry_s_of_tier(RRDSET *st, size_t tier) {
+    RRDDIM *rd;
+    time_t last_entry_s  = 0;
+
+    rrddim_foreach_read(rd, st) {
+                time_t t = rrddim_last_entry_s_of_tier(rd, tier);
+                if(t > last_entry_s) last_entry_s = t;
+            }
+    rrddim_foreach_done(rd);
+
+    return last_entry_s;
+}
+
+// get the timestamp of first entry in the round-robin database
+time_t rrdset_first_entry_s(RRDSET *st) {
+    RRDDIM *rd;
+    time_t first_entry_s = LONG_MAX;
+
+    rrddim_foreach_read(rd, st) {
+        time_t t = rrddim_first_entry_s(rd);
+        if(t && t < first_entry_s)
+            first_entry_s = t;
+    }
+    rrddim_foreach_done(rd);
+
+    if (unlikely(LONG_MAX == first_entry_s)) return 0;
+    return first_entry_s;
+}
+
+time_t rrdset_first_entry_s_of_tier(RRDSET *st, size_t tier) {
+    if(unlikely(tier >= nd_profile.storage_tiers))
+        return 0;
+
+    RRDDIM *rd;
+    time_t first_entry_s = LONG_MAX;
+
+    rrddim_foreach_read(rd, st) {
+        time_t t = rrddim_first_entry_s_of_tier(rd, tier);
+        if(t && t < first_entry_s)
+            first_entry_s = t;
+    }
+    rrddim_foreach_done(rd);
+
+    if (unlikely(LONG_MAX == first_entry_s)) return 0;
+    return first_entry_s;
+}
+
+void rrdset_get_retention_of_tier_for_collected_chart(RRDSET *st, time_t *first_time_s, time_t *last_time_s, time_t now_s, size_t tier) {
+    if(!now_s)
+        now_s = now_realtime_sec();
+
+    time_t db_first_entry_s = rrdset_first_entry_s_of_tier(st, tier);
+    time_t db_last_entry_s = st->last_updated.tv_sec; // we assume this is a collected RRDSET
+
+    if(unlikely(!db_last_entry_s)) {
+        db_last_entry_s = rrdset_last_entry_s_of_tier(st, tier);
+
+        if (unlikely(!db_last_entry_s)) {
+            // we assume this is a collected RRDSET
+            db_first_entry_s = 0;
+            db_last_entry_s = 0;
+        }
+    }
+
+    if(unlikely(db_last_entry_s > now_s)) {
+        internal_error(db_last_entry_s > now_s + 1,
+                       "RRDSET: 'host:%s/chart:%s' latest db time %" PRId64 " is in the future, adjusting it to now %" PRId64,
+                       rrdhost_hostname(st->rrdhost), rrdset_id(st),
+                       (int64_t)db_last_entry_s, (int64_t)now_s);
+        db_last_entry_s = now_s;
+    }
+
+    if(unlikely(db_first_entry_s && db_last_entry_s && db_first_entry_s >= db_last_entry_s)) {
+        internal_error(db_first_entry_s > db_last_entry_s,
+                       "RRDSET: 'host:%s/chart:%s' oldest db time %" PRId64 " is bigger than latest db time %" PRId64 ", adjusting it to (latest time %" PRId64 " - update every %" PRId64 ")",
+                       rrdhost_hostname(st->rrdhost), rrdset_id(st),
+                       (int64_t)db_first_entry_s, (int64_t)db_last_entry_s,
+                       (int64_t)db_last_entry_s, (int64_t)st->update_every);
+        db_first_entry_s = db_last_entry_s - st->update_every;
+    }
+
+    if(unlikely(!db_first_entry_s && db_last_entry_s))
+        // this can be the case on the first data collection of a chart
+        db_first_entry_s = db_last_entry_s - st->update_every;
+
+    *first_time_s = db_first_entry_s;
+    *last_time_s = db_last_entry_s;
+}
+
+void rrdset_is_obsolete___safe_from_collector_thread(RRDSET *st) {
+    if(!st) return;
+
+    rrdset_pluginsd_receive_unslot(st);
+
+    if(unlikely(!(rrdset_flag_check(st, RRDSET_FLAG_OBSOLETE)))) {
+//        netdata_log_info("Setting obsolete flag on chart 'host:%s/chart:%s'",
+//                rrdhost_hostname(st->rrdhost), rrdset_id(st));
+
+        rrdset_flag_set(st, RRDSET_FLAG_OBSOLETE);
+        rrdhost_flag_set(st->rrdhost, RRDHOST_FLAG_PENDING_OBSOLETE_CHARTS);
+
+        rrdset_touch_last_accessed_time_s(st);
+
+        // The parent skips replication for obsolete charts, so the natural
+        // "replication finished" decrement at stream-replication-sender.c will
+        // never fire for this chart. Release any pending replication slot now,
+        // otherwise rrdhost_sender_replicating_charts pins above zero and
+        // observability (SND_REPLICATING vs SND_RUNNING) stays stuck on the
+        // wrong state. Mirror the natural-finalize path's pulse-status flip on
+        // the 0/1 boundary so SND_REPLICATING -> SND_RUNNING is observed.
+        RRDSET_FLAGS old_repl = rrdset_flag_set_and_clear(
+            st,
+            RRDSET_FLAG_SENDER_REPLICATION_FINISHED,
+            RRDSET_FLAG_SENDER_REPLICATION_IN_PROGRESS);
+        if(old_repl & RRDSET_FLAG_SENDER_REPLICATION_IN_PROGRESS) {
+            if(rrdhost_sender_replicating_charts_minus_one(st->rrdhost) == 0)
+                pulse_host_status(st->rrdhost, PULSE_HOST_STATUS_SND_RUNNING, 0);
+        }
+
+        // The receiver side MUST NOT be released here. RRDSET_FLAG_RECEIVER_REPLICATION_IN_PROGRESS is
+        // also what makes a later CHART_DEFINITION_END a duplicate. A child sends one after every
+        // obsolete CHART, so clearing the flag here re-claims the chart and starts a second replication
+        // while its backfill may still be writing the higher tiers - two writers on one collect handle.
+        // It is released instead by its REPLAY_END if one arrives, else by the connect/disconnect reset
+        // or chart teardown.
+
+        rrdset_metadata_updated(st);
+
+        // the chart will not get more updates (data collection)
+        // so, we have to push its definition now
+        stream_sender_send_rrdset_definition_now(st);
+        rrdcontext_updated_rrdset_flags(st);
+    }
+}
+
+void rrdset_isnot_obsolete___safe_from_collector_thread(RRDSET *st) {
+    if(unlikely((rrdset_flag_check(st, RRDSET_FLAG_OBSOLETE)))) {
+
+//        netdata_log_info("Clearing obsolete flag on chart 'host:%s/chart:%s'",
+//                rrdhost_hostname(st->rrdhost), rrdset_id(st));
+
+        rrdset_flag_clear(st, RRDSET_FLAG_OBSOLETE);
+        rrdset_touch_last_accessed_time_s(st);
+
+        rrdset_metadata_updated(st);
+
+        // the chart will be pushed upstream automatically
+        // due to data collection
+        rrdcontext_updated_rrdset_flags(st);
+    }
+}
+
+void rrdset_update_heterogeneous_flag(RRDSET *st) {
+    RRDHOST *host = st->rrdhost;
+    (void)host;
+
+    RRDDIM *rd;
+
+    rrdset_flag_clear(st, RRDSET_FLAG_HOMOGENEOUS_CHECK);
+
+    bool init = false, is_heterogeneous = false;
+    RRD_ALGORITHM algorithm;
+    int64_t multiplier;
+    int64_t divisor;
+
+    rrddim_foreach_read(rd, st) {
+        if(!init) {
+            algorithm = rd->algorithm;
+            multiplier = rrddim_scale_magnitude(rd->multiplier);
+            divisor = rrddim_scale_magnitude(rd->divisor);
+            init = true;
+            continue;
+        }
+
+        if(algorithm != rd->algorithm || multiplier != rrddim_scale_magnitude(rd->multiplier) ||
+           divisor != rrddim_scale_magnitude(rd->divisor)) {
+            if(!rrdset_flag_check(st, RRDSET_FLAG_HETEROGENEOUS)) {
+                #ifdef NETDATA_INTERNAL_CHECKS
+                netdata_log_info("Dimension '%s' added on chart '%s' of host '%s' is not homogeneous to other dimensions already present "
+                     "(algorithm is '%s' vs '%s', multiplier is %d vs %" PRId64 ", "
+                     "divisor is %d vs %" PRId64 ").",
+                     rrddim_name(rd),
+                     rrdset_name(st),
+                     rrdhost_hostname(host),
+                     rrd_algorithm_name(rd->algorithm), rrd_algorithm_name(algorithm),
+                     rd->multiplier, multiplier,
+                     rd->divisor, divisor
+                );
+                #endif
+                rrdset_flag_set(st, RRDSET_FLAG_HETEROGENEOUS);
+            }
+
+            is_heterogeneous = true;
+            break;
+        }
+    }
+    rrddim_foreach_done(rd);
+
+    if(!is_heterogeneous) {
+        rrdset_flag_clear(st, RRDSET_FLAG_HETEROGENEOUS);
+        rrdcontext_updated_rrdset_flags(st);
+    }
+}
