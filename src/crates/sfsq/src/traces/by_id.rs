@@ -1,0 +1,461 @@
+//! Cross-source trace-by-id: assemble ONE trace from many sources.
+//!
+//! [`trace_by_id`] walks a validated set of [`TraceSource`]s (sealed
+//! SFSTs, in-memory chunk SFSTs, WAL tails) through the shared combiner
+//! (`sfst::trace_combine`): per-file sessions decode the TBLM bloom once
+//! and test the id against it, surviving sources feed lightweight span
+//! refs into the comparator-ordered k-way merge, and payloads
+//! materialize only as the merge accepts them.
+//!
+//! Status honesty (the design-record contract): a source that fails to
+//! map, open, or decode what the lookup reads surfaces as a
+//! [`SourceFailure`](PartialReason::SourceFailure) reason on the
+//! query-level [`QueryStatus`], and an unavailable source as
+//! [`RemoteUnavailable`](PartialReason::RemoteUnavailable) — never a
+//! silent skip. Cancellation before all source heads are resolved
+//! returns an EMPTY result with
+//! [`Cancelled`](PartialReason::Cancelled); cancellation during the
+//! merge returns the deterministic merged prefix. The span cap yields
+//! [`SizeCap`](PartialReason::SizeCap) keeping the globally earliest
+//! spans (cap+1 detection — an exactly-cap trace is `Complete`).
+//!
+//! Bloom first: each SFST opens as its metadata view, and only a file
+//! that holds the trace decodes its row columns and primary dictionary
+//! (`sfst::TraceFileSession::open_owned`). Corruption in what a lookup
+//! never reads — a file the bloom rules out, or one that does not hold
+//! the trace — is not discovered, so it is not reported.
+//!
+//! The result also carries a field→kinds map, so consumers type values
+//! from the stored schema instead of inferring them from rendered
+//! strings. Its sectioning and its scope (each key's leaf kinds, unioned
+//! over exactly the sources that contributed retained spans) live on
+//! [`FieldKinds`].
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use tokio_util::sync::CancellationToken;
+
+use sfst::trace_combine::{Shaped, SpanShaper, SpanSource, combine};
+
+use super::predicate::{LoweredTokens, PredicateError, SpanToken, TokenQuery};
+use super::sources::{SourceSetError, TraceSource, validate_sources};
+use super::status::{PartialReason, QueryStatus, StatusBuilder};
+use super::wal_scan::TraceWalScan;
+use crate::source::map_source;
+
+/// The library default span cap ([`TraceQuery::new`] applies it): far
+/// above any honest trace, low enough that a runaway merge stays bounded.
+pub const DEFAULT_SPAN_CAP: usize = 65_536;
+
+/// Most files holding decoded state at once while a trace is assembled
+/// or a search runs (decision 43): each file's decoded state is bounded
+/// by its size, so the limit bounds memory however many files a trace or
+/// a window spans. A count, not bytes: files are size-rotated, and a file
+/// holds at most 8 stream batches.
+pub(crate) const LOADED_SOURCES_MAX: usize = 7;
+
+/// A trace-by-id request in engine terms. [`new`](Self::new) applies the
+/// default span cap; [`span_cap`](Self::span_cap) overrides it and
+/// [`unbounded`](Self::unbounded) removes it.
+pub struct TraceQuery {
+    trace_id: sfst::TraceId,
+    span_cap: Option<usize>,
+    shaper: Option<Box<dyn SpanShaper + Send>>,
+    highlight: TokenQuery,
+}
+
+impl std::fmt::Debug for TraceQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TraceQuery")
+            .field("trace_id", &self.trace_id)
+            .field("span_cap", &self.span_cap)
+            .field("shaper", &self.shaper.is_some())
+            .field("highlight", &self.highlight)
+            .finish()
+    }
+}
+
+impl TraceQuery {
+    pub fn new(trace_id: sfst::TraceId) -> Self {
+        Self {
+            trace_id,
+            span_cap: Some(DEFAULT_SPAN_CAP),
+            shaper: None,
+            highlight: TokenQuery::default(),
+        }
+    }
+
+    /// Report the spans matching `tokens` ([`TraceData::matched`]): a
+    /// span matches when it satisfies some positive span-local token's
+    /// whole group (free text included), tested on its FULL values
+    /// before any [`shaper`](Self::shaper) cuts them. Negated,
+    /// trace-level and `trace_id` tokens select no span. No window: the
+    /// whole trace is shown.
+    pub fn highlight(mut self, tokens: impl Into<TokenQuery>) -> Self {
+        self.highlight = tokens.into();
+        self
+    }
+
+    /// Shape and weigh every span the merge keeps (a caller caps values
+    /// to its response's limits), and stop at the shaper's budget: the
+    /// merge then holds only what fits, and the result reports
+    /// [`ByteBudget`](PartialReason::ByteBudget) when the budget cut the
+    /// trace (see `sfst::trace_combine::SpanShaper`).
+    pub fn shaper(mut self, shaper: Box<dyn SpanShaper + Send>) -> Self {
+        self.shaper = Some(shaper);
+        self
+    }
+
+    /// Override the span cap. Zero is rejected at [`trace_by_id`]'s
+    /// request validation.
+    pub fn span_cap(mut self, cap: usize) -> Self {
+        self.span_cap = Some(cap);
+        self
+    }
+
+    /// Remove the span cap entirely.
+    pub fn unbounded(mut self) -> Self {
+        self.span_cap = None;
+        self
+    }
+}
+
+/// A request error — the caller built an invalid request or source set.
+/// Distinct from a [`Partial`](QueryStatus::Partial) result: nothing was
+/// queried.
+#[derive(Debug, thiserror::Error)]
+pub enum TraceRequestError {
+    /// The all-zero trace id is the OTLP "unset/invalid" sentinel: TIDX
+    /// never indexes it (`sfst/src/trace_index.rs` `TraceIdIndex::build`
+    /// excludes unset ids) while a tail scan would still serve its
+    /// spans — the answer would depend on data layout.
+    #[error("the all-zero (unset) trace id cannot be looked up")]
+    UnsetTraceId,
+    /// A zero cap accepts nothing and truncates on the first group —
+    /// the answer would be a guaranteed-empty `SizeCap` partial.
+    #[error("a zero span cap would return nothing; omit the cap or raise it")]
+    ZeroSpanCap,
+    #[error(transparent)]
+    Highlight(#[from] PredicateError),
+    #[error(transparent)]
+    SourceSet(#[from] SourceSetError),
+}
+
+/// The field→kinds maps for typed reconstruction, SECTIONED to mirror
+/// how the trace exposes names: span-level `fields` keep their storage
+/// names; event/link attribute keys are the prefix-stripped names
+/// `sfst::TraceEvent`/`sfst::TraceLink` expose (a flat result map would
+/// collide an event attr `foo` with a link attr `foo` whose kinds
+/// differ). Every section is FILTERED to exactly the names the returned
+/// trace exposes. A name's kinds are the union of its leaf kinds over
+/// exactly the sources whose spans the result retained — uncoalesced,
+/// and file-wide: a source's schema covers every span it holds, not
+/// only this trace's (which value had which kind is not stored). Sorted
+/// by name. Storage names are vocabulary keys (`vocab::parse_key`), so a
+/// consumer that wants one map keyed by key puts the owner prefix back
+/// on the event and link names.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct FieldKinds {
+    pub fields: Vec<(String, sfst::ValueKinds)>,
+    pub event_attributes: Vec<(String, sfst::ValueKinds)>,
+    pub link_attributes: Vec<(String, sfst::ValueKinds)>,
+}
+
+/// One assembled trace plus everything the consumer needs to interpret
+/// it honestly.
+#[derive(Debug)]
+pub struct TraceData {
+    /// The merged trace (combiner total order, node-index graph). Empty
+    /// when the id is absent everywhere — that is a `Complete` empty,
+    /// not an error.
+    pub trace: sfst::Trace,
+    /// Query-level completeness.
+    pub status: QueryStatus,
+    /// Field → leaf kinds for the returned trace; see [`FieldKinds`] for
+    /// the sectioning and scope.
+    pub field_kinds: FieldKinds,
+    /// Parallel to `trace.spans`: the query's shaper cut part of the
+    /// span (all `false` without a shaper).
+    pub span_cut: Vec<bool>,
+    /// Ascending indices into `trace.spans` of the spans matching the
+    /// query's highlight tokens (empty without any).
+    pub matched: Vec<u32>,
+}
+
+/// Wraps the caller's shaper: each span the merge keeps is tested
+/// against the highlight tokens on its full values, then shaped.
+/// `matched` gets one entry per shaped span, the last of which the
+/// budget may refuse; the kept prefix is the trace.
+struct Highlighter<'t> {
+    tokens: &'t [SpanToken],
+    inner: Option<Box<dyn SpanShaper + Send>>,
+    matched: Vec<bool>,
+}
+
+impl SpanShaper for Highlighter<'_> {
+    fn shape(&mut self, span: &mut sfst::TraceSpan) -> Shaped {
+        self.matched
+            .push(self.tokens.iter().any(|t| t.eval.matches(span, None)));
+        match self.inner.as_deref_mut() {
+            Some(inner) => inner.shape(span),
+            None => Shaped {
+                weight: 0,
+                cut: false,
+            },
+        }
+    }
+
+    fn budget(&self) -> usize {
+        self.inner
+            .as_deref()
+            .map_or(usize::MAX, |inner| inner.budget())
+    }
+}
+
+/// Run a cross-source trace-by-id. See the module docs for the status
+/// and cancellation contract.
+///
+/// `progress` ticks once per source during setup, success or failure
+/// alike; the caller advertises the `sources.len()` total out of band
+/// (the otel-ledger handler sets it on the capture and runs this
+/// through `spawn_blocking`). Callers that don't report pass a fresh
+/// counter; callers that don't cancel pass `CancellationToken::new()`
+/// (as `sfsq-cli` does).
+///
+/// Pure sync — reads and decompresses files; invoke off any async
+/// runtime thread (the logs-engine contract).
+pub fn trace_by_id(
+    sources: Vec<TraceSource>,
+    query: TraceQuery,
+    cancel: CancellationToken,
+    progress: Arc<AtomicUsize>,
+) -> Result<TraceData, TraceRequestError> {
+    if query.trace_id.is_unset() {
+        return Err(TraceRequestError::UnsetTraceId);
+    }
+    if query.span_cap == Some(0) {
+        return Err(TraceRequestError::ZeroSpanCap);
+    }
+    query.highlight.validate()?;
+    validate_sources(&sources)?;
+
+    let mut status = StatusBuilder::new();
+    let cancelled_empty = |mut status: StatusBuilder| {
+        status.add(PartialReason::Cancelled);
+        TraceData {
+            trace: sfst::Trace {
+                spans: Vec::new(),
+                roots: Vec::new(),
+                children: Vec::new(),
+            },
+            status: status.finish(),
+            field_kinds: FieldKinds::default(),
+            span_cut: Vec::new(),
+            matched: Vec::new(),
+        }
+    };
+    // Pre-heads cancellation returns EMPTY + Cancelled — polled up front
+    // so an already-cancelled call (a zero-source one included) can
+    // never report Complete. The combiner re-polls identically.
+    if cancel.is_cancelled() {
+        return Ok(cancelled_empty(status));
+    }
+
+    // ── Setup: obtain every source's bytes ────────────────────────────
+    // Map SFST bytes and decode tail frames. A failure is reported
+    // (SourceFailure) and the source dropped; cancellation HERE returns
+    // the empty result — no deterministic prefix exists before every
+    // source is ready.
+    let mut mapped_sfsts: Vec<(crate::source::Mapped, &TraceSource)> = Vec::new();
+    let mut tails: Vec<(super::sources::SourceId, TraceWalScan)> = Vec::new();
+    for source in &sources {
+        if cancel.is_cancelled() {
+            return Ok(cancelled_empty(status));
+        }
+        match source {
+            TraceSource::Sfst(c) => match map_source(&c.source) {
+                Ok(mapped) => mapped_sfsts.push((mapped, source)),
+                Err(e) => {
+                    tracing::warn!("sfsq traces: source {} failed to map: {e}", c.source_id);
+                    status.add(PartialReason::SourceFailure);
+                }
+            },
+            // The scan reads the VALIDATED coverage range — the one field
+            // the overlap check saw (no second range to diverge).
+            TraceSource::Tail(t) => match TraceWalScan::scan_range(&t.path, t.coverage.range) {
+                Ok(scan) => tails.push((t.source_id.clone(), scan)),
+                Err(e) => {
+                    tracing::warn!("sfsq traces: tail {} failed to scan: {e}", t.source_id);
+                    status.add(PartialReason::SourceFailure);
+                }
+            },
+            // No summary pruning here (the bloom prunes a by-id probe),
+            // so any unavailable source may hold the trace's spans.
+            TraceSource::Unavailable(_) => status.add(PartialReason::RemoteUnavailable),
+        }
+        progress.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Sessions own a metadata view of their mapping (which stays put from
+    // here on): the bloom decides first, and only a file that holds the
+    // trace opens fully. An SFST whose summary does not parse is a
+    // SourceFailure; one the bloom rules out never decodes more than its
+    // summary, metadata and bloom, and is dropped at once. The merge
+    // borrows the rest and keeps few of them loaded; a released one drops
+    // its file's pages.
+    let mut sessions: Vec<sfst::TraceFileSession<'_, '_>> = Vec::new();
+    let mut origin: Vec<String> = Vec::new();
+    for (mapped, source) in &mapped_sfsts {
+        if cancel.is_cancelled() {
+            return Ok(cancelled_empty(status));
+        }
+        match sfst::MetaReader::open(mapped.bytes()) {
+            Ok(meta) => {
+                let session = sfst::TraceFileSession::open_owned(meta)
+                    .on_release(move || mapped.release_pages());
+                // A file the bloom rules out holds nothing for this
+                // lookup: drop it now, so resident state is that of the
+                // files that may hold the trace, not of every file.
+                if !session.might_contain(query.trace_id) {
+                    drop(session);
+                    mapped.release_pages();
+                    continue;
+                }
+                sessions.push(session);
+                origin.push(source.source_id().to_string());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "sfsq traces: source {} failed to parse: {e}",
+                    source.source_id()
+                );
+                status.add(PartialReason::SourceFailure);
+            }
+        }
+    }
+
+    // The combiner's input slice: sessions first, tails after — the
+    // index split the field-kind pass below relies on. `origin` maps a
+    // merge index back to a diagnostic label.
+    let session_count = sessions.len();
+    let mut merged: Vec<&mut dyn SpanSource> = Vec::new();
+    for session in sessions.iter_mut() {
+        merged.push(session);
+    }
+    for (source_id, tail) in tails.iter_mut() {
+        merged.push(tail);
+        origin.push(source_id.to_string());
+    }
+
+    let lowered = LoweredTokens::new(&query.highlight);
+    let mut highlighter = Highlighter {
+        tokens: &lowered.positive,
+        inner: query.shaper,
+        matched: Vec::new(),
+    };
+    // Without a shaper or a token to test, the merge shapes nothing.
+    let shaping = highlighter.inner.is_some() || !highlighter.tokens.is_empty();
+    let outcome = combine(
+        &mut merged,
+        query.trace_id,
+        query.span_cap,
+        Some(&mut sfst::LoadedSources::new(LOADED_SOURCES_MAX)),
+        shaping.then_some(&mut highlighter as &mut dyn SpanShaper),
+        &|| cancel.is_cancelled(),
+    );
+    // Release the merge's &mut borrows (each session, each tail) so the
+    // field-kind pass below can read tails by index again.
+    drop(merged);
+
+    if outcome.truncated {
+        status.add(PartialReason::SizeCap);
+    }
+    if outcome.budget_hit {
+        status.add(PartialReason::ByteBudget);
+    }
+    if outcome.cancelled {
+        status.add(PartialReason::Cancelled);
+    }
+    for (idx, e) in &outcome.failures {
+        let who = origin.get(*idx).map(String::as_str).unwrap_or("?");
+        tracing::warn!("sfsq traces: source {who} failed during merge: {e}");
+        status.add(PartialReason::SourceFailure);
+    }
+
+    // ── Field kinds: from exactly the contributing sources, projected
+    // onto exactly the names the result exposes ───────────────────────
+    let mut kinds: BTreeMap<String, sfst::ValueKinds> = BTreeMap::new();
+    let mut fold = |pairs: Vec<(String, sfst::ValueKinds)>| {
+        for (field, set) in pairs {
+            let entry = kinds.entry(field).or_default();
+            *entry = entry.union(set);
+        }
+    };
+    for &idx in &outcome.contributing_sources {
+        if idx < session_count {
+            match sessions[idx].metadata() {
+                Ok(metadata) => fold(metadata.tree.derive_leaf_kinds()),
+                Err(e) => {
+                    tracing::warn!(
+                        "sfsq traces: source {} metadata failed to read: {e}",
+                        origin[idx]
+                    );
+                    status.add(PartialReason::SourceFailure);
+                }
+            }
+        } else {
+            let tail = tails[idx - session_count].1.field_kinds();
+            fold(tail.iter().map(|(k, v)| (k.clone(), *v)).collect());
+        }
+    }
+    // Exposed names per section. Span fields keep storage names; event/
+    // link attribute names are prefix-stripped in the result, so their
+    // kinds resolve through the storage prefix.
+    use std::collections::BTreeSet;
+    let mut field_names: BTreeSet<&str> = BTreeSet::new();
+    let mut event_attr_names: BTreeSet<&str> = BTreeSet::new();
+    let mut link_attr_names: BTreeSet<&str> = BTreeSet::new();
+    for span in &outcome.trace.spans {
+        field_names.extend(span.fields.iter().map(|(k, _)| k.as_str()));
+        for ev in &span.events {
+            event_attr_names.extend(ev.attributes.iter().map(|(k, _)| k.as_str()));
+        }
+        for lk in &span.links {
+            link_attr_names.extend(lk.attributes.iter().map(|(k, _)| k.as_str()));
+        }
+    }
+    let project = |names: &BTreeSet<&str>, prefix: &str| -> Vec<(String, sfst::ValueKinds)> {
+        names
+            .iter()
+            .filter_map(|name| {
+                kinds
+                    .get(&format!("{prefix}{name}"))
+                    .map(|k| (name.to_string(), *k))
+            })
+            .collect()
+    };
+    let field_kinds = FieldKinds {
+        fields: project(&field_names, ""),
+        event_attributes: project(&event_attr_names, "events.attributes."),
+        link_attributes: project(&link_attr_names, "links.attributes."),
+    };
+
+    let kept = outcome.trace.spans.len();
+    let matched = highlighter
+        .matched
+        .iter()
+        .take(kept)
+        .enumerate()
+        .filter(|(_, hit)| **hit)
+        .map(|(i, _)| i as u32)
+        .collect();
+    Ok(TraceData {
+        trace: outcome.trace,
+        status: status.finish(),
+        field_kinds,
+        span_cut: outcome.cut,
+        matched,
+    })
+}

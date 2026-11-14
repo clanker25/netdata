@@ -1,0 +1,49 @@
+{
+  "version": "2.0.21-debian",
+  "listen_queue": 1,
+  "listen_queue_errors": 0,
+  "signal_queue": 1,
+  "load": 1,
+  "pid": 1267323,
+  "uid": 1001,
+  "gid": 1001,
+  "cwd": "/home/ilyam",
+  "locks": [
+    {
+      "user 0": 0
+    },
+    {
+      "signal": 0
+    },
+    {
+      "filemon": 1
+    },
+    {
+      "timer": 0
+    },
+    {
+      "rbtimer": 0
+    },
+    {
+      "cron": 0
+    },
+    {
+      "rpc": 1
+    },
+    {
+      "snmp": 0
+    }
+  ],
+  "sockets": [
+    {
+      "name": ":3031",
+      "proto": "uwsgi",
+      "queue": 0,
+      "max_queue": 100,
+      "shared": 0,
+      "can_offload": 1
+    }
+  ],
+  "workers": [
+  ]
+}

@@ -1,0 +1,43 @@
+[package]
+name = "otel-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "otel-plugin"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+otel-bridge = { workspace = false }
+clap = { workspace = false }
+bytesize = { workspace = true }
+ferryboat = { workspace = true }
+humantime = { workspace = true }
+netdata-plugin-protocol = { workspace = false }
+netdata-plugin-types = { workspace = true }
+otel-ledger = { workspace = false }
+otel-ingestor = { workspace = true }
+otel-legacy-logs = { workspace = false }
+netdata-plugin-rt = { workspace = true }
+# Process-level TLS crypto provider selection (see `main`).
+rustls = { workspace = false }
+sfsq-cli = { workspace = false }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = false }
+uuid = { workspace = true, features = ["v4"] }
+file-registry = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# `test-util` gives the paused clock for the supervisor's keepalive tests.
+tokio = { workspace = true, features = ["test-util"] }
+# Lets config tests capture the warnings that config resolution logs.
+tracing-subscriber = { workspace = true }

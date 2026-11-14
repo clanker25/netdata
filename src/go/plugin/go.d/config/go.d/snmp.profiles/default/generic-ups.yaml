@@ -1,0 +1,15 @@
+extends:
+  - _system-base.yaml
+  - _std-ups-mib.yaml
+  - _std-topology-ip-mib.yaml
+
+selector:
+  - sysobjectid:
+      include:
+        - 1.3.6.1.2.1.33
+
+metadata:
+  device:
+    fields:
+      type:
+        value: "UPS"

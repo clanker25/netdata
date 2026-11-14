@@ -1,0 +1,4 @@
+target/
+.idea/
+*.tidx
+*.json.gz

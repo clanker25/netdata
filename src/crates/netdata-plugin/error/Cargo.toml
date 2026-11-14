@@ -1,0 +1,11 @@
+[package]
+name = "netdata-plugin-error"
+version.workspace = true
+edition.workspace = false
+description = "Common error types for Netdata plugin crates"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }

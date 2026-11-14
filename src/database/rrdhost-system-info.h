@@ -1,0 +1,143 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#ifndef NETDATA_RRDHOST_SYSTEM_INFO_H
+#define NETDATA_RRDHOST_SYSTEM_INFO_H
+
+#include "libnetdata/libnetdata.h"
+#include "rrdlabels.h"
+#include "daemon/status-file.h"
+
+#ifdef RRDHOST_SYSTEM_INFO_INTERNALS
+struct rrdhost_system_info {
+    char *cloud_provider_type;
+    char *cloud_instance_type;
+    char *cloud_instance_region;
+
+    char *host_os_name;
+    char *host_os_id;
+    char *host_os_id_like;
+    char *host_os_version;
+    char *host_os_version_id;
+    char *host_os_detection;
+    // Host-label metadata intentionally stays out of the public system-info serializers.
+    char *host_os_label_name;
+    char *host_os_label_version;
+    char *host_os_label_release;
+    char *host_os_label_codename;
+    char *host_os_label_edition;
+    char *host_os_label_build;
+    char *host_l4t_version;
+    char *host_cores;
+    char *host_cpu_freq;
+    char *host_cpu_model;
+    char *host_ram_total;
+    char *host_disk_space;
+    char *container_os_name;
+    char *container_os_id;
+    char *container_os_id_like;
+    char *container_os_version;
+    char *container_os_version_id;
+    char *container_os_detection;
+    char *kernel_name;
+    char *kernel_version;
+    char *architecture;
+    char *virtualization;
+    char *virt_detection;
+    char *container;
+    char *container_detection;
+    char *is_k8s_node;
+    uint64_t detected_fields; // candidate fields with an explicit successful value or absence
+    int16_t hops;
+    bool ml_capable;
+    bool ml_enabled;
+    char *install_type;
+    char *prebuilt_arch;
+    char *prebuilt_dist;
+    char *network_default_iface;
+    char *network_default_iface_ip;
+    char *network_default_iface_detection;
+    int mc_version;
+    char *hw_product_id;
+    char *hw_product_name;
+    char *hw_sys_vendor;
+    char *hw_product_type;
+};
+#else
+struct rrdhost_system_info;
+#endif
+
+// --------------------------------------------------------------------------------------------------------------------
+// allocation and free
+
+struct rrdhost_system_info *rrdhost_system_info_create(void);
+struct rrdhost_system_info *rrdhost_system_info_dup(struct rrdhost_system_info *system_info);
+void rrdhost_system_info_free(struct rrdhost_system_info *system_info);
+
+// --------------------------------------------------------------------------------------------------------------------
+// importing fields
+
+// detect system info on current system
+int rrdhost_system_info_detect(struct rrdhost_system_info *system_info);
+// Detect into a private candidate; no process environment changes. False discards the whole response.
+bool rrdhost_system_info_detect_runtime(struct rrdhost_system_info *candidate);
+bool rrdhost_system_info_detected_set(struct rrdhost_system_info *si, const char *key, const char *value);
+// Publication callers hold the host update lock. Only detected candidate fields are copied.
+bool rrdhost_system_info_update(struct rrdhost_system_info *dst, struct rrdhost_system_info *candidate);
+bool rrdhost_system_info_update_from_labels(struct rrdhost_system_info *dst, RRDLABELS *old_labels, RRDLABELS *new_labels);
+bool rrdhost_system_info_label_is_owned(const char *name);
+bool rrdhost_system_info_label_is_runtime(const char *name);
+// Full label import is for locally managed virtual hosts, not streamed host handshakes.
+bool rrdhost_system_info_update_all_from_labels(struct rrdhost_system_info *dst, RRDLABELS *old_labels, RRDLABELS *new_labels);
+int rrdhost_system_info_unittest(void);
+
+// import from host rrdlabels
+struct rrdhost_system_info *rrdhost_system_info_from_host_labels(RRDLABELS *labels);
+
+// --------------------------------------------------------------------------------------------------------------------
+// setting individual fields
+
+void rrdhost_system_info_hops_set(struct rrdhost_system_info *si, int16_t hops);
+void rrdhost_system_info_ml_capable_set(struct rrdhost_system_info *system_info, bool capable);
+void rrdhost_system_info_ml_enabled_set(struct rrdhost_system_info *system_info, bool enabled);
+void rrdhost_system_info_mc_version_set(struct rrdhost_system_info *system_info, int version);
+
+int rrdhost_system_info_set_by_name(struct rrdhost_system_info *system_info, const char *name, const char *value);
+
+// --------------------------------------------------------------------------------------------------------------------
+// reading individual fields
+
+const char *rrdhost_system_info_install_type(struct rrdhost_system_info *si);
+const char *rrdhost_system_info_prebuilt_dist(struct rrdhost_system_info *si);
+int16_t rrdhost_system_info_hops(struct rrdhost_system_info *si);
+
+// --------------------------------------------------------------------------------------------------------------------
+// exporting in various forms
+
+void rrdhost_system_info_to_rrdlabels(struct rrdhost_system_info *system_info, RRDLABELS *labels);
+
+void rrdhost_system_info_to_json_v1(BUFFER *wb, struct rrdhost_system_info *system_info);
+void rrdhost_system_info_to_json_v2(BUFFER *wb, struct rrdhost_system_info *system_info);
+void rrdhost_system_info_to_url_encode_stream(BUFFER *wb, struct rrdhost_system_info *system_info);
+
+typedef int (*add_host_sysinfo_key_value_t)(const char *name, const char *value, nd_uuid_t *uuid);
+
+// Number of NETDATA_* keys emitted by rrdhost_system_info_foreach(); callers
+// compare against the cb-success count to detect partial-store failures.
+// Keep in sync with the body of rrdhost_system_info_foreach().
+#define RRDHOST_SYSTEM_INFO_KEY_COUNT 27
+
+int rrdhost_system_info_foreach(struct rrdhost_system_info *system_info, add_host_sysinfo_key_value_t cb, nd_uuid_t *uuid);
+
+struct update_node_info;
+void rrdhost_system_info_to_node_info(struct rrdhost_system_info *system_info, struct update_node_info *node_info);
+
+size_t rrdhost_system_info_streaming_function_columns(BUFFER *wb, size_t field_id);
+void rrdhost_system_info_to_streaming_function_array(BUFFER *wb, struct rrdhost_system_info *system_info);
+void rrdhost_system_info_streaming_function_group_by(BUFFER *wb);
+
+bool get_daemon_status_fields_from_system_info(DAEMON_STATUS_FILE *ds);
+void rrdhost_system_info_swap(struct rrdhost_system_info *a, struct rrdhost_system_info *b);
+
+bool localhost_is_docker();
+
+#endif //NETDATA_RRDHOST_SYSTEM_INFO_H

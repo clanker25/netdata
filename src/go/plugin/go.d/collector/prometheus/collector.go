@@ -1,0 +1,161 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package prometheus
+
+import (
+	"context"
+	_ "embed"
+	"fmt"
+	"time"
+
+	"github.com/netdata/netdata/go/plugins/pkg/confopt"
+	"github.com/netdata/netdata/go/plugins/pkg/metrix"
+	"github.com/netdata/netdata/go/plugins/pkg/prometheus"
+	"github.com/netdata/netdata/go/plugins/pkg/relabel"
+	"github.com/netdata/netdata/go/plugins/pkg/web"
+	"github.com/netdata/netdata/go/plugins/plugin/framework/chartengine"
+	"github.com/netdata/netdata/go/plugins/plugin/framework/collectorapi"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/prometheus/promprofiles"
+)
+
+//go:embed "config_schema.json"
+var configSchema string
+
+func init() {
+	collectorapi.Register("prometheus", collectorapi.Creator{
+		JobConfigSchema: configSchema,
+		Defaults: collectorapi.Defaults{
+			UpdateEvery: 10,
+		},
+		CreateV2: func() collectorapi.CollectorV2 { return New() },
+		Config:   func() any { return &Config{} },
+	})
+}
+
+func New() *Collector {
+	return NewWithOptions()
+}
+
+// DefaultConfig returns an independent copy of the collector's runtime
+// configuration defaults.
+func DefaultConfig() Config {
+	return Config{
+		HTTPConfig: web.HTTPConfig{
+			ClientConfig: web.ClientConfig{
+				Timeout: confopt.Duration(time.Second * 10),
+			},
+		},
+		MaxInputSeries:            10000,
+		MaxOutputSeriesPerContext: 1000,
+		Profiles: ProfilesConfig{
+			Mode: profilesModeAuto,
+		},
+	}
+}
+
+// NewWithOptions constructs a collector with explicit non-configuration
+// dependencies. Runtime job configuration remains in Config.
+func NewWithOptions(opts ...CollectorOption) *Collector {
+	c := &Collector{
+		Config:             DefaultConfig(),
+		store:              metrix.NewCollectorStore(),
+		loadProfileCatalog: promprofiles.DefaultCatalog,
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(c)
+		}
+	}
+	return c
+}
+
+type Collector struct {
+	collectorapi.Base
+	Config `yaml:",inline" json:""`
+
+	prom             prometheus.Prometheus
+	jobRelabel       *relabel.Pipeline
+	store            metrix.CollectorStore
+	writer           *metricFamilyWriter
+	inputRejected    bool
+	runtime          *promRuntime
+	pipelineObserver PipelineDiagnosticObserver
+
+	// loadProfileCatalog resolves the profile catalog; a field so tests inject a fake.
+	loadProfileCatalog func() (promprofiles.Catalog, error)
+}
+
+func (c *Collector) Configuration() any {
+	return c.Config
+}
+
+func (c *Collector) Init(ctx context.Context) error {
+	if err := c.validateConfig(); err != nil {
+		return fmt.Errorf("validating config: %v", err)
+	}
+
+	prom, err := c.initPrometheusClient(ctx)
+	if err != nil {
+		return fmt.Errorf("init prometheus client: %v", err)
+	}
+	c.prom = prom
+
+	// With no relabeling blocks the scrape keeps the direct, no-buffering Scrape fast
+	// path; invalid rules or match patterns fail Init here.
+	pipeline, err := relabel.NewPipeline(c.Relabeling)
+	if err != nil {
+		return fmt.Errorf("init relabeling: %v", err)
+	}
+	c.jobRelabel = pipeline
+
+	gaugeFallback, err := compileFallbackTypeMatcher(c.FallbackType.Gauge)
+	if err != nil {
+		return fmt.Errorf("init gauge fallback type matcher: %v", err)
+	}
+	counterFallback, err := compileFallbackTypeMatcher(c.FallbackType.Counter)
+	if err != nil {
+		return fmt.Errorf("init counter fallback type matcher: %v", err)
+	}
+
+	c.writer = newMetricFamilyWriter(c.store, metricFamilyWriterPolicy{
+		isFallbackTypeGauge:   gaugeFallback,
+		isFallbackTypeCounter: counterFallback,
+		observePipeline:       c.pipelineObserver,
+	}, c.Logger)
+
+	return nil
+}
+
+func (c *Collector) Check(ctx context.Context) error {
+	return c.check(ctx)
+}
+
+func (c *Collector) Collect(ctx context.Context) error {
+	return c.collect(ctx)
+}
+
+func (c *Collector) Cleanup(context.Context) {
+	c.runtime = nil
+	if c.prom != nil && c.prom.HTTPClient() != nil {
+		c.prom.HTTPClient().CloseIdleConnections()
+	}
+}
+
+func (c *Collector) MetricStore() metrix.CollectorStore {
+	return c.store
+}
+
+func (c *Collector) ChartTemplateYAML() string {
+	if c.runtime == nil {
+		return ""
+	}
+	return c.runtime.chartTemplate
+}
+
+func (c *Collector) EnginePolicy() chartengine.EnginePolicy {
+	return chartengine.EnginePolicy{
+		MaxOutputSeriesPerContext: &c.MaxOutputSeriesPerContext,
+	}
+}
+
+var _ collectorapi.CollectorV2EnginePolicy = (*Collector)(nil)

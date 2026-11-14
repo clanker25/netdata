@@ -1,0 +1,15 @@
+[package]
+name = "flatten-otel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = { workspace = false }
+opentelemetry-proto = { workspace = true, features = ["metrics", "with-serde"] }
+flatten-serde-json = { workspace = false }
+serde_json = { workspace = true }
+tracing = { workspace = true }

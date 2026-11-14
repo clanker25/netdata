@@ -1,0 +1,981 @@
+//! OTel ingestor worker: the production OTLP receiver of the otel-plugin
+//! pipeline. It serves the three OpenTelemetry Collector services —
+//! metrics, logs, traces — on TWO transports with one shared set of
+//! ingestion cores, and splits them by signal:
+//!
+//! - **Logs + traces** — each export request is normalized, flattened, and
+//!   encoded into a WAL frame by `ng_flatten` (`prepare_log_frame` /
+//!   `prepare_trace_frame`), then appended to a per-tenant WAL; file events
+//!   stream to the ledger over a dedicated writer socket (`ledger_sender`)
+//!   for sealing into SFSTs by `ng-index`.
+//! - **Metrics** — aggregated into Netdata charts and emitted once per second
+//!   as chart data over ferryboat IPC to the supervisor (`aggregation` →
+//!   `chart` → `output`).
+//!
+//! The supervisor spawns this crate as a worker process; [`run_worker`] is
+//! the entry point (Configure → bind → build services → `Ready` → serve).
+//!
+//! # Modules
+//!
+//! - Services: `logs_service` and `trace_service` (WAL writers),
+//!   `metrics_service` (chart emission); `tenant_writers` (the WAL writers
+//!   of one signal, one per tenant: the wait for durable frames and the
+//!   lifecycle events to the ledger, shared by logs and traces); `tenant`
+//!   (tenant extraction from the `X-Scope-OrgID` header). Each service
+//!   exposes a transport-agnostic core that the gRPC wrappers and the
+//!   OTLP/HTTP front end both call.
+//! - Transports: `http_service` (OTLP/HTTP, `POST /v1/{logs,traces,metrics}`
+//!   with protobuf + JSON codecs on `receivers.otlp.protocols.http`) and
+//!   `otlp_json` (its OTLP/JSON decoding over the `opentelemetry-proto`
+//!   derives); gRPC serving (`receivers.otlp.protocols.grpc`) is `bind_grpc`
+//!   plus `grpc_server`, driven by `run_ingestor`.
+//! - Metrics support: `aggregation` (per-slot accumulation + cross-slot
+//!   contexts), `chart` (per-chart dimension state), `chart_config` (stock +
+//!   user chart config), `iter` (OTLP metric traversal), `otel` (proto
+//!   normalize/compare/hash extensions), `output` (plugin-protocol
+//!   formatting).
+//! - Ledger wiring: `ledger_sender` (writer→ledger IPC events).
+//! - Observers: `observer` (features that see accepted trace exports without
+//!   taking part in storing them). The service map (`otel-service-map`) is
+//!   one; it also serves the ingestor's one Function, `topology:tracing`,
+//!   through `otel_bridge::driver::CallDriver`.
+
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result};
+use ferryboat::{Connection, Endpoint};
+use netdata_plugin_protocol::Chunker;
+use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
+use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
+use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceServiceServer;
+use otel_bridge::config::{AuthConfig, LifecycleConfig, PluginConfig, ProtocolConfig};
+use otel_bridge::driver::{CallDriver, CallResponse, oversized_result};
+use otel_bridge::function::RawFunctionHandler;
+use otel_bridge::signals::Signal;
+use otel_bridge::{IngestorRequest, IngestorResponse};
+use otel_derived_metrics::DerivedMetrics;
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
+use tonic::transport::server::TcpIncoming;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
+
+mod aggregation;
+mod chart;
+mod chart_config;
+mod http_service;
+mod iter;
+mod ledger_sender;
+mod logs_service;
+mod metrics_service;
+mod observer;
+mod otel;
+mod otlp_json;
+mod output;
+mod tenant;
+mod tenant_writers;
+mod trace_service;
+
+use chart_config::ChartConfigManager;
+use logs_service::NetdataLogsService;
+use metrics_service::{ChartManager, NetdataMetricsService};
+use trace_service::NetdataTracesService;
+
+/// The largest export request that the plugin accepts, in bytes, after
+/// decompression: one limit for both transports. The gRPC services get it as
+/// their decoding limit (it is also tonic's default, which a new version of
+/// tonic could change), and the OTLP/HTTP front end reads at most this much
+/// (`http_service.rs`). What a request can make the plugin hold or write is
+/// sized against it, for example a chart's definition (`chart.rs`).
+pub(crate) const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+
+/// How often the idle-rotation sweep runs. Fixed, no config knob: it bounds
+/// only the *idle*-stream rotation latency — active streams still rotate
+/// precisely on the next write. A no-op tick is cheap (one lock + arithmetic
+/// per tenant, no I/O).
+const WAL_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Ingestor worker entry point.
+///
+/// Connects to the supervisor's IPC socket, receives Configure, then runs the
+/// enabled OTLP listeners (`receivers.otlp.protocols.{grpc,http}`; config
+/// validation requires at least one) and the chart emission loop. `Ready` is
+/// sent from inside `run_ingestor`, only after every enabled listener is
+/// bound and every startup step has
+/// succeeded: the supervisor forwards the ledger's Function declarations to the
+/// agent only once it sees this worker's Ready, so a startup failure here (a
+/// port already in use, an unreadable TLS key) leaves the plugin un-advertised
+/// and exits it once, instead of advertising Functions it cannot back.
+pub async fn run_worker(socket_path: &str) -> Result<()> {
+    tracing::info!(socket = %socket_path, "connecting to supervisor");
+
+    let mut conn: Connection<IngestorResponse, IngestorRequest> =
+        Connection::connect(Endpoint::ipc(socket_path))
+            .max_message_size(otel_bridge::IPC_MAX_MESSAGE_SIZE)
+            .open()
+            .await?;
+
+    // Wait for Configure message from supervisor
+    let config = match conn.recv().await? {
+        IngestorRequest::Configure(config) => {
+            tracing::info!("received plugin configuration from supervisor");
+            *config
+        }
+        other => {
+            anyhow::bail!("expected Configure, got {:?}", other);
+        }
+    };
+
+    // Best-effort: log immediately on return, before the supervisor (which
+    // stops every worker when one of them closes its connection, and kills
+    // one that is still there after its wait) can react to the dropped
+    // connection. `conn` is owned by `run_ingestor`, so unlike the
+    // ledger we can't log strictly before the drop.
+    run_ingestor(config, conn)
+        .await
+        .inspect_err(|e| tracing::error!("ingestor event loop error: {e:#}"))
+}
+
+async fn run_ingestor(
+    config: PluginConfig,
+    mut conn: Connection<IngestorResponse, IngestorRequest>,
+) -> Result<()> {
+    // Bind the enabled listeners FIRST, before this worker's disk setup: a port
+    // conflict is the most likely startup failure (another listener, or another
+    // agent in a shared network namespace), and binding here fails fast
+    // (strict, for both transports), before the ingestor touches its WAL
+    // directories or the seq high-water file and before `Ready`, instead of
+    // advertising an endpoint that cannot receive. Config validation
+    // guarantees at least one listener is enabled.
+    let grpc = &config.receivers.otlp.protocols.grpc;
+    let grpc_incoming = bind_grpc(grpc)?;
+    let http_listener = http_service::bind_http(&config.receivers.otlp.protocols.http).await?;
+
+    // Set up metrics pipeline
+    let mut ccm = ChartConfigManager::with_default_configs();
+    ccm.set_defaults(
+        config.metrics.interval_secs,
+        config.metrics.grace_period_secs,
+        config.metrics.expiry_duration_secs,
+    );
+    if let Some(chart_configs_dir) = &config.metrics.chart_configs_dir {
+        if let Err(e) = ccm.load_user_configs(chart_configs_dir) {
+            tracing::error!(
+                "failed to load chart configs from {}: {:#} - using stock configs",
+                chart_configs_dir,
+                e
+            );
+        }
+    }
+    let effective_defaults = ccm.resolve_chart_config(None);
+    tracing::info!(
+        "metrics default timing: interval={}s, grace={}s, expiry={}s",
+        effective_defaults.collection_interval,
+        effective_defaults.grace_period.as_secs(),
+        effective_defaults.expiry_duration.as_secs(),
+    );
+
+    let ccm = Arc::new(RwLock::new(ccm));
+    let chart_manager = Arc::new(RwLock::new(ChartManager::new()));
+
+    // Charts derived from ingested logs and traces, plus the plugin's own
+    // ingest outcomes. The export services record into it; the tick loop
+    // renders it. Its stores have their own locks, apart from the
+    // ChartManager's.
+    let derived_settings = otel_derived_metrics::Settings::from_environment()?;
+    if derived_settings != otel_derived_metrics::Settings::default() {
+        tracing::info!(
+            "the environment replaces the settings of the derived metrics: enabled {}, at most {} services",
+            derived_settings.enabled,
+            derived_settings.max_services
+        );
+    }
+
+    let derived_metrics =
+        Arc::new(DerivedMetrics::new(derived_settings).context("declaring the derived metrics")?);
+
+    // Arc-shared: the gRPC server and the OTLP/HTTP router both hold the
+    // metrics service (chart emission is transport-agnostic).
+    let metrics_service = Arc::new(NetdataMetricsService::new(
+        Arc::clone(&ccm),
+        Arc::clone(&chart_manager),
+        config.metrics.max_new_charts_per_request,
+        Arc::clone(&derived_metrics),
+    ));
+
+    // Channel for tick loop → main loop chart data forwarding
+    let (chart_tx, mut chart_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+    // Tick loop: wakes on each second boundary and emits the chart data for
+    // that slot.
+    let tick_chart_manager = Arc::clone(&chart_manager);
+    let tick_derived_metrics = Arc::clone(&derived_metrics);
+    let tick_handle = tokio::spawn(async move {
+        // Wait until the next second boundary.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before UNIX epoch");
+        let next_sec = std::time::Duration::from_secs(now.as_secs() + 1);
+        tokio::time::sleep(next_sec.saturating_sub(now)).await;
+
+        loop {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before UNIX epoch");
+            let slot_timestamp = now.as_secs();
+
+            // Both kinds of charts come in chunks of whole blocks. A chunk
+            // stays under `otel_derived_metrics::MAX_CHUNK_BYTES`, unless
+            // one block is larger: that block is a chunk of its own, and
+            // the limits of an OTLP metrics chart keep it under the IPC
+            // frame limit (`chart::MAX_DIMENSIONS`). The chart registry is
+            // locked only while the text is written, not while it is sent.
+            let mut otlp_charts = Chunker::new(otel_derived_metrics::MAX_CHUNK_BYTES);
+            tick_chart_manager
+                .write()
+                .await
+                .emit(slot_timestamp, &mut otlp_charts);
+
+            let mut closed = false;
+            let chunks = otlp_charts
+                .finish()
+                .into_iter()
+                .chain(tick_derived_metrics.emit(slot_timestamp));
+            for chunk in chunks {
+                if chart_tx.send(chunk).await.is_err() {
+                    closed = true;
+                    break;
+                }
+            }
+            if closed {
+                break;
+            }
+
+            // Sleep until the next second boundary.
+            let elapsed = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before UNIX epoch");
+            let next_sec = std::time::Duration::from_secs(elapsed.as_secs() + 1);
+            tokio::time::sleep(next_sec.saturating_sub(elapsed)).await;
+        }
+    });
+
+    // Set up the logs + traces pipelines. They SHARE one writer→ledger sender
+    // and one global seq allocator: the ledger accepts a single writer
+    // connection, and file `seq` must be globally unique across signals.
+    //
+    // `stop` is cancelled when this worker stops: both servers then take no
+    // new request and end when the requests in progress have their answers,
+    // and the sender knows that the ledger's leaving is expected.
+    let stop = CancellationToken::new();
+    let (ledger_sender, seq_allocator) = create_shared_writer_state(
+        &config,
+        &config.writer_socket_path,
+        derived_metrics.wal_events_queued(),
+        stop.clone(),
+    )?;
+    // One process-wide monotonic clock, shared across signals — the WAL writer's
+    // contract is that all per-frame `ingestion_ns` come from a single clock so
+    // frame-level ordering is consistent across every stream/signal.
+    let clock = Arc::new(std::sync::Mutex::new(file_registry::MonotonicClock::new()));
+    let logs_lifecycle = config.lifecycle_for(Signal::Logs);
+    let traces_lifecycle = config.lifecycle_for(Signal::Traces);
+    // The supervisor always resolves the identity before configuring a worker;
+    // its absence here is a supervisor bug, not a runtime condition.
+    let instance_identity = config
+        .identity
+        .context("plugin config reached the ingestor without a resolved identity")?;
+    let mut logs_service = create_logs_service(
+        &logs_lifecycle,
+        &config.auth,
+        Arc::clone(&ledger_sender),
+        Arc::clone(&seq_allocator),
+        Arc::clone(&clock),
+        instance_identity,
+    );
+    logs_service.set_derived_metrics(Arc::clone(&derived_metrics));
+    let logs_service = Arc::new(logs_service);
+
+    let mut traces_service = create_traces_service(
+        &traces_lifecycle,
+        &config.auth,
+        ledger_sender,
+        seq_allocator,
+        clock,
+        instance_identity,
+    );
+    traces_service.set_derived_metrics(Arc::clone(&derived_metrics));
+    // The service map sees accepted trace exports through the observer seam
+    // and serves `topology:tracing`. It is optional: when it cannot start,
+    // ingestion goes on without it.
+    let service_map = start_service_map(&config.base_dir);
+    if let Some(map) = &service_map {
+        traces_service.add_observer(Arc::new(observer::ServiceMapObserver(Arc::clone(map))));
+    }
+    let traces_service = Arc::new(traces_service);
+    let mut handlers: Vec<Arc<dyn RawFunctionHandler>> = Vec::new();
+    if let Some(map) = &service_map {
+        handlers.push(Arc::new(otel_service_map::function::TopologyFunction::new(
+            Arc::clone(map),
+        )));
+    }
+    let (call_tx, mut call_rx) = tokio::sync::mpsc::unbounded_channel::<IngestorResponse>();
+    let mut calls = CallDriver::new(handlers, call_tx);
+
+    // Startup config warnings, per signal (each signal resolves its own
+    // rotation + ingestion window).
+    warn_signal_config(
+        "logs",
+        logs_service.default_max_file_duration(),
+        logs_service.ingest_future_skew(),
+        logs_service.ingest_max_age(),
+    );
+    warn_signal_config(
+        "traces",
+        traces_service.default_max_file_duration(),
+        traces_service.ingest_future_skew(),
+        traces_service.ingest_max_age(),
+    );
+
+    // Idle-rotation sweeps: a periodic task per signal closes WAL streams that
+    // have passed their duration threshold with no new frames, so quiet streams
+    // still get indexed (and, with remote storage, uploaded). Each signal gets
+    // its OWN task: the sweeps do serial fsyncs, so sharing one task would let
+    // a slow traces sweep delay the next logs sweep tick (and vice versa) — the
+    // signals' writer registries are independent, so nothing is shared.
+    let logs_sweep_handle = spawn_sweep("logs", Arc::clone(&logs_service), |s| {
+        s.sweep_expired_rotations()
+    });
+    let traces_sweep_handle = spawn_sweep("traces", Arc::clone(&traces_service), |s| {
+        s.sweep_expired_rotations()
+    });
+
+    let grpc_server = match grpc_incoming {
+        Some(incoming) => Some(grpc_server(
+            grpc,
+            incoming,
+            &metrics_service,
+            &logs_service,
+            &traces_service,
+            stop.clone(),
+        )?),
+        None => None,
+    };
+
+    // The OTLP/HTTP front end over the SAME service cores. `None` means the
+    // receiver is disabled; the pending future keeps the select! arm shape
+    // uniform either way.
+    let http_server = http_listener.map(|listener| {
+        let router = http_service::router(http_service::HttpState {
+            logs: Arc::clone(&logs_service),
+            traces: Arc::clone(&traces_service),
+            metrics: Arc::clone(&metrics_service),
+            auth: config.auth.clone(),
+        });
+        http_service::serve(listener, router, stop.clone())
+    });
+
+    // Every fallible startup step is behind us and the listener is bound, so
+    // this is the point at which the supervisor may advertise the plugin. The
+    // ingestor's Ready also gates the ledger's declarations.
+    conn.send(IngestorResponse::Ready {
+        declarations: calls.declarations(),
+    })
+    .await?;
+    tracing::info!("signaled ready to supervisor");
+
+    // A receiver that is disabled has no server: its future waits for the
+    // stop and ends with it, so the select! arms and the stop below have one
+    // shape either way.
+    let grpc_server = async {
+        match grpc_server {
+            Some(server) => server.await,
+            None => {
+                stop.cancelled().await;
+                Ok(())
+            }
+        }
+    };
+    let http_server = async {
+        match http_server {
+            Some(server) => server.await,
+            None => {
+                stop.cancelled().await;
+                Ok(())
+            }
+        }
+    };
+    tokio::pin!(grpc_server, http_server);
+
+    // Main loop: forward chart data to supervisor, handle incoming requests,
+    // run both transport servers. A server ends only after the stop below, so
+    // one that ends here failed (`serve` names the transport).
+    tokio::select! {
+        result = &mut grpc_server => {
+            result?;
+            anyhow::bail!("the OTLP/gRPC server ended with no stop request");
+        }
+        result = &mut http_server => {
+            result?;
+            anyhow::bail!("the OTLP/HTTP server ended with no stop request");
+        }
+        _ = async {
+            loop {
+                tokio::select! {
+                    Some(payload) = chart_rx.recv() => {
+                        let resp = IngestorResponse::ChartData { payload };
+                        if let Err(e) = conn.send(resp).await {
+                            tracing::error!(%e, "failed to send chart data to supervisor");
+                            break;
+                        }
+                    }
+                    Some(resp) = call_rx.recv() => {
+                        calls.finish(&resp);
+                        let transaction = resp.result().map(|r| r.transaction.clone());
+                        match conn.send(resp).await {
+                            // ferryboat checks the size before writing, so the
+                            // link is intact: answer with a small error instead
+                            // of tearing down the ingestor.
+                            Err(ferryboat::Error::MessageTooLarge { size, max }) => {
+                                tracing::error!("function response too large: {size} bytes exceeds {max} byte limit");
+                                if let Some(transaction) = transaction {
+                                    let resp = IngestorResponse::Result(oversized_result(transaction, size, max));
+                                    if let Err(e) = conn.send(resp).await {
+                                        tracing::error!(%e, "failed to send result to supervisor");
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(%e, "failed to send result to supervisor");
+                                break;
+                            }
+                            Ok(()) => {}
+                        }
+                    }
+                    req = conn.recv() => {
+                        match req {
+                            Ok(IngestorRequest::Call { transaction, timeout, name, args, payload }) => {
+                                calls.call(transaction, timeout, name, args, payload);
+                            }
+                            Ok(IngestorRequest::Cancel { transaction }) => calls.cancel(&transaction),
+                            Ok(IngestorRequest::Shutdown) => {
+                                tracing::info!("received Shutdown from supervisor");
+                                break;
+                            }
+                            Ok(IngestorRequest::Configure(_)) => {
+                                tracing::warn!("unexpected late Configure message");
+                            }
+                            Err(e) => {
+                                tracing::error!(%e, "supervisor connection lost");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        } => {}
+    }
+
+    tick_handle.abort();
+    logs_sweep_handle.abort();
+    traces_sweep_handle.abort();
+
+    // The stop work, all of it inside one budget (`otel_bridge::shutdown`).
+    //
+    // First the exports in progress get their answer: an export that is cut
+    // gets none, and its sender sends again records that are on the disk
+    // already. A server ends when its connections are closed: it tells each
+    // client that it stops and closes a connection after its answers. A peer
+    // that sent nothing yet, or that ignores the notice, holds its
+    // connection open: the exports get half of the budget at most, so that
+    // such a peer leaves the service map its time.
+    //
+    // Then the service map writes its open minutes. It comes second because
+    // its stop closes its queue: the spans of an export that ends after that
+    // would be answered and stored, and missing from the map.
+    stop.cancel();
+    let budget = otel_bridge::shutdown::WORKER_STOP_BUDGET;
+    let deadline = tokio::time::Instant::now() + budget;
+    let exports = async {
+        let (grpc, http) = tokio::join!(&mut grpc_server, &mut http_server);
+        for result in [grpc, http] {
+            if let Err(e) = result {
+                tracing::warn!("a server ended its stop with an error: {e:#}");
+            }
+        }
+    };
+    if tokio::time::timeout(budget / 2, exports).await.is_err() {
+        tracing::info!(
+            "connections were still open {} ms after the stop request: an export in progress \
+             on one of them gets no answer",
+            (budget / 2).as_millis()
+        );
+    }
+    if let Some(map) = service_map {
+        if tokio::time::timeout_at(deadline, map.shutdown())
+            .await
+            .is_err()
+        {
+            tracing::warn!("service map: shutdown took too long; its open minutes are lost");
+        }
+    }
+    Ok(())
+}
+
+/// Starts the service map under `{base_dir}/service-map`, or logs why it
+/// cannot and returns `None`.
+fn start_service_map(
+    base_dir: &std::path::Path,
+) -> Option<Arc<otel_service_map::service::ServiceMap>> {
+    let config = otel_service_map::service::Config::new(base_dir.join("service-map"));
+    match otel_service_map::service::ServiceMap::start(config) {
+        Ok(map) => Some(Arc::new(map)),
+        Err(e) => {
+            tracing::error!(%e, "service map: cannot start; topology:tracing is not available");
+            None
+        }
+    }
+}
+
+/// Build the writer→ledger state shared by every ingestion signal: one
+/// `LedgerSender` (the ledger accepts a single writer connection) and one
+/// global `SeqAllocator` (file `seq` is globally unique across signals).
+///
+/// The seq is GLOBAL across signals (one allocator → one highwater file), so the
+/// seed scans BOTH signals' dirs and takes the max. Seeding from one signal alone
+/// would let a restart reissue a seq still live as another signal's SFST, making
+/// a new file look "older" than a retained one and triggering wrong eviction. The
+/// single highwater file is signal-neutral (`{base_dir}/shared/seq_highwater`),
+/// so global seq durability does not depend on any one signal's directory.
+fn create_shared_writer_state(
+    config: &PluginConfig,
+    writer_socket_path: &str,
+    wal_events_queued: Arc<std::sync::atomic::AtomicU64>,
+    stop: CancellationToken,
+) -> Result<(Arc<ledger_sender::LedgerSender>, Arc<wal::SeqAllocator>)> {
+    let logs_lc = config.lifecycle_for(Signal::Logs);
+    let traces_lc = config.lifecycle_for(Signal::Traces);
+    let highwater_path = config.seq_highwater_path();
+
+    let logs_scan = scan_seq_dirs(&logs_lc.wal.dir, &logs_lc.index.dir, &logs_lc.catalog.dir)?;
+    let traces_scan = scan_seq_dirs(
+        &traces_lc.wal.dir,
+        &traces_lc.index.dir,
+        &traces_lc.catalog.dir,
+    )?;
+    let highwater = wal::read_seq_highwater(&highwater_path);
+    let seed = logs_scan
+        .max()
+        .max(traces_scan.max())
+        .max(highwater.unwrap_or(0));
+
+    let seq_allocator = Arc::new(
+        wal::SeqAllocator::durable(highwater_path, seed, wal::DEFAULT_RESERVE_BATCH)
+            .context("initializing seq high-water allocator")?,
+    );
+
+    let ledger_sender = Arc::new(ledger_sender::LedgerSender::new(
+        writer_socket_path,
+        wal_events_queued,
+        stop,
+    ));
+
+    tracing::info!(
+        logs_wal = logs_scan.wal_max,
+        logs_sfst = logs_scan.sfst_max,
+        logs_catalog = logs_scan.catalog_max,
+        traces_wal = traces_scan.wal_max,
+        traces_sfst = traces_scan.sfst_max,
+        traces_catalog = traces_scan.catalog_max,
+        highwater,
+        seed,
+        "ingestion enabled (multi-tenant WAL); seq allocator + ledger sender shared across logs + traces"
+    );
+
+    Ok((ledger_sender, seq_allocator))
+}
+
+/// The logs ingestion service, built from the derived logs lifecycle the same
+/// way as [`create_traces_service`].
+fn create_logs_service(
+    lifecycle: &LifecycleConfig,
+    auth: &AuthConfig,
+    ledger_sender: Arc<ledger_sender::LedgerSender>,
+    seq_allocator: Arc<wal::SeqAllocator>,
+    clock: Arc<std::sync::Mutex<file_registry::MonotonicClock>>,
+    instance_identity: file_registry::Identity,
+) -> NetdataLogsService {
+    NetdataLogsService::new(
+        ledger_sender,
+        lifecycle.wal.clone(),
+        lifecycle.ingest.clone(),
+        seq_allocator,
+        clock,
+        auth.clone(),
+        instance_identity,
+    )
+}
+
+/// The traces ingestion service. Its WAL dir + rotation come from the derived
+/// traces lifecycle (`{base_dir}/traces/wal` — the same derivation the ledger
+/// uses), so the two processes agree on where traces WAL files live.
+fn create_traces_service(
+    lifecycle: &LifecycleConfig,
+    auth: &AuthConfig,
+    ledger_sender: Arc<ledger_sender::LedgerSender>,
+    seq_allocator: Arc<wal::SeqAllocator>,
+    clock: Arc<std::sync::Mutex<file_registry::MonotonicClock>>,
+    instance_identity: file_registry::Identity,
+) -> NetdataTracesService {
+    tracing::info!(
+        wal_dir = %lifecycle.wal.dir.display(),
+        "traces ingestion enabled"
+    );
+    NetdataTracesService::new(
+        ledger_sender,
+        lifecycle.wal.clone(),
+        lifecycle.ingest.clone(),
+        seq_allocator,
+        clock,
+        auth.clone(),
+        instance_identity,
+    )
+}
+
+/// Bind the OTLP/gRPC listener, or return `None` when it is disabled.
+/// tonic's `serve(addr)` would bind lazily, only when the server future is
+/// polled, so the socket is bound here to fail fast (see `run_ingestor`).
+fn bind_grpc(listener: &ProtocolConfig) -> Result<Option<TcpIncoming>> {
+    if !listener.enabled {
+        tracing::info!(
+            "OTLP/gRPC receiver disabled (receivers.otlp.protocols.grpc.enabled is false)"
+        );
+        return Ok(None);
+    }
+    let endpoint = &listener.endpoint;
+    let addr: std::net::SocketAddr = endpoint
+        .parse()
+        .with_context(|| format!("failed to parse OTLP/gRPC endpoint address: {endpoint}"))?;
+    // `serve_with_incoming` discards the builder's TCP options, so restore the
+    // TCP_NODELAY default that `serve(addr)` used to apply to accepted sockets.
+    let incoming = TcpIncoming::bind(addr)
+        .with_context(|| format!("failed to bind OTLP/gRPC endpoint {endpoint}"))?
+        .with_nodelay(Some(true));
+    tracing::info!(%endpoint, "OTLP/gRPC endpoint bound");
+    Ok(Some(incoming))
+}
+
+/// Build the OTLP/gRPC server (with TLS if configured) for metrics, logs and
+/// traces over the bound `incoming` socket.
+fn grpc_server(
+    listener: &ProtocolConfig,
+    incoming: TcpIncoming,
+    metrics_service: &Arc<NetdataMetricsService>,
+    logs_service: &Arc<NetdataLogsService>,
+    traces_service: &Arc<NetdataTracesService>,
+    stop: CancellationToken,
+) -> Result<impl std::future::Future<Output = Result<()>> + use<>> {
+    let endpoint = listener.endpoint.clone();
+    let mut server_builder = Server::builder();
+
+    if let (Some(cert_path), Some(key_path)) = (&listener.tls.cert_file, &listener.tls.key_file) {
+        let cert = std::fs::read(cert_path)
+            .with_context(|| format!("failed to read TLS certificate from: {}", cert_path))?;
+        let key = std::fs::read(key_path)
+            .with_context(|| format!("failed to read TLS private key from: {}", key_path))?;
+        let identity = Identity::from_pem(cert, key);
+
+        let mut tls_config = ServerTlsConfig::new().identity(identity);
+
+        if let Some(ca_cert_path) = &listener.tls.client_ca_file {
+            let ca_cert = std::fs::read(ca_cert_path)
+                .with_context(|| format!("failed to read CA certificate from: {}", ca_cert_path))?;
+            tls_config =
+                tls_config.client_ca_root(tonic::transport::Certificate::from_pem(ca_cert));
+        }
+
+        server_builder = server_builder
+            .tls_config(tls_config)
+            .context("failed to configure TLS")?;
+    } else {
+        tracing::warn!("TLS disabled, using insecure connection on OTLP/gRPC endpoint: {endpoint}");
+    }
+
+    let metrics_svc = MetricsServiceServer::from_arc(Arc::clone(metrics_service))
+        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+        .max_decoding_message_size(MAX_REQUEST_BYTES);
+    let logs_svc = LogsServiceServer::from_arc(Arc::clone(logs_service))
+        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+        .max_decoding_message_size(MAX_REQUEST_BYTES);
+    let traces_svc = TraceServiceServer::from_arc(Arc::clone(traces_service))
+        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+        .max_decoding_message_size(MAX_REQUEST_BYTES);
+
+    tracing::info!(%endpoint, "OTLP/gRPC server starting (metrics + logs + traces)");
+    let server = server_builder
+        .add_service(metrics_svc)
+        .add_service(logs_svc)
+        .add_service(traces_svc)
+        .serve_with_incoming_shutdown(incoming, stop.cancelled_owned());
+    Ok(async move {
+        server
+            .await
+            .with_context(|| format!("OTLP/gRPC server error on {endpoint}"))
+    })
+}
+
+/// Spawn one signal's idle-rotation sweep loop: every [`WAL_SWEEP_INTERVAL`],
+/// run the given sweep off the async worker pool (`spawn_blocking` — it does
+/// serial `fsync`s and must never stall the runtime). Missed ticks are
+/// skipped, not burst-fired.
+fn spawn_sweep<S: Send + Sync + 'static>(
+    signal: &'static str,
+    service: Arc<S>,
+    sweep: fn(&S),
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(WAL_SWEEP_INTERVAL);
+        // A slow tick (many tenants sealing at once on slow storage) must not
+        // burst-fire the backlog; skip missed ticks instead.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let svc = Arc::clone(&service);
+            if let Err(e) = tokio::task::spawn_blocking(move || sweep(&svc)).await {
+                tracing::error!(%e, signal, "WAL idle-rotation sweep task failed");
+            }
+        }
+    })
+}
+
+/// Warn once at startup, per signal, about config values that will surprise:
+/// a rotation duration at or below the sweep interval (idle streams then
+/// rotate at sweep granularity), a zero `future_skew` (any sender/server clock
+/// skew causes routine rejections), and a zero `max_age` (everything older
+/// than the moment of arrival is rejected — effectively all real history).
+fn warn_signal_config(
+    signal: &str,
+    default_rotation: std::time::Duration,
+    future_skew: std::time::Duration,
+    max_age: std::time::Duration,
+) {
+    if default_rotation <= WAL_SWEEP_INTERVAL {
+        tracing::warn!(
+            signal,
+            max_file_duration_secs = default_rotation.as_secs(),
+            sweep_interval_secs = WAL_SWEEP_INTERVAL.as_secs(),
+            "WAL max_file_duration is at or below the idle-rotation sweep interval; \
+             idle streams will rotate at sweep granularity (active streams still rotate on write)"
+        );
+    }
+    if future_skew.is_zero() {
+        tracing::warn!(
+            signal,
+            "ingest future_skew is 0; data timestamped even 1ns ahead of the server \
+             clock will be rejected (ordinary sender/server clock skew will cause rejections)"
+        );
+    }
+    if max_age.is_zero() {
+        tracing::warn!(
+            signal,
+            "ingest max_age is 0; everything older than the moment of arrival is \
+             rejected (effectively all real history; ordinary delivery latency will cause rejections)"
+        );
+    }
+}
+
+/// The highest seq found by scanning one signal's on-disk data files.
+struct DirScan {
+    wal_max: u64,
+    sfst_max: u64,
+    catalog_max: u64,
+}
+
+impl DirScan {
+    fn max(&self) -> u64 {
+        self.wal_max.max(self.sfst_max).max(self.catalog_max)
+    }
+}
+
+/// Scan one signal's WAL, index, and catalog dirs for the highest seq.
+///
+/// Looking at WAL alone is unsafe: post-restart the cleaner may have pruned every
+/// WAL but SFSTs at higher seqs still sit on disk; starting low would make new
+/// files appear "older" than retained ones and trigger immediate eviction by the
+/// seq-ordered retention loop. Catalogs outlive the SFSTs they describe, so they
+/// bound the seed when the data files are gone. Together the scans guarantee what
+/// correctness needs: no new seq collides with a surviving local file (the
+/// invariant of the bare-seq-keyed registries). The caller additionally folds in
+/// the persisted high-water mark, which extends monotonicity across seqs whose
+/// files are gone entirely (age-evicted, or wiped with a remote archive) — reuse
+/// there cannot corrupt (identities are per-process and cross-identity state is
+/// identity-keyed), it only degrades seq as a creation-order proxy. A missing dir
+/// scans as 0.
+fn scan_seq_dirs(
+    wal_dir: &std::path::Path,
+    index_dir: &std::path::Path,
+    catalog_dir: &std::path::Path,
+) -> Result<DirScan> {
+    let wal_max = wal::scan_max_sequence_recursive(wal_dir)
+        .with_context(|| format!("scanning WAL dirs in {:?}", wal_dir))?;
+    let sfst_max = sfst::scan_max_sequence_recursive(index_dir)
+        .with_context(|| format!("scanning SFST dirs in {:?}", index_dir))?;
+    let catalog_max = otel_catalog::scan_max_sequence(catalog_dir)
+        .with_context(|| format!("scanning catalog dirs in {:?}", catalog_dir))?;
+    Ok(DirScan {
+        wal_max,
+        sfst_max,
+        catalog_max,
+    })
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+
+    /// The `FileId` filename shape both data-file scanners parse. Built via the
+    /// real `FileId` codec so it can never drift from the on-disk format.
+    fn data_filename(seq: u64, ext: &str) -> String {
+        file_registry::FileId::new(
+            file_registry::Identity::new(
+                file_registry::MachineId::new(uuid::Uuid::from_u128(1)).unwrap(),
+                file_registry::InstanceId::new(uuid::Uuid::from_u128(2)).unwrap(),
+            ),
+            0,
+            seq,
+            0xabcd,
+        )
+        .to_filename(ext)
+    }
+
+    /// The global seed = max of every signal's dir scan and the signal-neutral
+    /// high-water file. Mirrors `create_shared_writer_state` for one signal.
+    fn combined_seed(scan: &DirScan, highwater: Option<u64>) -> u64 {
+        scan.max().max(highwater.unwrap_or(0))
+    }
+
+    #[test]
+    fn seed_is_max_of_scans_and_highwater() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let index_dir = tmp.path().join("index");
+        let catalog_dir = tmp.path().join("catalog");
+        // The high-water file is signal-neutral, under {base}/shared/.
+        let highwater_path = tmp.path().join("shared").join("seq_highwater");
+
+        // WAL max 3 < SFST max 10 < catalog max 25 < high-water 40.
+        std::fs::create_dir_all(wal_dir.join("tenant-a")).unwrap();
+        std::fs::write(wal_dir.join("tenant-a").join(data_filename(3, "wal")), b"").unwrap();
+        std::fs::create_dir_all(index_dir.join("tenant-a")).unwrap();
+        std::fs::write(
+            index_dir.join("tenant-a").join(data_filename(10, "sfst")),
+            b"",
+        )
+        .unwrap();
+        let cat_dir = catalog_dir.join("2026-06-11").join("tenant-a");
+        std::fs::create_dir_all(&cat_dir).unwrap();
+        std::fs::write(
+            cat_dir.join(otel_catalog::filename(
+                file_registry::Identity::new(
+                    file_registry::MachineId::new(uuid::Uuid::from_u128(1)).unwrap(),
+                    file_registry::InstanceId::new(uuid::Uuid::from_u128(2)).unwrap(),
+                ),
+                25,
+                100,
+                200,
+            )),
+            b"",
+        )
+        .unwrap();
+        wal::write_seq_highwater(&highwater_path, 40).unwrap();
+
+        let scan = scan_seq_dirs(&wal_dir, &index_dir, &catalog_dir).unwrap();
+        assert_eq!(scan.wal_max, 3);
+        assert_eq!(scan.sfst_max, 10);
+        assert_eq!(scan.catalog_max, 25);
+        let highwater = wal::read_seq_highwater(&highwater_path);
+        assert_eq!(highwater, Some(40));
+        let seed = combined_seed(&scan, highwater);
+        assert_eq!(seed, 40);
+
+        // The first seq the allocator hands out is above every input.
+        let alloc =
+            wal::SeqAllocator::durable(highwater_path, seed, wal::DEFAULT_RESERVE_BATCH).unwrap();
+        assert_eq!(alloc.next().unwrap(), 41);
+    }
+
+    #[test]
+    fn seed_survives_missing_dirs_and_corrupt_highwater() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let index_dir = tmp.path().join("index");
+        let catalog_dir = tmp.path().join("catalog");
+        let highwater_path = tmp.path().join("shared").join("seq_highwater");
+
+        // Catalog is the only survivor; the high-water file is corrupt
+        // garbage. Startup must not fail and the catalog bounds the seed.
+        let cat_dir = catalog_dir.join("2026-06-11").join("tenant-a");
+        std::fs::create_dir_all(&cat_dir).unwrap();
+        std::fs::write(
+            cat_dir.join(otel_catalog::filename(
+                file_registry::Identity::new(
+                    file_registry::MachineId::new(uuid::Uuid::from_u128(1)).unwrap(),
+                    file_registry::InstanceId::new(uuid::Uuid::from_u128(2)).unwrap(),
+                ),
+                7,
+                100,
+                200,
+            )),
+            b"",
+        )
+        .unwrap();
+        std::fs::create_dir_all(highwater_path.parent().unwrap()).unwrap();
+        std::fs::write(&highwater_path, b"garbage").unwrap();
+
+        let scan = scan_seq_dirs(&wal_dir, &index_dir, &catalog_dir).unwrap();
+        let highwater = wal::read_seq_highwater(&highwater_path);
+        assert_eq!(highwater, None);
+        assert_eq!(combined_seed(&scan, highwater), 7);
+    }
+}
+
+#[cfg(test)]
+mod grpc_listener_tests {
+    use otel_bridge::config::TlsServerConfig;
+
+    use super::*;
+
+    fn grpc(enabled: bool, endpoint: &str) -> ProtocolConfig {
+        ProtocolConfig {
+            enabled,
+            endpoint: endpoint.to_string(),
+            tls: TlsServerConfig::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_grpc_listener_binds_nothing() {
+        // Even an address that cannot bind is never touched when disabled.
+        assert!(bind_grpc(&grpc(false, "not-an-address")).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn enabled_grpc_listener_binds_or_fails_fast() {
+        assert!(bind_grpc(&grpc(true, "127.0.0.1:0")).unwrap().is_some());
+
+        let err = bind_grpc(&grpc(true, "not-an-address")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to parse OTLP/gRPC endpoint address"),
+            "{err:#}"
+        );
+
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = taken.local_addr().unwrap().to_string();
+        let err = bind_grpc(&grpc(true, &addr)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("failed to bind OTLP/gRPC endpoint"),
+            "{err:#}"
+        );
+    }
+}

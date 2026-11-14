@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#ifndef NETDATA_FILE_LOCK_H
+#define NETDATA_FILE_LOCK_H
+
+#include "libnetdata/libnetdata-platform-fwd.h"
+
+#if defined(OS_WINDOWS)
+#include <windows.h>
+
+// wincrypt.h (included via windows.h) defines macros that conflict with OpenSSL
+#ifdef X509_NAME
+#undef X509_NAME
+#endif
+#ifdef X509_EXTENSIONS
+#undef X509_EXTENSIONS
+#endif
+#ifdef PKCS7_SIGNER_INFO
+#undef PKCS7_SIGNER_INFO
+#endif
+#ifdef OCSP_REQUEST
+#undef OCSP_REQUEST
+#endif
+#ifdef OCSP_RESPONSE
+#undef OCSP_RESPONSE
+#endif
+#endif
+
+typedef struct file_lock {
+#if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_MACOS)
+    int fd;
+#elif defined(OS_WINDOWS)
+    HANDLE handle;
+#else
+#error "Unsupported operating system"
+#endif
+} FILE_LOCK;
+
+// Initialize to invalid values
+#if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_MACOS)
+#define FILE_LOCK_INVALID ((FILE_LOCK){ .fd = -1 })
+#define FILE_LOCK_OK(lock) ((lock).fd != -1)
+#elif defined(OS_WINDOWS)
+#define FILE_LOCK_INVALID ((FILE_LOCK){ .handle = INVALID_HANDLE_VALUE })
+#define FILE_LOCK_OK(lock) ((lock).handle != INVALID_HANDLE_VALUE)
+#endif
+
+/**
+ * Get a file lock
+ *
+ * Attempts to acquire an exclusive lock on a file. The lock is automatically released
+ * when the process exits or if the process crashes. Only one process can hold the lock
+ * at a time.
+ *
+ * @param filename UTF-8 encoded filename (MSYS2/Cygwin path format or native Windows path on Windows)
+ * @return FILE_LOCK The lock handle. Use FILE_LOCK_OK() to check if lock was acquired
+ */
+FILE_LOCK file_lock_get(const char *filename);
+
+/**
+ * Get an exclusive file lock, waiting for the current owner if necessary.
+ *
+ * The lock is automatically released when the process exits or crashes.
+ *
+ * @param filename UTF-8 encoded filename (MSYS2/Cygwin path format or native Windows path on Windows)
+ * @return FILE_LOCK The lock handle. Use FILE_LOCK_OK() to check if lock was acquired
+ */
+FILE_LOCK file_lock_get_wait(const char *filename);
+
+/**
+ * Release a file lock
+ *
+ * Releases a previously acquired file lock. After calling this function,
+ * another process may acquire the lock.
+ *
+ * @param lock The lock to release
+ */
+void file_lock_release(FILE_LOCK lock);
+
+#endif //NETDATA_FILE_LOCK_H

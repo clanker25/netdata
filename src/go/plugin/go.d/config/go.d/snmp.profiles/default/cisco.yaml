@@ -1,0 +1,12 @@
+# Profile for Cisco  devices
+
+extends:
+  - _system-base.yaml
+  - _cisco-base.yaml
+  - _cisco-licensing-traditional.yaml
+  - _cisco-licensing-smart.yaml
+
+selector:
+  - sysobjectid:
+      include:
+        - 1.3.6.1.4.1.9.1.*

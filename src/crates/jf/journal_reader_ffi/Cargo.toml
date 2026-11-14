@@ -1,0 +1,19 @@
+[package]
+name = "journal_reader_ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+error = { workspace = true }
+# journal_reader integrated into journal_file
+journal_file = { workspace = true }
+memmap2 = { workspace = true }
+serde_json = { workspace = true }
+sigbus = { workspace = true }
+
+[build-dependencies]
+cbindgen = { workspace = true }
+
+[lib]
+crate-type = ["staticlib"]

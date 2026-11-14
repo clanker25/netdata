@@ -1,0 +1,297 @@
+[workspace]
+resolver = "2"
+exclude = ["jf"]
+members = [
+    # Shared Rust plugin SDK: the pluginsd protocol, the plugin runtime, the
+    # config-form schema, derived-metrics charts and the value types any Netdata
+    # Rust plugin builds on.
+    "netdata-plugin/error",
+    "netdata-plugin/metrics",
+    "netdata-plugin/protocol",
+    "netdata-plugin/rt",
+    "netdata-plugin/schema",
+    "netdata-plugin/types",
+
+    # OTel plugin: the supervisor binary, its worker processes and their IPC.
+    "ferryboat",
+    "file-lifecycle",
+    "otel-bridge",
+    "otel-derived-metrics",
+    "otel-ingestor",
+    "otel-job-scheduler",
+    "otel-ledger",
+    "otel-legacy-logs",
+    "otel-plugin",
+    "otel-service-map",
+
+    # OTel storage, indexing and query; none of these speak the plugin protocol.
+    "chunk-file",
+    "file-cache",
+    "file-registry",
+    "flatten-otel",
+    "ng-flatten",
+    "ng-index",
+    "otel-catalog",
+    "otel-logs-identity",
+    "sfsq",
+    "sfsq-cli",
+    "sfst",
+    "treight",
+    "wal",
+
+    # OTel tools: OTLP load generators and a standalone OTLP-to-WAL receiver.
+    "ng-ingest",
+    "otel-streams",
+
+    # Legacy journal stack: reads the former OTel plugin's journal files for
+    # otel-legacy-logs. Unrelated to jf, the C systemd-journal plugin's reader.
+    "journal-common",
+    "journal-core",
+    "journal-engine",
+    "journal-function",
+    "journal-index",
+    "journal-registry",
+
+    # NetFlow plugin.
+    "netflow-plugin",
+
+    # Plugin IPC library, Rust implementation (the C one is src/libnetdata/netipc).
+    "netipc",
+]
+
+[workspace.package]
+version = "0.1.3"
+edition = "2024"
+rust-version = "1.91"
+
+[workspace.lints.clippy]
+collapsible_if = "allow"
+
+[workspace.dependencies]
+
+# Internal crates: shared Rust plugin SDK.
+netdata-plugin-error = { path = "netdata-plugin/error" }
+netdata-plugin-metrics = { path = "netdata-plugin/metrics" }
+netdata-plugin-protocol = { path = "netdata-plugin/protocol" }
+netdata-plugin-rt = { path = "netdata-plugin/rt" }
+netdata-plugin-schema = { path = "netdata-plugin/schema" }
+netdata-plugin-types = { path = "netdata-plugin/types" }
+
+# Internal crates: OTel plugin.
+ferryboat = { path = "ferryboat" }
+file-lifecycle = { path = "file-lifecycle" }
+otel-bridge = { path = "otel-bridge" }
+otel-derived-metrics = { path = "otel-derived-metrics" }
+otel-ingestor = { path = "otel-ingestor" }
+otel-job-scheduler = { path = "otel-job-scheduler" }
+otel-ledger = { path = "otel-ledger" }
+otel-legacy-logs = { path = "otel-legacy-logs" }
+otel-service-map = { path = "otel-service-map" }
+
+# Internal crates: OTel storage, indexing and query.
+chunk-file = { path = "chunk-file" }
+file-cache = { path = "file-cache" }
+file-registry = { path = "file-registry" }
+flatten-otel = { path = "flatten-otel" }
+ng-flatten = { path = "ng-flatten" }
+ng-index = { path = "ng-index" }
+otel-catalog = { path = "otel-catalog" }
+otel-logs-identity = { path = "otel-logs-identity" }
+sfsq = { path = "sfsq" }
+sfsq-cli = { path = "sfsq-cli" }
+sfst = { path = "sfst" }
+treight = { path = "treight" }
+wal = { path = "wal" }
+
+# Internal crates: legacy journal stack.
+journal-common = { path = "journal-common" }
+journal-core = { path = "journal-core" }
+journal-engine = { path = "journal-engine" }
+journal-function = { path = "journal-function" }
+journal-index = { path = "journal-index", default-features = false }
+journal-registry = { path = "journal-registry" }
+
+# External crates used by more than one group (plugin SDK, OTel, legacy
+# journal stack, NetFlow, netipc).
+allocative = "0.3.4"
+anyhow = "1.0"
+async-trait = "0.1.89"
+bitflags = "2.9"
+bumpalo = { version = "3", features = ["std"] }
+bytes = "1"
+bytesize = { version = "2.3.1", features = ["serde"] }
+chrono = { version = "0.4" }
+clap = { version = "4", features = ["derive"] }
+console-subscriber = "0.5"
+flatten-serde-json = { git = "https://github.com/meilisearch/meilisearch", tag = "v1.22.1" }
+fst = { git = "https://github.com/vkalintiris/fst.git", branch="bumpalo" }
+futures = "0.3"
+hashbrown = "0.17"
+humantime = "2.2"
+humantime-serde = "1.1"
+itoa = "1.0"
+libc = "0.2"
+lru = "0.19"
+lz4_flex = { version = "0.12", default-features = false, features = ["std", "safe-decode", "checked-decode"] }
+memmap2 = "0.9"
+nix = { version = "0.30" }
+notify = "8.2"
+parking_lot = "0.12"
+proptest = "1.9"
+prost = "0.14"
+regex = "1.10"
+reqwest = { version = "0.13.2", default-features = false }
+roaring = { git = "https://github.com/netdata/roaring-rs.git", branch="allocative" }
+rustc-hash = "2.1"
+schemars = "1.0"
+serde = { version = "1.0" }
+serde_json = "1.0"
+serde_yaml = "0.9.34"
+tempfile = { version = "3" }
+thiserror = "2"
+tokio = { version = "1.45", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tonic = "0.14"
+tracing = { version = "0.1" }
+tracing-subscriber = "0.3"
+twox-hash = { version = "2.1", default-features = false }
+uuid = { version = "1.0"}
+zerocopy = { version = "0.9.0-alpha.0" }
+
+# External crates: shared Rust plugin SDK only.
+atoi = "2.0"
+futures-util = { version = "0.3", features = ["sink"] }
+indexmap = "2"
+phf = { version = "0.12", default-features = true }
+phf_codegen = "0.12"
+tracing-journald = "0.3"
+
+# External crates: OTel only.
+
+# OTLP/HTTP receiver front end for otel-ingestor: axum router served alongside
+# the tonic gRPC transport, with http/http-body-util request plumbing and
+# tokio-rustls TLS termination for the plain-HTTP listener. Axum runs with
+# default features off: the receiver decodes bodies itself (prost + serde_json
+# with mirrored Content-Type) and never uses the Json/Form/Query extractors,
+# and skipping them keeps serde_path_to_error out of the graph (and keeps
+# axum from adding serde_urlencoded, which opendal's S3 signer pulls in
+# anyway). http2 is enabled so the h2 ALPN entry the TLS listener advertises is
+# honest; http1 + tokio are what axum::serve needs.
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio"] }
+http = "1"
+http-body-util = "0.1"
+tokio-rustls = "0.26"
+
+# reqwest-rustls-tls is load-bearing: without a TLS backend, reqwest rejects
+# every https:// URL in-process (S3/STS never reachable). Guarded by
+# file-lifecycle's TLS-capability test.
+opendal = { version = "0.59", default-features = false, features = [
+  "services-fs",
+  "services-s3",
+  "executors-tokio",
+  "layers-retry",
+  "reqwest-rustls-tls",
+  "auto-register-services",
+] }
+
+# Pinned exactly: the no-`unsafe`-in-crate guarantee was audited per-version
+# (v0.17.0, `grep -rc unsafe src/` == 0); re-audit before any bump.
+fastbloom = { version = "=0.17.0", features = ["serde"] }
+
+# Test-only: in-memory CA/server/client certificates for the OTLP/HTTP TLS
+# listener tests, so no key material is committed. Default features select
+# `ring`, the workspace's rustls backend.
+rcgen = "0.14"
+
+base64 = "0.22"
+bincode = { version = "2.0", features = ["serde"] }
+crc32fast = "1"
+criterion = { version = "0.5" }
+flate2 = "1"
+moka = { version = "0.12", features = ["future"] }
+opentelemetry-proto = "0.33"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+serde_bytes = "0.11"
+serde_regex = "1.1.0"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+tower = "0.5"
+url = "2"
+zstd = "0.13"
+
+# External crates: legacy journal stack only.
+async-stream = "0.3"
+crossbeam-channel = "0.5"
+foyer = { version = "0.20.0", features = ["serde"] }
+hashers = "1.0"
+lzma-rust2 = { version = "0.15", default-features = false, features = ["std", "xz"] }
+md5 = "0.7"
+rand = "0.9"
+rayon = "1.11.0"
+ruzstd = "0.9.1"
+siphasher = "1.0"
+static_assertions = "1.1"
+walkdir = "2.4"
+
+# External crates: NetFlow only.
+
+# Published systemd-journal-sdk crates. Keys use the journal-sdk-* prefix
+# because the plain journal-* names are taken by the internal path crates
+# elsewhere in this file; in-code idents are journal_sdk_*.
+journal-sdk-common = { package = "systemd-journal-sdk-common", version = "0.8.1" }
+journal-sdk-core = { package = "systemd-journal-sdk-core", version = "0.8.1" }
+journal-sdk-engine = { package = "systemd-journal-sdk-engine", version = "0.8.1" }
+journal-sdk-host = { package = "systemd-journal-sdk-host", version = "0.8.1" }
+journal-sdk-index = { package = "systemd-journal-sdk-index", version = "0.8.1" }
+journal-sdk-log-writer = { package = "systemd-journal-sdk-log-writer", version = "0.8.1" }
+journal-sdk-registry = { package = "systemd-journal-sdk-registry", version = "0.8.1" }
+
+bitvec = "1.0.1"
+etherparse = "0.20.1"
+ipnet = "2.11.0"
+ipnet-trie = "0.3.0"
+jaq-core = "3.0.0"
+jaq-json = "2.0.0"
+jaq-std = "3.0.0"
+maxminddb = "0.27.3"
+memchr = "2.7"
+netflow_parser = "1.0.6"
+netgauze-bgp-pkt = "0.11.0"
+netgauze-bmp-pkt = "0.11.0"
+pcap-file = "2.0.0"
+protoc-bin-vendored = "3"
+rmp-serde = "1.3.1"
+sflow-parser = "0.6.0"
+socket2 = "0.6.3"
+tokio-stream = "0.1"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+
+[profile.dev]
+opt-level = 0
+debug = true
+debug-assertions = true
+
+[profile.release]
+# Keep line tables in packaged release builds so production crash backtraces stay
+# symbolizable (function + file:line) without the size cost of full DWARF debuginfo.
+debug = "line-tables-only"
+opt-level = 4
+lto = "fat"
+codegen-units = 1
+
+[profile.release-min]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# Profiling builds (perf / heaptrack): optimized like release, but no LTO so
+# stack backtraces attribute to the real functions instead of being mangled
+# by cross-crate inlining. Build with `cargo build --profile profiling`.
+[profile.profiling]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = true

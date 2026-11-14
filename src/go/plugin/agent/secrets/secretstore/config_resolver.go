@@ -1,0 +1,44 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package secretstore
+
+import (
+	"context"
+	"fmt"
+
+	secretresolver "github.com/netdata/netdata/go/plugins/plugin/agent/secrets/resolver"
+)
+
+func resolveProviderPayload(
+	ctx context.Context,
+	resolver *secretresolver.AtomicResolver,
+	cfg Config,
+) (Config, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	if resolver == nil {
+		return nil, fmt.Errorf("resolving provider payload secrets: nil resolver")
+	}
+
+	// prepareConfig already deep-clones the raw config before calling here.
+	// Build a top-level payload view to keep store identity/source metadata static
+	// while avoiding another YAML round-trip clone for provider payload resolution.
+	payload := cfg.ProviderPayload()
+
+	resolved, err := resolver.Resolve(
+		ctx,
+		payload,
+		nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("resolving provider payload secrets: %w", err)
+	}
+	result, ok := resolved.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf(
+			"resolving provider payload secrets: resolved payload shape differs",
+		)
+	}
+	return Config(result), nil
+}

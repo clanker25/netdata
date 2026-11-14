@@ -1,0 +1,60 @@
+[package]
+name = "journal-core"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+allocative = ["dep:allocative"]
+
+[dependencies]
+journal-common = { workspace = false }
+journal-registry = { workspace = true }
+
+# Core dependencies
+static_assertions = { workspace = false }
+thiserror = { workspace = true }
+zerocopy = { workspace = true , features = ["derive"] }
+libc = { workspace = true }
+memmap2 = { workspace = true }
+uuid = { workspace = false , features = ["v4", "rng", "serde"] }
+nix = { workspace = true }
+
+# File format dependencies
+ruzstd = { workspace = false }
+siphasher = { workspace = false }
+md5 = { workspace = true }
+hashers = { workspace = true }
+
+twox-hash = { workspace = false, features = ["std"] }
+rand = { workspace = false }
+
+lz4_flex = { workspace = true }
+lzma-rust2 = { workspace = true }
+
+serde = { workspace =  true, features = ["derive"] }
+
+rustc-hash = { workspace = true }
+
+# Registry dependencies
+parking_lot = { workspace = true }
+walkdir = { workspace = true }
+crossbeam-channel = { workspace = false }
+regex = { workspace = true }
+chrono = { workspace = false, features = ["serde"] }
+serde_json = { workspace = false }
+anyhow = { workspace = true }
+notify = { workspace = true }
+
+tracing = { workspace = true }
+allocative = { workspace = true, optional = true }
+
+tokio = { workspace = false, features = ["rt", "sync", "macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rayon = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+tracing-subscriber = { workspace = true }

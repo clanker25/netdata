@@ -1,0 +1,91 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package dyncfg
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/netdata/netdata/go/plugins/plugin/framework/functions"
+)
+
+// Function wraps functions.Function with dyncfg-specific accessor and helper methods.
+type Function struct {
+	ctx context.Context
+	fn  functions.Function
+}
+
+// NewFunction creates a new dyncfg Function wrapper.
+func NewFunction(ctx context.Context, fn functions.Function) Function {
+	return Function{
+		ctx: ctx,
+		fn:  fn,
+	}
+}
+
+// UID returns the function's unique identifier.
+func (f Function) UID() string {
+	return f.fn.UID
+}
+
+func (f Function) Context() context.Context {
+	return f.ctx
+}
+
+// Source returns the function's source field.
+func (f Function) Source() string {
+	return f.fn.Source
+}
+
+// Payload returns the function's payload.
+func (f Function) Payload() []byte {
+	return f.fn.Payload
+}
+
+// Command returns the dyncfg command from Args[1].
+// Returns empty Command if args has fewer than 2 elements.
+func (f Function) Command() Command {
+	return CommandFromArgs(f.fn.Args)
+}
+
+// ID returns the config ID from Args[0].
+// Returns empty string if args is empty.
+func (f Function) ID() string {
+	if len(f.fn.Args) < 1 {
+		return ""
+	}
+	return f.fn.Args[0]
+}
+
+// JobName returns the job name from Args[2] (used in add command).
+// Returns empty string if args has fewer than 3 elements.
+// The caller validates the raw name; it must match the daemon persistence key.
+func (f Function) JobName() string {
+	if len(f.fn.Args) < 3 {
+		return ""
+	}
+	return f.fn.Args[2]
+}
+
+// HasPayload returns true if the function has a non-empty payload.
+func (f Function) HasPayload() bool {
+	return len(f.fn.Payload) > 0
+}
+
+// ValidateArgs checks if the function has at least the required number of arguments.
+// Returns an error with a descriptive message if validation fails.
+func (f Function) ValidateArgs(required int) error {
+	if len(f.fn.Args) < required {
+		return fmt.Errorf("missing required arguments: need %d, got %d", required, len(f.fn.Args))
+	}
+	return nil
+}
+
+// ValidateHasPayload checks if the function has a payload.
+// Returns an error if the payload is empty.
+func (f Function) ValidateHasPayload() error {
+	if !f.HasPayload() {
+		return fmt.Errorf("missing configuration payload")
+	}
+	return nil
+}

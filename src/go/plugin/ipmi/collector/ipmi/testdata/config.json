@@ -1,0 +1,7 @@
+{
+  "driver": "open",
+  "device": 0,
+  "update_every": 6,
+  "timeout": 6,
+  "collect_sel": false
+}
